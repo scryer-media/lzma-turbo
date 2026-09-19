@@ -251,3 +251,101 @@ fn feeding_a_converter_in_pieces_gives_what_feeding_it_whole_gives() {
         }
     }
 }
+
+/// Every length up to twice the longest alignment plus its lookahead, at
+/// several start offsets, against the SDK.
+///
+/// The whole-corpus test above proves the converters over big buffers, where
+/// the edges are a vanishing part of the work. This one is only edges: the C's
+/// `size &= ~(Alignment - 1)`, its `if (size <= 2) return p` and the tail its
+/// scan loops leave behind all live in the first few dozen bytes, and an
+/// off-by-one in any of them is invisible at 200 kB and decides everything at
+/// 5 bytes.
+#[test]
+fn every_converter_matches_the_sdk_at_every_short_length() {
+    let Some(bin) = tool("filter-oracle") else {
+        return;
+    };
+    let dir = tempdir("bcj-short");
+    // Bytes that are an opcode for one converter or another at every offset,
+    // so that no length is a buffer of bytes nothing looks at.
+    let mut rng = Rng(0xA5A5_1234);
+    let mut soup = Vec::new();
+    while soup.len() < 128 {
+        match rng.next_u32() % 6 {
+            0 => soup.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00]),
+            1 => soup.extend_from_slice(&[0x00, 0x00, 0x00, 0xEB]),
+            2 => soup.extend_from_slice(&[0x48, 0x00, 0x00, 0x01]),
+            3 => soup.extend_from_slice(&[0xF0, 0x00, 0xF8, 0x00]),
+            4 => soup.extend_from_slice(&[0x6F, 0x00, 0x00, 0x00]),
+            _ => soup.extend_from_slice(&rng.next_u32().to_le_bytes()),
+        }
+    }
+
+    for (kind, name) in KINDS {
+        for start in [0u32, kind.alignment(), kind.alignment() * 7] {
+            for len in 0..=(2 * kind.alignment() as usize + kind.lookahead() + 18) {
+                for off in [0usize, 1, 3] {
+                    let data = soup[off..off + len].to_vec();
+                    for encoding in [true, false] {
+                        let flag = if encoding { "enc" } else { "dec" };
+                        let want = oracle(&bin, &dir, name, flag, start, &data);
+                        let mut ours = data.clone();
+                        let mut bcj = Bcj::new(kind, start).expect("aligned");
+                        let n = if encoding {
+                            bcj.encode(&mut ours)
+                        } else {
+                            bcj.decode(&mut ours)
+                        };
+                        assert_eq!(
+                            ours, want,
+                            "{name} {flag} start={start} len={len} off={off}"
+                        );
+                        assert!(
+                            n <= len,
+                            "{name} {flag} len={len}: reported {n} bytes converted"
+                        );
+                        assert!(
+                            len < kind.alignment() as usize + kind.lookahead()
+                                || n + kind.max_carry() >= len,
+                            "{name} {flag} len={len}: left {} bytes over, more than the carry",
+                            len - n
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The delta filter at every length up to twice its longest distance, both
+/// directions, against the SDK. Its state rotation has a separate arm for
+/// `size <= distance`, and that arm is only reachable at these lengths.
+#[test]
+fn the_delta_filter_matches_the_sdk_at_every_short_length() {
+    let Some(bin) = tool("filter-oracle") else {
+        return;
+    };
+    let dir = tempdir("delta-short");
+    let mut rng = Rng(0x5A5A_4321);
+    let soup: Vec<u8> = (0..600).map(|_| rng.next_u32() as u8).collect();
+    for distance in [1u32, 2, 3, 4, 5, 16, 17, 255, 256] {
+        for len in 0..=(2 * distance as usize + 3) {
+            let data = soup[..len].to_vec();
+            for encoding in [true, false] {
+                let flag = if encoding { "enc" } else { "dec" };
+                let want = oracle(&bin, &dir, "delta", flag, distance, &data);
+                let mut ours = data.clone();
+                let mut d = Delta::new((distance - 1) as u8).expect("distance");
+                if encoding {
+                    d.encode(&mut ours);
+                } else {
+                    d.decode(&mut ours);
+                }
+                assert_eq!(ours, want, "delta {flag} distance={distance} len={len}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

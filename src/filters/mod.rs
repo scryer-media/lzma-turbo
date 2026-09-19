@@ -13,4 +13,5 @@
 //! and leaves the tail to the caller; see the module docs for the contract.
 
 pub mod bcj;
+pub mod bcj2;
 pub mod delta;

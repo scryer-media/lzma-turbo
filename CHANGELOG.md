@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.0 - 2026-09-19
+
+- `filters::bcj2`: BCJ2, 7z's four-stream branch converter, ported in both
+  directions from `C/Bcj2.c` and `C/Bcj2Enc.c`. It is not an in-place
+  converter like the rest of `filters` - it splits its input into a main
+  stream, a stream of absolute call targets, one of jump targets and a
+  range-coded flag per branch opcode, which is how a 7z folder carries it - so
+  its core is slice-driven: `Bcj2Dec::decode` takes the four input slices and
+  an output window and says how much of each it took, `Bcj2Enc::encode` takes
+  a source slice and four output windows, and both resume exactly where they
+  stopped. `decode_to_vec` and `encode_to_streams` are the whole-buffer
+  convenience over them. `no_std`, no dependency, and behind the same
+  `filters` feature as `bcj` and `delta`; xz has no filter id for BCJ2, so
+  there is no `xz::bcj2`.
+- The encoder carries the SDK's conversion conditions, not a simplification of
+  them: the relative limit (`Bcj2Enc::set_relat_limit`, default `0x0f << 24`),
+  the file-size limit (`set_file_size`), the starting address (`set_ip`) and
+  the three finish modes, including the block-overlap check 23.00 added so
+  that a `0F 8x` marker straddling a block boundary is not converted.
+- Both directions are bit-exact with the SDK. `tests/bcj2_parity.rs` compares
+  all four encoded streams against a `bcj2-oracle` that `cargo xtask
+  lzma-util` builds from the pinned SDK's own `Bcj2.c` and `Bcj2Enc.c`, over
+  the shared corpus, generated x86-like data, every length from zero to ten,
+  and a real binary; it decodes the reference encoder's streams with this
+  decoder and this encoder's streams with the reference decoder; and it runs
+  both directions in one-byte, seven-byte and random-sized pieces per stream
+  against the one-shot result.
+- The BCJ and delta converters were audited line by line against the pinned
+  SDK's `Bra.c`, `Bra86.c`, `BraIA64.c` and `Delta.c`. No behavioural
+  divergence was found, and `tests/filter_parity.rs` now proves that where it
+  would have hidden: every converter and both directions at every length from
+  zero to twice its alignment plus its lookahead, at three start offsets and
+  three input alignments, and the delta filter at every length up to twice its
+  distance, all against the reference.
+- The readers have a memory budget, checked before anything is allocated.
+  `LzmaReader::new` and `Lzma2Reader::new` refuse a header or property byte
+  whose rounded dictionary, probability table and input buffer would exceed
+  512 MiB, `DEFAULT_MEMORY_LIMIT`; `with_memory_limit` takes the budget
+  explicitly and `u64::MAX` opts out for trusted input, and `memory_required`
+  says what a header would cost. `LzmaReader::with_props` keeps its
+  unrestricted policy for containers that already enforce their own limit;
+  `with_props_and_memory_limit` is the checked form. The `.lzma` header is
+  read from the inner reader directly, so a rejected header allocates nothing,
+  and the remaining-size comparison against the caller's buffer is made in 64
+  bits before it is narrowed, as `CDecoder::Read` does.
+
 ## 0.4.0 - 2026-09-19
 
 - A `filters` feature: the BCJ and delta converters on their own, as

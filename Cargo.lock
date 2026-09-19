@@ -1065,7 +1065,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lzma-bench"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "liblzma",
  "lzma-rust2",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",

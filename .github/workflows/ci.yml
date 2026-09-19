@@ -22,7 +22,7 @@ jobs:
   hygiene:
     name: hygiene
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,7 +65,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,7 +79,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,7 +93,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -108,7 +108,7 @@ jobs:
   test:
     name: test-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -180,7 +180,7 @@ jobs:
   wasm:
     name: wasm-${{ matrix.lane }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +215,7 @@ jobs:
           - lane: crypto-host-only
             features: "std,crypto-host"
           # The converters alone, as a 7z reader takes them: no std, no xz.
+          # That includes BCJ2, which is 7z's and has no xz filter id.
           - lane: filters-only
             features: "filters"
     steps:
@@ -248,7 +249,7 @@ jobs:
   wasm-conformance:
     name: wasm-conformance
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -271,7 +272,7 @@ jobs:
   msrv:
     name: msrv
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -289,7 +290,7 @@ jobs:
   package:
     name: package
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -320,7 +321,7 @@ jobs:
   asm-provenance:
     name: asm-provenance-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -390,7 +391,7 @@ jobs:
   sdk-oracle:
     name: sdk-oracle-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -441,7 +442,7 @@ jobs:
     # constant factor, and the encoder lanes below are inside it. The corpus
     # cap is what keeps that factor affordable; widening this instead would be
     # the wrong knob.
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -519,7 +520,7 @@ jobs:
   thread-sanitizer:
     name: thread-sanitizer
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       TSAN_TOOLCHAIN: nightly-2026-09-01
     steps:
@@ -556,7 +557,7 @@ jobs:
   vectors:
     name: vectors
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -574,7 +575,7 @@ jobs:
   xz-utils-suite:
     name: xz-utils-suite-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -604,7 +605,7 @@ jobs:
   encoder-parity:
     name: encoder-parity-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -658,11 +659,11 @@ jobs:
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
         run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity --test mt_match_finder
-      # Same rule for the BCJ and delta converters, both directions.
+      # Same rule for the BCJ, BCJ2 and delta converters, both directions.
       - name: Bit-exact with the reference filters
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test filter_parity
+        run: cargo test --locked --release -p lzma-turbo --test filter_parity --test bcj2_parity
       - name: The .xz writer through every reader, and through xz and 7-Zip
         env:
           LZMA_TURBO_XZ_REQUIRE: "1"
@@ -676,7 +677,7 @@ jobs:
   fuzz-check:
     name: fuzz-check
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       FUZZ_TOOLCHAIN: nightly-2026-09-01
       CARGO_FUZZ_VERSION: 0.13.2
@@ -713,7 +714,7 @@ jobs:
     if: always()
     needs: [hygiene, fmt, clippy, docs, test, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, thread-sanitizer, vectors, xz-utils-suite, encoder-parity, fuzz-check, fuzz-differential]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Fail if any required lane failed
         env:

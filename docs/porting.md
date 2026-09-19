@@ -107,6 +107,18 @@ formats, so they live in `filters::bcj` and `filters::delta` behind their own
 `filters` feature (`xz` implies it and re-exports them), and the 7z fork uses
 them rather than carrying its own.
 
+BCJ2 is in the same place for the same reason, even though it is 7z's alone:
+xz has no filter id for it, so `filters::bcj2` is not re-exported under `xz`.
+It is not an in-place converter — it splits its input into four streams, which
+a 7z folder carries as four coder outputs — so its API is slice-driven rather
+than the `convert in place, return how much` contract the rest of `filters`
+has. Both directions are ported:
+
+| C | Rust | Notes |
+| --- | --- | --- |
+| `Bcj2.c` (`Bcj2Dec_Decode`) | `src/filters/bcj2.rs` | The decoder's state machine over the four input streams, with the C's resume points: a branch target half-written into a full output window, a range coder part way through its five priming bytes. |
+| `Bcj2Enc.c` (`Bcj2Enc_Encode`, `Bcj2Enc_Encode_2`) | `src/filters/bcj2.rs` | The encoder, including the `temp` lookahead `Bcj2Enc_Encode` wraps `Bcj2Enc_Encode_2` in, the three finish modes, and the relative-limit, file-size and block-overlap conditions that decide whether an offset is converted. |
+
 Two things the xz layer needs, and which the crate already had: the checksums
 in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check type 1 and
 CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`] (check type 10),

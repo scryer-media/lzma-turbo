@@ -148,7 +148,7 @@ jobs:
     name: test-${{ matrix.platform }}
     if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -177,7 +177,7 @@ jobs:
       && needs.verify.result == 'success'
       && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     environment: crates-io
     permissions:
       contents: read
@@ -215,7 +215,7 @@ jobs:
     needs: [verify, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:

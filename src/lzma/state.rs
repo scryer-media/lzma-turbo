@@ -109,7 +109,7 @@ impl LzmaProps {
         } else {
             (1 << 12) - 1
         };
-        let dic_buf_size = (dict_size as usize + mask) & !mask;
+        let dic_buf_size = (dict_size as usize).wrapping_add(mask) & !mask;
         if dic_buf_size < dict_size as usize {
             dict_size as usize
         } else {

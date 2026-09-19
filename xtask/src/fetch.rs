@@ -411,7 +411,8 @@ fn result(r: Result<(), String>) -> ExitCode {
 ///   and one thread;
 /// * `lzma-oracle-mt` and `lzma2-oracle-mt`, those two again built *without*
 ///   `Z7_ST`, which is the only way to reach `LzFindMt.c` and `MtCoder.c`;
-/// * `filter-oracle`, the SDK's branch converters and delta filter.
+/// * `filter-oracle`, the SDK's branch converters and delta filter;
+/// * `bcj2-oracle`, the SDK's four-stream BCJ2 converter, both directions.
 ///
 /// The single-threaded ones are built with `-DZ7_ST`, which is what selects
 /// `LzFind.c` over `LzFindMt.c`.
@@ -443,6 +444,7 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     let oracle2_src = write_src("lzma2-oracle.c", ORACLE2_C)?;
     let oracle2mt_src = write_src("lzma2-oracle-mt.c", ORACLE2_MT_C)?;
     let filter_src = write_src("filter-oracle.c", ORACLE_FILTER_C)?;
+    let bcj2_src = write_src("bcj2-oracle.c", ORACLE_BCJ2_C)?;
 
     // C: the `Z7_ST` build. `-D_7ZIP_ST` is the older spelling the SDK still
     // honours; passing both keeps this working either way.
@@ -554,7 +556,14 @@ fn build_lzma_util(dest: &Path) -> Result<Vec<PathBuf>, String> {
     ]));
     build(&filters, &filter_srcs)?;
 
-    Ok(vec![util, oracle, oracle_mt, oracle2, oracle2_mt, filters])
+    let bcj2 = binary(dest, "bcj2-oracle");
+    let mut bcj2_srcs = vec![bcj2_src];
+    bcj2_srcs.extend(core(&["CpuArch.c", "Bcj2.c", "Bcj2Enc.c"]));
+    build(&bcj2, &bcj2_srcs)?;
+
+    Ok(vec![
+        util, oracle, oracle_mt, oracle2, oracle2_mt, filters, bcj2,
+    ])
 }
 
 /// The SDK's own branch converters and delta filter, driven from the command
@@ -617,6 +626,122 @@ int main(int argc, char **argv)
   free(buf);
   return 0;
   }
+}
+"##;
+
+/// The SDK's BCJ2 converter, driven from the command line, so the four-stream
+/// port can be compared byte for byte against it.
+///
+/// Both directions are one call each: the buffers are sized so that neither
+/// `Bcj2Enc_Encode` nor `Bcj2Dec_Decode` can run out of room, which is the
+/// shape the reference documents as "decode full stream via single call".
+const ORACLE_BCJ2_C: &str = r##"/* The SDK's BCJ2 converter, for parity testing.
+   Usage: bcj2-oracle enc <relatLimit> <fileSize|-> <in> <main> <call> <jump> <rc>
+          bcj2-oracle dec <origSize> <main> <call> <jump> <rc> <out> */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Bcj2.h"
+
+static Byte *slurp(const char *path, size_t *size)
+{
+  FILE *f = fopen(path, "rb");
+  Byte *buf;
+  if (!f) { perror(path); exit(2); }
+  fseek(f, 0, SEEK_END); *size = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+  buf = (Byte *)malloc(*size ? *size : 1);
+  if (!buf) exit(2);
+  if (*size && fread(buf, 1, *size, f) != *size) { perror("read"); exit(2); }
+  fclose(f);
+  return buf;
+}
+
+static void spit(const char *path, const Byte *p, size_t n)
+{
+  FILE *f = fopen(path, "wb");
+  if (!f) { perror(path); exit(2); }
+  if (n && fwrite(p, 1, n, f) != n) { perror("write"); exit(2); }
+  fclose(f);
+}
+
+int main(int argc, char **argv)
+{
+  if (argc < 2) { fprintf(stderr, "usage: bcj2-oracle enc|dec ...\n"); return 2; }
+
+  if (strcmp(argv[1], "enc") == 0)
+  {
+    size_t size, cap, cap4;
+    Byte *src, *bufs[BCJ2_NUM_STREAMS];
+    CBcj2Enc e;
+    unsigned i;
+    if (argc != 9) { fprintf(stderr, "usage: bcj2-oracle enc relatLimit fileSize in main call jump rc\n"); return 2; }
+    src = slurp(argv[4], &size);
+    cap = size + 1024;
+    cap4 = (cap + 3) & ~(size_t)3;
+    Bcj2Enc_Init(&e);
+    e.relatLimit = (UInt32)strtoul(argv[2], NULL, 0);
+    if (strcmp(argv[3], "-") != 0)
+    {
+      const CBcj2Enc_ip_unsigned fileSize =
+          (CBcj2Enc_ip_unsigned)strtoull(argv[3], NULL, 0);
+      Bcj2Enc_SET_FileSize(&e, fileSize)
+    }
+    for (i = 0; i < BCJ2_NUM_STREAMS; i++)
+    {
+      const size_t n = (i == BCJ2_STREAM_MAIN) ? cap : cap4;
+      bufs[i] = (Byte *)malloc(n ? n : 4);
+      if (!bufs[i]) return 2;
+      e.bufs[i] = bufs[i];
+      e.lims[i] = bufs[i] + n;
+    }
+    e.src = src;
+    e.srcLim = src + size;
+    e.finishMode = BCJ2_ENC_FINISH_MODE_END_STREAM;
+    Bcj2Enc_Encode(&e);
+    if (e.state != BCJ2_ENC_STATE_FINISHED || !Bcj2Enc_IsFinished(&e))
+    {
+      fprintf(stderr, "bcj2-oracle: encoder did not finish (state=%u)\n", e.state);
+      return 3;
+    }
+    for (i = 0; i < BCJ2_NUM_STREAMS; i++)
+      spit(argv[5 + i], bufs[i], (size_t)(e.bufs[i] - bufs[i]));
+    return 0;
+  }
+
+  if (strcmp(argv[1], "dec") == 0)
+  {
+    size_t orig, sizes[BCJ2_NUM_STREAMS];
+    Byte *bufs[BCJ2_NUM_STREAMS], *dest;
+    CBcj2Dec d;
+    unsigned i;
+    SRes res;
+    if (argc != 8) { fprintf(stderr, "usage: bcj2-oracle dec origSize main call jump rc out\n"); return 2; }
+    orig = (size_t)strtoull(argv[2], NULL, 0);
+    Bcj2Dec_Init(&d);
+    for (i = 0; i < BCJ2_NUM_STREAMS; i++)
+    {
+      bufs[i] = slurp(argv[3 + i], &sizes[i]);
+      d.bufs[i] = bufs[i];
+      d.lims[i] = bufs[i] + sizes[i];
+    }
+    dest = (Byte *)malloc(orig ? orig : 1);
+    if (!dest) return 2;
+    d.dest = dest;
+    d.destLim = dest + orig;
+    res = Bcj2Dec_Decode(&d);
+    if (res != SZ_OK) { fprintf(stderr, "bcj2-oracle: decode res=%d\n", res); return 4; }
+    if ((size_t)(d.dest - dest) != orig)
+    {
+      fprintf(stderr, "bcj2-oracle: produced %u of %u bytes\n",
+          (unsigned)(d.dest - dest), (unsigned)orig);
+      return 5;
+    }
+    spit(argv[7], dest, orig);
+    return 0;
+  }
+
+  fprintf(stderr, "unknown mode %s\n", argv[1]);
+  return 2;
 }
 "##;
 

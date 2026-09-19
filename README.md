@@ -123,7 +123,9 @@ The encoder is a port of the same SDK's `LzFind.c`, `LzmaEnc.c` and
 optimal parser and the LZMA2 chunk layer, with `.lzma` and `.xz` writers and
 `std::io::Write` adapters over them. The BCJ and delta filters are ported in
 both directions too, so the `.xz` writer can emit filtered blocks and not only
-plain LZMA2. It is bit-exact with the reference encoder — the same input at
+plain LZMA2. BCJ2, 7z's four-stream branch converter, is ported in both
+directions alongside them in `filters::bcj2`; xz has no filter id for it, so it
+is not re-exported under `xz`. It is bit-exact with the reference encoder — the same input at
 the same settings produces the same bytes, and every converter agrees with the
 SDK's byte for byte in both directions — and the parity tests check that
 against binaries built from the pinned SDK sources over a generated corpus.
@@ -154,7 +156,7 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders |
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
 | `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, `XzEncoder`, the `.lzma`/`.xz` writers and the `Write` adapters; implies `crc` |
-| `filters` | yes | the BCJ and delta converters, `filters::bcj` and `filters::delta`, on their own: `no_std`, no dependency |
+| `filters` | yes | the BCJ, BCJ2 and delta converters, `filters::bcj`, `filters::bcj2` and `filters::delta`, on their own: `no_std`, no dependency |
 | `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the checks and the index; implies `std`, `crc` and `filters`, and re-exports the converters at `xz::bcj` and `xz::delta` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 | `crc-host` | no | on `wasm32`, the same CRC API delegated to embedder-installed hooks; implies `crc`. Inert on native targets - see [wasm](#wasm) |
@@ -278,8 +280,8 @@ aarch64 and windows-msvc x86-64 unless a stage says otherwise:
 
 - **Parity with the reference.** The decoders against the SDK's C and assembly
   loops, and the encoders, the threaded match finder, the block coder and the
-  BCJ/delta filters against binaries `cargo xtask lzma-util` builds from the
-  pinned SDK sources — byte for byte, on all four platforms.
+  BCJ/BCJ2/delta filters against binaries `cargo xtask lzma-util` builds from
+  the pinned SDK sources — byte for byte, on all four platforms.
 - **The same bytes everywhere.** `cargo xtask golden --check` compares a
   handful of inputs at fixed settings against SHA-256 digests committed in
   `tests/golden.manifest`, so a platform cannot drift on its own even if it
