@@ -42,6 +42,11 @@ pub(crate) struct Job {
     pub(crate) packed: Vec<u8>,
     /// A buffer to decode into, recycled from a previous block.
     pub(crate) out: Vec<u8>,
+    /// What the dispatcher charged its memory accounting for this job: the two
+    /// buffers above, as they were when they left. Carried by the job and
+    /// handed back untouched so that what comes off the running total is
+    /// exactly what went on it.
+    pub(crate) held: u64,
     /// What to checksum over the run, in this worker, before the block is
     /// handed back. See [`crate::checksum`].
     #[cfg(feature = "crc")]
@@ -59,6 +64,8 @@ pub(crate) struct Done {
     pub(crate) out: Vec<u8>,
     /// The job's input buffer, returned for reuse.
     pub(crate) packed: Vec<u8>,
+    /// What the dispatcher charged for the job, echoed back unchanged.
+    pub(crate) held: u64,
     /// What the worker checksummed, if the run decoded and a plan asked for
     /// it.
     #[cfg(feature = "crc")]
@@ -238,6 +245,7 @@ fn worker(
                 res: Err(Error::Cancelled),
                 out: job.out,
                 packed: job.packed,
+                held: job.held,
                 #[cfg(feature = "crc")]
                 checks: None,
             });
@@ -262,6 +270,7 @@ fn worker(
                             res: Err(e),
                             out: Vec::new(),
                             packed: job.packed,
+                            held: job.held,
                             #[cfg(feature = "crc")]
                             checks: None,
                         });
@@ -291,6 +300,7 @@ fn worker(
                 res,
                 out,
                 packed: job.packed,
+                held: job.held,
                 #[cfg(feature = "crc")]
                 checks,
             })

@@ -800,3 +800,188 @@ fn waiting_for_a_worker_returns_after_cancel() {
     assert!(!dec.wait_for_worker(), "waited for a cancelled worker");
     assert_eq!(dec.spawned_threads(), 0, "workers outlived cancel");
 }
+
+// 14. The accounting is the truth: what the decoder says it holds is what it
+// holds, at every thread count and for a consumer of any speed.
+
+/// What `feed` may take although the limit says no.
+///
+/// A limit smaller than one feed would otherwise never make progress, so an
+/// empty input buffer always accepts something; the chase decoder streams, so
+/// no larger buffer is ever needed to keep moving.
+const FEED_SLACK: u64 = 1 << 16;
+
+/// How far over the limit the accounting is allowed to go.
+///
+/// The feed above, and the chase decoder: it is what takes over when nothing
+/// can be dispatched, it works in steps of a megabyte, and with ordered
+/// delivery it may have to hold one such step until the block before it
+/// lands. Neither asks the limit first, because refusing them would stall the
+/// decode rather than bound it.
+const SLACK: u64 = (1 << 20) + FEED_SLACK;
+
+/// Decodes `packed` in `feed` sized pieces, handing `drain_limit` bytes out at
+/// a time, and returns the highest `held_bytes` seen.
+fn peak_held(
+    dict_prop: u8,
+    packed: &[u8],
+    plain: &[u8],
+    threads: usize,
+    limit: u64,
+    feed: usize,
+    drain_limit: usize,
+) -> u64 {
+    let mut dec = Lzma2AdaptiveDecoder::new(dict_prop, &opts(threads, limit)).expect("props");
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut peak = 0u64;
+    loop {
+        if pos < packed.len() {
+            let end = (pos + feed).min(packed.len());
+            pos += dec.feed(&packed[pos..end]).expect("feed");
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        assert_eq!(
+            dec.held_bytes(),
+            dec.in_flight_bytes(),
+            "two accounts of the same memory"
+        );
+        let status = dec
+            .drain_upto(drain_limit, |o, b| sink.put(o, b))
+            .expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if status == DrainStatus::NeedsMoreInput && pos == packed.len() {
+            // Everything has been fed and the decoder wants more: with no
+            // input left the only thing to wait for is a worker.
+            dec.wait_for_worker();
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert_eq!(dec.held_bytes(), dec.in_flight_bytes());
+    peak
+}
+
+#[test]
+fn held_bytes_stays_inside_the_limit_at_every_thread_count() {
+    // Twenty-four runs of a megabyte of incompressible bytes: 24 MiB of output
+    // under a 4 MiB limit, so the decoder has to keep letting go of what it
+    // has decoded to take in what has not.
+    let runs: Vec<_> = (0..24)
+        .map(|i| copy_run(&pseudo_random(1 << 20, i + 1)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 4 << 20;
+
+    for threads in [1usize, 2, 4, 8] {
+        // A consumer that takes everything it is offered, and one that takes
+        // four kilobytes at a time - which is where a decoder that accounted
+        // only for what it had delivered would quietly hold whole blocks.
+        for drain_limit in [usize::MAX, 4096] {
+            let peak = peak_held(16, &packed, &plain, threads, LIMIT, 1 << 16, drain_limit);
+            assert!(
+                peak <= LIMIT + SLACK,
+                "threads {threads} drain {drain_limit}: peak {peak} over the \
+                 {LIMIT} byte limit by more than {SLACK}",
+            );
+        }
+    }
+}
+
+#[test]
+fn a_caller_that_feeds_far_ahead_does_not_keep_the_buffer_it_needed() {
+    // The whole stream fed at once, under a limit that cannot hold it: the
+    // input buffer grows to whatever `feed` would take and must be given back
+    // as the runs are claimed, rather than counting against every dispatch for
+    // the rest of the decode.
+    let runs: Vec<_> = (0..16)
+        .map(|i| copy_run(&pseudo_random(1 << 19, i + 100)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 4 << 20;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(16, &opts(4, LIMIT)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut peak = 0u64;
+    loop {
+        if pos < packed.len() {
+            // As much as the decoder will take, every turn.
+            pos += dec.feed(&packed[pos..]).expect("feed");
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if status == DrainStatus::NeedsMoreInput && pos == packed.len() {
+            dec.wait_for_worker();
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+    // Chasing is off here, so the chase decoder's step is not in play and the
+    // only thing above the limit is a feed.
+    assert!(
+        peak <= LIMIT + FEED_SLACK,
+        "peak {peak} over the {LIMIT} byte limit by more than {FEED_SLACK}",
+    );
+    assert!(
+        dec.held_bytes() <= LIMIT / 4 + FEED_SLACK,
+        "{} bytes still held after the stream finished",
+        dec.held_bytes()
+    );
+}
+
+#[test]
+fn a_buffer_grown_for_a_large_run_is_not_parked_for_small_ones() {
+    // One large run and then many small ones. The buffers the large run needed
+    // are worth an allocation to a run of the same size and nothing at all to a
+    // run a fraction of it, so they must not sit in the pool holding the
+    // limit's worth of memory for the rest of the decode.
+    let mut runs = vec![copy_run(&pseudo_random(8 << 20, 11))];
+    runs.extend((0..24).map(|i| copy_run(&pseudo_random(16 << 10, i + 200))));
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 32 << 20;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(16, &opts(4, LIMIT)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut tail_peak = 0u64;
+    loop {
+        if pos < packed.len() {
+            let end = (pos + (1 << 16)).min(packed.len());
+            pos += dec.feed(&packed[pos..end]).expect("feed");
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        // Once the large run is out of the way, nothing the decoder is doing
+        // needs more than a small multiple of a small run.
+        if sink.bytes().len() > (8 << 20) + (64 << 10) {
+            tail_peak = tail_peak.max(dec.held_bytes());
+        }
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if status == DrainStatus::NeedsMoreInput && pos == packed.len() {
+            dec.wait_for_worker();
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert!(
+        tail_peak <= 1 << 20,
+        "{tail_peak} bytes held while decoding sixteen-kilobyte runs"
+    );
+}

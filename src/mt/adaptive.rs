@@ -40,6 +40,11 @@ use crate::mt::pool::{Done, Job, Pool, locate};
 /// handed to the caller. C: `props.outStep_ST`.
 const OUT_STEP_ST: usize = 1 << 20;
 
+/// The smallest dead front worth the move that reclaims it, and the slack a
+/// shrunk input buffer keeps so that the next feed does not immediately grow
+/// it again.
+const COMPACT_MIN: usize = 1 << 16;
+
 /// Why [`Lzma2AdaptiveDecoder::drain`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStatus {
@@ -118,6 +123,10 @@ pub struct Lzma2AdaptiveDecoder {
     // The worker pool, spawned on first dispatch.
     pool: Option<Pool>,
     outstanding: usize,
+    /// What the runs out with workers are charged for: each one's output
+    /// buffer and the copy of its packed bytes, as they were when they left.
+    /// The job carries the figure and hands it back, so what comes off is
+    /// exactly what went on.
     outstanding_bytes: u64,
 
     // Decoded blocks waiting for their turn.
@@ -125,10 +134,15 @@ pub struct Lzma2AdaptiveDecoder {
     /// The block `drain_upto` stopped in the middle of. Delivered before
     /// anything else, so a limited drain cuts a block without reordering it.
     part: Option<Part>,
-    ready_bytes: u64,
+    /// The capacity of every decoded block held here, in `ready` and in
+    /// `part`. Capacity, not length: a block half handed over still owns the
+    /// whole buffer until the rest of it goes.
+    ready_cap: u64,
     emitted_out: u64,
     spare_out: Vec<Vec<u8>>,
     spare_in: Vec<Vec<u8>>,
+    /// The capacity parked in the two pools above.
+    spare_cap: u64,
 
     // What each run's decoder checksummed, worker or chase alike. See
     // [`crate::checksum`]: this is computed where the bytes were produced,
@@ -200,10 +214,11 @@ impl Lzma2AdaptiveDecoder {
             outstanding: 0,
             outstanding_bytes: 0,
             ready: BTreeMap::new(),
-            ready_bytes: 0,
+            ready_cap: 0,
             emitted_out: 0,
             spare_out: Vec::new(),
             spare_in: Vec::new(),
+            spare_cap: 0,
             #[cfg(feature = "crc")]
             plan: ChecksumPlan::none(),
             #[cfg(feature = "crc")]
@@ -347,8 +362,27 @@ impl Lzma2AdaptiveDecoder {
         self.runs_claimed
     }
 
-    /// Bytes the decoder is currently holding: buffered input, blocks being
-    /// decoded, and blocks decoded but not yet delivered.
+    /// Every byte of buffer the decoder is holding.
+    ///
+    /// The input buffer, the copy of each dispatched run's packed bytes, the
+    /// buffer each run is being decoded into, the decoded blocks waiting for
+    /// their turn, and the capacity parked for reuse. Capacity throughout, not
+    /// length: a buffer grown for a large run goes on holding that much memory
+    /// until it is dropped, and a caller that asked for a limit wants to hear
+    /// about it.
+    ///
+    /// What it does not include is the fixed cost of a decoder: the chase
+    /// decoder's dictionary and each worker's, which are a function of the
+    /// stream's dictionary size and the thread count rather than of how much
+    /// is in flight, and which the limit therefore does not govern.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        self.buf.capacity() as u64 + self.outstanding_bytes + self.ready_cap + self.spare_cap
+    }
+
+    /// Bytes the decoder is currently holding: the same figure as
+    /// [`Lzma2AdaptiveDecoder::held_bytes`], under the name the memory limit
+    /// is phrased in.
     ///
     /// Dispatch is refused rather than allowed to push this over
     /// [`Lzma2AdaptiveDecoder::memory_limit`]; a run too large to fit at all
@@ -356,7 +390,7 @@ impl Lzma2AdaptiveDecoder {
     /// stalling.
     #[must_use]
     pub fn in_flight_bytes(&self) -> u64 {
-        self.buf.len() as u64 + self.outstanding_bytes + self.ready_bytes
+        self.held_bytes()
     }
 
     /// The limit [`Lzma2AdaptiveDecoder::in_flight_bytes`] is kept under.
@@ -387,8 +421,12 @@ impl Lzma2AdaptiveDecoder {
             // Input already claimed by a run still counts until it is dropped.
             self.reclaim();
         }
-        let held = self.in_flight_bytes();
-        let room = self.memory_limit.saturating_sub(held);
+        // Everything held that is not the input buffer. What is left of the
+        // limit after it is what the buffer may be, bytes and capacity alike.
+        let other = self.held_bytes() - self.buf.capacity() as u64;
+        let room = self
+            .memory_limit
+            .saturating_sub(other + self.buf.len() as u64);
         // Always take at least one byte's worth of progress possible: a limit
         // smaller than the buffer would otherwise deadlock. The single-threaded
         // path streams, so a large buffer is never required to make progress.
@@ -398,8 +436,31 @@ impl Lzma2AdaptiveDecoder {
         } else {
             take
         };
+        if take == 0 {
+            return Ok(0);
+        }
+        self.grow_buf(take, other);
         self.buf.extend_from_slice(&data[..take]);
         Ok(take)
+    }
+
+    /// Makes room for `take` more bytes of input without the buffer's own
+    /// growth overshooting the limit.
+    ///
+    /// A `Vec` asked for one byte more than it has takes twice what it had,
+    /// which is right for a buffer whose size nobody has an opinion about and
+    /// wrong here: a caller who asked for four megabytes would find eight
+    /// megabytes of input buffer, grown inside the very call that checked the
+    /// limit. So the growth is asked for deliberately - geometric while the
+    /// limit leaves room for it, exactly what is needed once it does not.
+    fn grow_buf(&mut self, take: usize, other: u64) {
+        let want = self.buf.len() + take;
+        if self.buf.capacity() >= want {
+            return;
+        }
+        let allow = usize::try_from(self.memory_limit.saturating_sub(other)).unwrap_or(usize::MAX);
+        let cap = want.saturating_mul(2).min(allow).max(want);
+        self.buf.reserve_exact(cap - self.buf.len());
     }
 
     /// Declares that no more input is coming. A stream that then does not end
@@ -630,13 +691,21 @@ impl Lzma2AdaptiveDecoder {
             return;
         }
         let drop = (keep_from - self.base) as usize;
-        // Dropping the front moves everything behind it, so it is done only
-        // once the dead part is at least half the buffer: each byte is then
-        // moved a bounded number of times however the input was fed. Dropping
-        // after every run instead is quadratic when a caller feeds far ahead
-        // of a stream of small runs - a gigabyte held, a megabyte claimed at a
-        // time, and the whole remainder moved for each one.
-        if drop < self.buf.len() / 2 {
+        let live = self.buf.len() - drop;
+        // Dropping the front moves everything behind it, so what is freed has
+        // to pay for the move: the dead part must be at least a quarter of what
+        // is left, which bounds how many times a byte can be moved however the
+        // input was fed. Dropping after every run instead is quadratic when a
+        // caller feeds far ahead of a stream of small runs - a gigabyte held, a
+        // megabyte claimed at a time, and the whole remainder moved for each
+        // one.
+        //
+        // A quarter rather than a half because the front is dead memory the
+        // limit counts, and the limit is what decides whether the next run can
+        // go to a worker: holding a claimed run's bytes until they are half the
+        // buffer is a copy of every dispatched run sitting in the way of the
+        // next dispatch.
+        if drop * 4 < live {
             return;
         }
         self.reclaim();
@@ -652,6 +721,17 @@ impl Lzma2AdaptiveDecoder {
         let drop = (keep_from - self.base) as usize;
         self.buf.drain(..drop);
         self.base = keep_from;
+        // A buffer grown while a caller fed far ahead is capacity the limit
+        // goes on counting long after the bytes in it have been claimed, and it
+        // is capacity no future feed asked for. It is given back once it is
+        // more than twice what is left in it plus a feed's worth of slack;
+        // halving like this keeps the number of times a byte is moved bounded,
+        // and the slack keeps a decoder that is running at its limit from
+        // shrinking and regrowing around every feed.
+        let want = self.buf.len().saturating_add(COMPACT_MIN);
+        if self.buf.capacity() > want.saturating_mul(2) {
+            self.buf.shrink_to(want);
+        }
     }
 
     /// Takes finished blocks off the pool, optionally waiting for one.
@@ -675,15 +755,15 @@ impl Lzma2AdaptiveDecoder {
 
     fn accept(&mut self, d: Done) {
         self.outstanding -= 1;
-        self.outstanding_bytes -= d.unpacked_len as u64;
-        self.spare_in.push(d.packed);
+        self.outstanding_bytes -= d.held;
+        self.park_in(d.packed);
         match d.res {
             Ok(()) => {
                 #[cfg(feature = "crc")]
                 if let Some(c) = d.checks {
                     self.checks.push(c);
                 }
-                self.ready_bytes += d.unpacked_len as u64;
+                self.ready_cap += d.out.capacity() as u64;
                 self.ready
                     .insert(d.out_offset, (d.out_offset, d.out, d.unpacked_len));
             }
@@ -714,10 +794,10 @@ impl Lzma2AdaptiveDecoder {
                 sink(*off + *sent as u64, &buf[*sent..*sent + take]);
                 *sent += take;
                 *left -= take;
-                self.ready_bytes -= take as u64;
                 any = true;
                 if *sent == *len {
                     let (_, buf, _, _) = self.part.take().expect("just borrowed");
+                    self.ready_cap -= buf.capacity() as u64;
                     self.recycle(buf);
                 }
                 continue;
@@ -735,7 +815,6 @@ impl Lzma2AdaptiveDecoder {
             };
             let (off, buf, len) = self.ready.remove(&key).expect("just looked it up");
             let take = len.min(*left);
-            self.ready_bytes -= take as u64;
             sink(off, &buf[..take]);
             *left -= take;
             if off == self.emitted_out {
@@ -745,8 +824,11 @@ impl Lzma2AdaptiveDecoder {
                 self.emitted_out = off + len as u64;
             }
             if take == len {
+                self.ready_cap -= buf.capacity() as u64;
                 self.recycle(buf);
             } else {
+                // Still counted: the block moves from `ready` to `part`, and
+                // the buffer under it is held either way.
                 self.part = Some((off, buf, len, take));
             }
             any = true;
@@ -767,9 +849,68 @@ impl Lzma2AdaptiveDecoder {
         Ok(())
     }
 
+    /// Parks an output buffer for the next run, or lets it go.
     fn recycle(&mut self, buf: Vec<u8>) {
-        if self.spare_out.len() < self.threads + 2 {
+        // A chase step writes at most one step's worth, so a buffer that size
+        // is worth keeping whatever the runs are doing.
+        let want = self
+            .pending
+            .front()
+            .map_or(0, |r| r.unpacked_len)
+            .max(OUT_STEP_ST as u64);
+        if self.spare_out.len() < self.threads + 2 && self.worth_parking(buf.capacity(), want) {
+            self.spare_cap += buf.capacity() as u64;
             self.spare_out.push(buf);
+        }
+    }
+
+    /// Parks a run's input copy for the next run, or lets it go.
+    fn park_in(&mut self, buf: Vec<u8>) {
+        let want = self.pending.front().map_or(0, |r| r.packed_len);
+        if self.spare_in.len() < self.threads + 2 && self.worth_parking(buf.capacity(), want) {
+            self.spare_cap += buf.capacity() as u64;
+            self.spare_in.push(buf);
+        }
+    }
+
+    /// Whether a buffer of `cap` bytes is worth parking when the next run
+    /// wants `want` of them.
+    ///
+    /// Recycling a buffer saves an allocation and a page fault per run, which
+    /// is worth having, but only while the buffer is about the size the next
+    /// run asks for. One grown for a sixty-megabyte run is sixty megabytes of
+    /// the caller's limit sitting idle once the runs are a megabyte, and since
+    /// the limit counts what is parked, it is also sixty megabytes that the
+    /// next dispatch cannot have. Two bounds fall out of that: a buffer far
+    /// larger than the work in front of it is dropped, and what is parked
+    /// altogether stays a small part of the limit.
+    fn worth_parking(&self, cap: usize, want: u64) -> bool {
+        let cap = cap as u64;
+        if want != 0 && cap > want.saturating_mul(2) {
+            return false;
+        }
+        self.spare_cap + cap <= self.memory_limit / 4
+    }
+
+    /// Takes a parked output buffer, if there is one.
+    fn take_out(&mut self) -> Vec<u8> {
+        match self.spare_out.pop() {
+            Some(b) => {
+                self.spare_cap -= b.capacity() as u64;
+                b
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Takes a parked input buffer, if there is one.
+    fn take_in(&mut self) -> Vec<u8> {
+        match self.spare_in.pop() {
+            Some(b) => {
+                self.spare_cap -= b.capacity() as u64;
+                b
+            }
+            None => Vec::new(),
         }
     }
 
@@ -798,10 +939,21 @@ impl Lzma2AdaptiveDecoder {
         // single-threaded path, which streams it out of its dictionary a
         // megabyte at a time. Waiting for room that will never appear would be
         // a deadlock, and buffering it anyway would be a lie about the limit.
-        let need = run.unpacked_len + run.packed_len;
-        if need > self.memory_limit {
+        //
+        // A run needs a buffer to decode into and a copy of its packed bytes,
+        // both of which the accounting counts for as long as the worker has
+        // them. What it costs on top of what is already held, though, is only
+        // what the buffers it will reuse do not already cover: those are parked
+        // capacity, counted where they sit, and dispatch moves them rather than
+        // allocating more.
+        let size = run.unpacked_len + run.packed_len;
+        if size > self.memory_limit {
             return Ok(Dispatch::Chase);
         }
+        let reuse_out = self.spare_out.last().map_or(0, |b| b.capacity() as u64);
+        let reuse_in = self.spare_in.last().map_or(0, |b| b.capacity() as u64);
+        let need =
+            run.unpacked_len.saturating_sub(reuse_out) + run.packed_len.saturating_sub(reuse_in);
         if self.in_flight_bytes() + need > self.memory_limit {
             // Room appears when an outstanding block lands. If none is
             // outstanding there is nothing to wait for, so the chase decoder
@@ -833,11 +985,17 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Dispatch::Chase);
         }
 
-        let mut packed_buf = self.spare_in.pop().unwrap_or_default();
+        let mut packed_buf = self.take_in();
         packed_buf.clear();
         packed_buf.extend_from_slice(&self.buf[from..from + packed]);
-        let out = self.spare_out.pop().unwrap_or_default();
+        let out = self.take_out();
+        // What the pair costs while the worker has them. The output buffer
+        // will be grown to the run's length if it is not there already, so it
+        // is charged for whichever is the larger; the packed copy is read and
+        // never grown, so it comes back exactly as it went.
+        let held = packed_buf.capacity() as u64 + (out.capacity() as u64).max(run.unpacked_len);
 
+        let pool = self.pool.as_mut().expect("checked above");
         pool.dispatch(Job {
             #[cfg(feature = "crc")]
             plan: self.plan.clone(),
@@ -846,10 +1004,11 @@ impl Lzma2AdaptiveDecoder {
             unpacked_len: unpacked,
             packed: packed_buf,
             out,
+            held,
         })?;
 
         self.outstanding += 1;
-        self.outstanding_bytes += run.unpacked_len;
+        self.outstanding_bytes += held;
         self.next_index += 1;
         self.runs_claimed += 1;
         self.pending.pop_front();
@@ -925,11 +1084,17 @@ impl Lzma2AdaptiveDecoder {
             if self.ordered && self.emitted_out != offset {
                 // Blocks dispatched earlier have not landed yet, so this one
                 // has to wait its turn in memory.
-                let mut b = self.spare_out.pop().unwrap_or_default();
+                let mut b = match self.spare_out.pop() {
+                    Some(b) => {
+                        self.spare_cap -= b.capacity() as u64;
+                        b
+                    }
+                    None => Vec::new(),
+                };
                 b.clear();
                 b.extend_from_slice(dec.dic_slice(start, end));
                 let len = b.len();
-                self.ready_bytes += len as u64;
+                self.ready_cap += b.capacity() as u64;
                 self.ready.insert(offset, (offset, b, len));
             } else {
                 sink(offset, dec.dic_slice(start, end));
