@@ -720,3 +720,83 @@ fn a_bounded_drain_does_not_accept_a_chunk_that_never_finished() {
         );
     }
 }
+
+// 13. Somewhere to wait: a caller with nothing left to feed must be able to
+// block on a worker instead of calling `drain` until one answers.
+
+#[test]
+fn waiting_for_a_worker_is_false_when_none_is_outstanding() {
+    let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz"], 2);
+
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    assert!(!dec.wait_for_worker(), "waited with nothing dispatched");
+
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+    while dec.drain(|o, b| sink.put(o, b)).expect("drain") != DrainStatus::Finished {}
+    assert_eq!(sink.bytes(), plain);
+    assert!(!dec.wait_for_worker(), "waited after the stream finished");
+}
+
+#[test]
+fn waiting_for_a_worker_takes_in_a_finished_run() {
+    // The shape that used to spin: every run is in the buffer, the caller has
+    // nothing more it wants to feed, and `drain` hands control straight back
+    // while workers are still decoding. Each iteration here either produces
+    // output or blocks on a worker, so the loop is bounded by the number of
+    // runs rather than by how long a worker takes.
+    let names = ["text.p1.xz", "mixed.p1.xz", "rand.p1.xz", "text.p1.xz"];
+    let (prop, packed, plain) = multi_run(&names, 4);
+
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    // Deliberately no `end_of_input` until the buffer is exhausted: that is
+    // what makes `drain` return rather than wait.
+    let mut waited = 0usize;
+    let mut drains = 0usize;
+    loop {
+        drains += 1;
+        assert!(drains < 10_000, "the drain loop did not converge");
+        let before = sink.order.len();
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if sink.order.len() != before {
+            continue;
+        }
+        if dec.wait_for_worker() {
+            waited += 1;
+            continue;
+        }
+        dec.end_of_input();
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert!(waited > 0, "no wait was ever needed, so nothing was tested");
+    assert!(!dec.wait_for_worker(), "a run outlived the finished stream");
+}
+
+#[test]
+fn waiting_for_a_worker_returns_after_cancel() {
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 4);
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    dec.set_chase(false);
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    let mut n = 0usize;
+    let _ = dec.drain(|_, b| n += b.len());
+    dec.cancel();
+    assert!(!dec.wait_for_worker(), "waited for a cancelled worker");
+    assert_eq!(dec.spawned_threads(), 0, "workers outlived cancel");
+}

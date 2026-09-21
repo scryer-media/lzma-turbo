@@ -422,6 +422,34 @@ impl Lzma2AdaptiveDecoder {
 
     // -- output -------------------------------------------------------------
 
+    /// Blocks until a worker hands back a finished run, and takes it in.
+    ///
+    /// Returns false at once when no run is outstanding.
+    ///
+    /// [`drain`](Lzma2AdaptiveDecoder::drain) hands control back as soon as
+    /// there is nothing it can do without more input, even with workers still
+    /// decoding, so that the caller can feed the next run rather than wait for
+    /// the last one. A caller whose read-ahead is already satisfied has nothing
+    /// to feed and nothing else to do; without somewhere to wait it would call
+    /// drain again, and again, for as long as the workers took. This is that
+    /// place: one block, no poll interval, no deadline.
+    ///
+    /// Everything else a worker has already finished is taken in along with
+    /// the run waited for. A run that failed is not reported here - the failure
+    /// is held with the block it belongs to and comes out of the next drain, in
+    /// order, exactly as it would have without this call.
+    ///
+    /// False also comes back when the outstanding run can no longer arrive: the
+    /// decode was cancelled, or every worker has gone. A caller looping on this
+    /// therefore cannot spin - the next drain turns that state into the error
+    /// it is.
+    pub fn wait_for_worker(&mut self) -> bool {
+        if self.outstanding == 0 {
+            return false;
+        }
+        self.collect(true)
+    }
+
     /// Decodes as much as the bytes fed so far allow and hands each block to
     /// `sink` as `(output offset, bytes)`.
     ///

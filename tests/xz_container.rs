@@ -623,6 +623,51 @@ fn the_adaptive_decoder_handles_concatenated_streams() {
 }
 
 #[test]
+fn waiting_for_a_worker_replaces_the_drain_spin() {
+    // A caller with every byte of the file already fed and nothing more it
+    // wants to hand over: `drain` returns rather than wait, so without
+    // somewhere to block such a caller would call it until a worker answered.
+    let payload = common::pseudo_random(3 << 20, 0xb10c);
+    let Some(data) = xz_compress(&["-1", "--block-size=262144", "-T4"], &payload) else {
+        return;
+    };
+    let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(4));
+    assert!(!dec.wait_for_worker(), "waited with nothing dispatched");
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        pos += dec.feed(&data[pos..]).expect("feed");
+    }
+    let mut waited = 0usize;
+    let mut turns = 0usize;
+    loop {
+        turns += 1;
+        assert!(turns < 10_000, "the drain loop did not converge");
+        let before = out.len();
+        let status = dec.drain(|_, b| out.extend_from_slice(b)).expect("drain");
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if out.len() != before {
+            continue;
+        }
+        if dec.wait_for_worker() {
+            waited += 1;
+            continue;
+        }
+        dec.end_of_input();
+    }
+    assert_eq!(out, payload);
+    assert!(!dec.wait_for_worker(), "a block outlived the finished file");
+    // How often the wait is actually reached depends on how the file was
+    // blocked and on which worker finishes when, so the count is reported
+    // rather than asserted; what the loop proves is that waiting instead of
+    // re-draining decodes the same bytes and always converges.
+    assert!(waited <= turns);
+}
+
+#[test]
 fn the_thread_count_can_change_mid_stream() {
     let payload = common::pseudo_random(3 << 20, 0xfeed);
     let Some(data) = xz_compress(&["-1", "--block-size=262144", "-T4"], &payload) else {
