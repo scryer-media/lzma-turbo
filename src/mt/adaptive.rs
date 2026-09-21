@@ -143,6 +143,10 @@ pub struct Lzma2AdaptiveDecoder {
     spare_in: Vec<Vec<u8>>,
     /// The capacity parked in the two pools above.
     spare_cap: u64,
+    /// What the last run dispatched needed, unpacked and packed. What a parked
+    /// buffer is worth keeping for, once the backlog is empty.
+    last_unpacked: u64,
+    last_packed: u64,
 
     // What each run's decoder checksummed, worker or chase alike. See
     // [`crate::checksum`]: this is computed where the bytes were produced,
@@ -219,6 +223,8 @@ impl Lzma2AdaptiveDecoder {
             spare_out: Vec::new(),
             spare_in: Vec::new(),
             spare_cap: 0,
+            last_unpacked: 0,
+            last_packed: 0,
             #[cfg(feature = "crc")]
             plan: ChecksumPlan::none(),
             #[cfg(feature = "crc")]
@@ -851,12 +857,15 @@ impl Lzma2AdaptiveDecoder {
 
     /// Parks an output buffer for the next run, or lets it go.
     fn recycle(&mut self, buf: Vec<u8>) {
-        // A chase step writes at most one step's worth, so a buffer that size
-        // is worth keeping whatever the runs are doing.
+        // The run at the cursor is what the buffer would be reused for. When
+        // there is none - a caller feeding one run at a time has nothing in
+        // the backlog most of the time - the last run dispatched says what the
+        // runs of this stream are like. A chase step writes at most one step's
+        // worth, so a buffer that size is worth keeping either way.
         let want = self
             .pending
             .front()
-            .map_or(0, |r| r.unpacked_len)
+            .map_or(self.last_unpacked, |r| r.unpacked_len)
             .max(OUT_STEP_ST as u64);
         if self.spare_out.len() < self.threads + 2 && self.worth_parking(buf.capacity(), want) {
             self.spare_cap += buf.capacity() as u64;
@@ -866,7 +875,10 @@ impl Lzma2AdaptiveDecoder {
 
     /// Parks a run's input copy for the next run, or lets it go.
     fn park_in(&mut self, buf: Vec<u8>) {
-        let want = self.pending.front().map_or(0, |r| r.packed_len);
+        let want = self
+            .pending
+            .front()
+            .map_or(self.last_packed, |r| r.packed_len);
         if self.spare_in.len() < self.threads + 2 && self.worth_parking(buf.capacity(), want) {
             self.spare_cap += buf.capacity() as u64;
             self.spare_in.push(buf);
@@ -1009,6 +1021,8 @@ impl Lzma2AdaptiveDecoder {
 
         self.outstanding += 1;
         self.outstanding_bytes += held;
+        self.last_unpacked = run.unpacked_len;
+        self.last_packed = run.packed_len;
         self.next_index += 1;
         self.runs_claimed += 1;
         self.pending.pop_front();
