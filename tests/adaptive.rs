@@ -844,10 +844,11 @@ fn peak_held(
             }
         }
         peak = peak.max(dec.held_bytes());
-        assert_eq!(
-            dec.held_bytes(),
+        assert!(
+            dec.in_flight_bytes() <= dec.held_bytes(),
+            "bytes in flight {} over the buffers holding them {}",
             dec.in_flight_bytes(),
-            "two accounts of the same memory"
+            dec.held_bytes()
         );
         let status = dec
             .drain_upto(drain_limit, |o, b| sink.put(o, b))
@@ -863,7 +864,7 @@ fn peak_held(
         }
     }
     assert_eq!(sink.bytes(), plain);
-    assert_eq!(dec.held_bytes(), dec.in_flight_bytes());
+    assert_eq!(dec.in_flight_bytes(), 0, "bytes in flight after the end");
     peak
 }
 
@@ -935,9 +936,15 @@ fn a_caller_that_feeds_far_ahead_does_not_keep_the_buffer_it_needed() {
         peak <= LIMIT + FEED_SLACK,
         "peak {peak} over the {LIMIT} byte limit by more than {FEED_SLACK}",
     );
+    // What may remain is the recycling pool at its smallest: one buffer of
+    // each kind, which a decoder keeps whatever the parking cap says so that
+    // the next run does not allocate and fault its pages back in from nothing.
+    // Everything the far-ahead feed grew is gone.
+    let keeps = 2 * (1 << 20) + FEED_SLACK;
     assert!(
-        dec.held_bytes() <= LIMIT / 4 + FEED_SLACK,
-        "{} bytes still held after the stream finished",
+        dec.held_bytes() <= keeps,
+        "{} bytes still held after the stream finished, more than the {keeps} \
+         that one buffer of each kind would be",
         dec.held_bytes()
     );
 }
@@ -984,4 +991,151 @@ fn a_buffer_grown_for_a_large_run_is_not_parked_for_small_ones() {
         tail_peak <= 1 << 20,
         "{tail_peak} bytes held while decoding sixteen-kilobyte runs"
     );
+}
+
+// 15. What the chase decoded, and an accounting that cannot go backwards.
+
+#[test]
+fn the_chase_reports_what_it_decoded() {
+    let (prop, packed, plain) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 2);
+
+    // One thread: every run is decoded on the calling thread, so all of it is
+    // chased.
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(1, u64::MAX)).expect("props");
+    assert_eq!(dec.chase_decoded_bytes(), 0);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    loop {
+        if pos < packed.len() {
+            let end = (pos + (1 << 15)).min(packed.len());
+            pos += dec.feed(&packed[pos..end]).expect("feed");
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        if dec.drain(|o, b| sink.put(o, b)).expect("drain") == DrainStatus::Finished {
+            break;
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert_eq!(dec.chase_decoded_bytes(), plain.len() as u64);
+
+    // Four threads, chasing off, every run complete before the first drain:
+    // the workers take all of it and the caller's thread decodes none.
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    dec.end_of_input();
+    while dec.drain(|o, b| sink.put(o, b)).expect("drain") != DrainStatus::Finished {}
+    assert_eq!(sink.bytes(), plain);
+    assert_eq!(
+        dec.chase_decoded_bytes(),
+        0,
+        "the calling thread decoded a run the workers could have had"
+    );
+}
+
+#[test]
+fn the_accounting_balances_over_runs_of_every_size() {
+    // Runs of wildly unequal size recycle buffers between runs that do not fit
+    // each other, which is where a figure charged one way and refunded another
+    // goes negative. Debug arithmetic panics if it does; the assertions below
+    // are what says it came back to zero.
+    let sizes = [1 << 20, 1 << 12, 3 << 18, 1 << 16, 5 << 19, 1 << 14];
+    let runs: Vec<_> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| copy_run(&pseudo_random(*n, i as u64 + 7)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+
+    for threads in [1usize, 2, 4, 8] {
+        for limit in [u64::MAX, 4 << 20, 1 << 20] {
+            let mut dec = Lzma2AdaptiveDecoder::new(16, &opts(threads, limit)).expect("props");
+            let mut sink = Sink::default();
+            let mut pos = 0usize;
+            loop {
+                if pos < packed.len() {
+                    let end = (pos + 9999).min(packed.len());
+                    pos += dec.feed(&packed[pos..end]).expect("feed");
+                    if pos == packed.len() {
+                        dec.end_of_input();
+                    }
+                }
+                assert!(dec.in_flight_bytes() <= dec.held_bytes());
+                if dec.drain(|o, b| sink.put(o, b)).expect("drain") == DrainStatus::Finished {
+                    break;
+                }
+            }
+            assert_eq!(sink.bytes(), plain, "threads {threads} limit {limit}");
+            assert_eq!(
+                dec.in_flight_bytes(),
+                0,
+                "threads {threads} limit {limit}: bytes in flight after the end"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_caller_that_feeds_far_ahead_still_gets_its_runs_decoded_by_workers() {
+    // What the input buffer is allowed to claim decides whether there is
+    // anything left to decode with. A caller that hands over the whole stream
+    // the moment it has it must not end up with a decoder holding its limit in
+    // input, refusing every dispatch for want of room and decoding the stream
+    // on the calling thread - which is the slow path wearing the fast path's
+    // clothes, and shows up nowhere except in the clock.
+    let runs: Vec<_> = (0..24)
+        .map(|i| copy_run(&pseudo_random(1 << 20, i + 300)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+
+    // Once under a limit that holds only a few runs, once under one that holds
+    // the lot: the rule is the same either way.
+    // A limit that holds only a few runs leaves the chase real work to do -
+    // there are moments when nothing can be dispatched - while a limit that
+    // holds the lot leaves it almost none.
+    for (limit, share) in [(8u64 << 20, 2u64), (512 << 20, 20)] {
+        let mut dec = Lzma2AdaptiveDecoder::new(20, &opts(4, limit)).expect("props");
+        let mut sink = Sink::default();
+        let mut pos = 0usize;
+        let mut peak = 0u64;
+        loop {
+            if pos < packed.len() {
+                // Everything, every turn, for as long as it is taken.
+                pos += dec.feed(&packed[pos..]).expect("feed");
+                if pos == packed.len() {
+                    dec.end_of_input();
+                }
+            }
+            peak = peak.max(dec.held_bytes());
+            let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+            peak = peak.max(dec.held_bytes());
+            if status == DrainStatus::Finished {
+                break;
+            }
+            if status == DrainStatus::NeedsMoreInput && pos == packed.len() {
+                dec.wait_for_worker();
+            }
+        }
+        assert_eq!(sink.bytes(), plain);
+        assert!(
+            peak <= limit + SLACK,
+            "limit {limit}: peak {peak} over it by more than {SLACK}",
+        );
+        // The chase is there to cover the tail of a run that has not arrived,
+        // and here everything has: what it decodes is what the limit forced,
+        // not what a buffer holding the limit forced.
+        let chased = dec.chase_decoded_bytes();
+        assert!(
+            chased * share <= plain.len() as u64,
+            "limit {limit}: {chased} bytes of {} decoded on the calling thread",
+            plain.len(),
+        );
+        assert_eq!(dec.runs_claimed(), runs.len() as u64);
+    }
 }
