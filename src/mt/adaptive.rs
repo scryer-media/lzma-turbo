@@ -49,6 +49,13 @@ const OUT_STEP_ST: usize = 1 << 20;
 /// stream a page at a time.
 const MIN_BUF_BUDGET: u64 = 1 << 20;
 
+/// The size a copied input piece is cut to when the budget allows more.
+///
+/// Small enough that the pieces of a stream are all the same size and so
+/// recycle through the queue's pool, large enough that a run of any ordinary
+/// size still spans only a handful of them.
+const PIECE_TARGET: usize = 4 << 20;
+
 /// Why [`Lzma2AdaptiveDecoder::drain`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStatus {
@@ -115,6 +122,9 @@ struct Stats {
     peak_spare: u64,
     refused_held: u64,
     max_outstanding: u64,
+    in_reused: u64,
+    in_fresh: u64,
+    in_grown: u64,
 }
 
 /// An LZMA2 decoder that is fed input and switches between single- and
@@ -519,8 +529,25 @@ impl Lzma2AdaptiveDecoder {
         // Into a buffer the decode has finished with where there is one: on a
         // stream of large runs this is the difference between faulting in
         // every page of the input once and faulting in none of them.
-        let mut buf = self.segs.take_spare().unwrap_or_default();
+        let mut buf = match self.segs.take_spare() {
+            Some(buf) => {
+                self.stats.in_reused += 1;
+                buf
+            }
+            None => {
+                self.stats.in_fresh += 1;
+                Vec::new()
+            }
+        };
         buf.clear();
+        // In pieces of a size that repeats. A copy sized to whatever room
+        // happens to be free makes every piece a different size, so a parked
+        // one rarely fits the next and the allocator maps and unmaps a large
+        // region per piece; a steady size means the same few allocations serve
+        // the whole stream. A buffer already in hand is used to its capacity,
+        // whatever that is - it is mapped either way.
+        let take = take.min(PIECE_TARGET.max(buf.capacity()));
+        self.stats.in_grown += u64::from(buf.capacity() < take);
         buf.try_reserve_exact(take).map_err(|_| Error::Alloc)?;
         buf.extend_from_slice(&data[..take]);
         self.segs.push_owned(buf);
