@@ -527,6 +527,24 @@ impl Lzma2AdaptiveDecoder {
         Ok(take)
     }
 
+    /// Hands back an allocation the decode has finished with, emptied.
+    ///
+    /// A caller that hands buffers over with
+    /// [`feed_owned`](Lzma2AdaptiveDecoder::feed_owned) has given the decoder
+    /// the allocation, and reading the next piece into a fresh one costs a
+    /// page fault per page. This returns one the decoder is done with, cleared
+    /// and with its capacity intact, to be filled and handed over again.
+    ///
+    /// A piece the decoder or one of its workers is still reading is never
+    /// returned here, and neither is a range a caller lent with
+    /// [`feed_shared`](Lzma2AdaptiveDecoder::feed_shared), which was never the
+    /// decoder's to give. `None` means there is nothing spare, and the caller
+    /// should allocate.
+    #[must_use]
+    pub fn reclaim_piece(&mut self) -> Option<Vec<u8>> {
+        self.segs.take_spare()
+    }
+
     /// Adds a piece of the stream the decoder takes ownership of.
     ///
     /// Nothing is copied: the piece becomes the decoder's, workers are handed

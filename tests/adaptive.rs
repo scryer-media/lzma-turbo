@@ -1253,3 +1253,139 @@ fn a_caller_lending_part_of_its_own_buffer_decodes_the_same_stream() {
     // The caller's buffer is its own again, and untouched.
     assert_eq!(*whole, packed);
 }
+
+/// The same handover as the test above, over a stream small enough to run
+/// under Miri, which the 24 MiB one is not: two megabytes takes about a
+/// quarter of an hour there.
+#[test]
+fn handing_buffers_over_and_taking_them_back_decodes_the_same_stream() {
+    let runs: Vec<_> = (0..8)
+        .map(|i| copy_run(&pseudo_random(1 << 18, i + 700)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 2 << 20;
+    const READ: usize = 1 << 18;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(18, &opts(3, LIMIT)).expect("props");
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut peak = 0u64;
+    let mut turns = 0u32;
+    // Which allocations the reader ever used: the point of handing buffers
+    // back is that this stays a handful however long the stream is.
+    let mut seen: Vec<usize> = Vec::new();
+    let mut offered: Option<Vec<u8>> = None;
+    loop {
+        loop {
+            if offered.is_none() && pos < packed.len() {
+                // The buffer the decoder has finished with, where there is
+                // one, filled again - which is what a reader does.
+                let mut buf = dec.reclaim_piece().unwrap_or_default();
+                assert!(buf.is_empty(), "a reclaimed buffer comes back empty");
+                let end = (pos + READ).min(packed.len());
+                buf.extend_from_slice(&packed[pos..end]);
+                pos = end;
+                let id = buf.as_ptr() as usize;
+                if !seen.contains(&id) {
+                    seen.push(id);
+                }
+                offered = Some(buf);
+            }
+            let Some(seg) = offered.take() else { break };
+            offered = dec.feed_owned(seg).expect("feed_owned");
+            if offered.is_some() {
+                break;
+            }
+            if pos == packed.len() {
+                dec.end_of_input();
+                break;
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        while dec.wait_for_worker() {}
+        turns += 1;
+        assert!(turns < 10_000, "no progress in {turns} turns");
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert!(
+        peak <= LIMIT + SLACK,
+        "peak {peak} over the {LIMIT} byte limit by more than {SLACK}",
+    );
+    // However few reads this stream is, no buffer was ever handed back while
+    // the decoder was still reading it: every one that came back was empty,
+    // asserted above, and the decode agrees with the plain bytes.
+    assert!(!seen.is_empty());
+    // Nothing of the stream is left in flight once it has finished.
+    while dec.reclaim_piece().is_some() {}
+    assert_eq!(dec.in_flight_bytes(), 0);
+}
+
+#[test]
+fn a_reader_that_takes_its_buffers_back_stops_allocating() {
+    // The same handover over a stream long enough to reach a steady state:
+    // once the decode is keeping up, every read goes into a buffer the
+    // decoder has finished with, so the number of allocations stops growing
+    // with the length of the stream and settles at how far ahead the reader
+    // is allowed to be.
+    let runs: Vec<_> = (0..24)
+        .map(|i| copy_run(&pseudo_random(1 << 20, i + 800)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 8 << 20;
+    const READ: usize = 1 << 20;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(20, &opts(4, LIMIT)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut turns = 0u32;
+    let mut reads = 0usize;
+    let mut seen: Vec<usize> = Vec::new();
+    let mut offered: Option<Vec<u8>> = None;
+    loop {
+        loop {
+            if offered.is_none() && pos < packed.len() {
+                let mut buf = dec.reclaim_piece().unwrap_or_default();
+                let end = (pos + READ).min(packed.len());
+                buf.extend_from_slice(&packed[pos..end]);
+                pos = end;
+                reads += 1;
+                let id = buf.as_ptr() as usize;
+                if !seen.contains(&id) {
+                    seen.push(id);
+                }
+                offered = Some(buf);
+            }
+            let Some(seg) = offered.take() else { break };
+            offered = dec.feed_owned(seg).expect("feed_owned");
+            if offered.is_some() {
+                break;
+            }
+            if pos == packed.len() {
+                dec.end_of_input();
+                break;
+            }
+        }
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        if status == DrainStatus::Finished {
+            break;
+        }
+        while dec.wait_for_worker() {}
+        turns += 1;
+        assert!(turns < 10_000, "no progress in {turns} turns");
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert_eq!(dec.runs_claimed(), runs.len() as u64);
+    // Half the reads would be a poor showing; the point is that it is a
+    // handful and does not track the stream.
+    assert!(
+        seen.len() * 2 <= reads,
+        "{} allocations for {reads} reads",
+        seen.len(),
+    );
+}
