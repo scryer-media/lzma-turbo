@@ -1389,3 +1389,68 @@ fn a_reader_that_takes_its_buffers_back_stops_allocating() {
         seen.len(),
     );
 }
+
+#[test]
+fn a_whole_piece_a_little_larger_than_the_budget_is_still_taken() {
+    // The budget is written in run sizes, and until a run has been scanned
+    // there are none, so what it falls back to decides whether a caller that
+    // cannot cut its pieces up gets anywhere at all. Here every piece is a
+    // few bytes over the smallest budget there is, under a limit tight enough
+    // that no budget written from a run size reaches one either: the geometry
+    // that used to stall such a caller outright. The chase is switched off,
+    // which is what makes the stall visible: with it on the decoder crawls
+    // through the stream single-threaded instead of stopping, and a caller
+    // cannot tell the two apart. At a limit this tight the chase still takes
+    // the runs it has no other way to finish, and that is fine; what the
+    // decoder may not do is refuse input it has the room for and then wait
+    // for it.
+    let runs: Vec<_> = (0..6)
+        .map(|i| copy_run(&pseudo_random(1 << 20, i + 900)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 4 << 20;
+    // A megabyte and a little: larger than the floor, larger than half of
+    // what a tight limit leaves, and indivisible.
+    const READ: usize = (1 << 20) + 48;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(22, &opts(3, LIMIT)).expect("props");
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut turns = 0u32;
+    let mut peak = 0u64;
+    let mut offered: Option<Vec<u8>> = None;
+    loop {
+        loop {
+            if offered.is_none() && pos < packed.len() {
+                let end = (pos + READ).min(packed.len());
+                offered = Some(packed[pos..end].to_vec());
+                pos = end;
+            }
+            let Some(seg) = offered.take() else { break };
+            offered = dec.feed_owned(seg).expect("feed_owned");
+            if offered.is_some() {
+                break;
+            }
+            if pos == packed.len() {
+                dec.end_of_input();
+                break;
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        while dec.wait_for_worker() {}
+        turns += 1;
+        assert!(turns < 10_000, "no progress in {turns} turns");
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert_eq!(dec.runs_claimed(), runs.len() as u64);
+    assert!(
+        peak <= LIMIT + SLACK,
+        "peak {peak} over the {LIMIT} byte limit by more than {SLACK}",
+    );
+}

@@ -703,7 +703,23 @@ impl Lzma2AdaptiveDecoder {
             }
             room = ceiling.saturating_sub(held);
         }
-        let take = usize::try_from(room).unwrap_or(usize::MAX).min(len);
+        let mut take = usize::try_from(room).unwrap_or(usize::MAX).min(len);
+        if whole && take < len && !self.has_work_in_hand() {
+            // A piece handed over whole cannot be cut down to the budget, and
+            // the decoder has nothing else it could be getting on with, so the
+            // only question left is whether the limit has room for it at all.
+            // Anything narrower than that deadlocks a caller whose pieces are
+            // a little larger than the budget happens to be - the budget is
+            // written in run sizes, and before a run is known there are none.
+            // Only for the first pieces, though: the point is to get a caller
+            // that cannot cut its pieces up past a budget that is smaller than
+            // one of them, not to let read-ahead take the limit and leave the
+            // decode with no room to run in.
+            let fits = self.input_free().saturating_sub(held);
+            if len as u64 <= fits && held < (len as u64).saturating_mul(2) {
+                take = len;
+            }
+        }
         if whole && take < len {
             return Ok(0);
         }
