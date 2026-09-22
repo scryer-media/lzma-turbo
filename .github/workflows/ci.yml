@@ -88,7 +88,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --exclude wasm-conformance --all-targets --all-features -- -D warnings
 
   docs:
     name: docs
@@ -140,7 +140,7 @@ jobs:
       # happened to be on PATH. That is why there is no setup-nasm step here
       # and why Windows no longer skips the default build.
       - name: Test with the assembly decode loop (default)
-        run: cargo test --locked --workspace --no-fail-fast
+        run: cargo test --locked --workspace --exclude wasm-conformance --no-fail-fast
       - name: Test with the portable decode loop
         run: cargo test --locked -p lzma-turbo --no-default-features --features std --no-fail-fast
       - name: Test without std
@@ -246,6 +246,10 @@ jobs:
   # quietly checksumming in-guest. Ubuntu's runner image ships rustup, so the
   # wasip1 std is one `target add` away; without it the tests self-skip, which
   # is why the target is installed explicitly rather than left to chance.
+  #
+  # The harness is `tools/wasm-conformance`, the one crate in the workspace
+  # that depends on wasmtime. Every other job excludes it, so this is the only
+  # place wasmtime is compiled; its clippy runs here for the same reason.
   wasm-conformance:
     name: wasm-conformance
     runs-on: ubuntu-24.04
@@ -258,16 +262,17 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
+          components: clippy
       - name: The wasip1 std must really be present, not merely nameable
         run: |
           set -eu
           rustup target add wasm32-wasip1
           libdir="$(rustc --print target-libdir --target wasm32-wasip1)"
           test -d "$libdir" || { echo "no wasm32-wasip1 std at $libdir" >&2; exit 1; }
+      - name: Lint the harness
+        run: cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
       - name: Decode an .xz of each check type through host hooks
-        run: |
-          cargo test --locked -p lzma-turbo --features crc-host,crypto-host \
-            --test wasm_host_conformance
+        run: cargo test --locked -p wasm-conformance
 
   msrv:
     name: msrv
