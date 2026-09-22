@@ -75,6 +75,14 @@ crypto-host = ["std", "native-crypto"]
 # shipped build has neither the branch nor the environment lookup. See
 # `src/kernel_ab.rs` and `docs/simd-kernels-report.md`.
 kernel-ab = ["std", "enc", "xz"]
+# Diagnostic counters inside the adaptive decoder, never default. It records
+# what the dispatcher did with each run - sent, refused, chased, and the peaks
+# of everything charged against the memory limit - and prints them when the
+# decoder is dropped and `LZMA_ADAPTIVE_STATS` is set in the environment, so
+# that a memory or scheduling regression can be attributed to a mechanism
+# rather than guessed at. Without it the shipped decoder carries neither the
+# counters nor the sampling that maintains them. See `src/mt/adaptive.rs`.
+adaptive-stats = ["std"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }

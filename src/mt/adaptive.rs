@@ -96,9 +96,24 @@ enum Dispatch {
     Chase,
 }
 
-/// Diagnostic counters. Temporary: printed at drop when `LZMA_ADAPTIVE_STATS`
-/// is set, so that a regression can be attributed to a mechanism rather than
-/// guessed at.
+/// Records one diagnostic counter, and nothing at all unless the counters are
+/// built. Every use of `Stats` goes through it, so a default build carries
+/// neither the arithmetic nor the fields it would write to.
+macro_rules! stat {
+    ($($t:tt)*) => {
+        #[cfg(feature = "adaptive-stats")]
+        {
+            $($t)*
+        }
+    };
+}
+
+/// Diagnostic counters, so that a regression can be attributed to a mechanism
+/// rather than guessed at. Behind `adaptive-stats`, which is not a default
+/// feature: they are for a decoder under a profiler, not for the decoder a
+/// program ships. With the feature on they are printed when the decoder is
+/// dropped and `LZMA_ADAPTIVE_STATS` is set in the environment.
+#[cfg(feature = "adaptive-stats")]
 #[derive(Default, Debug)]
 struct Stats {
     sent: u64,
@@ -129,6 +144,7 @@ struct Stats {
 /// An LZMA2 decoder that is fed input and switches between single- and
 /// multi-threaded decoding while it runs.
 pub struct Lzma2AdaptiveDecoder {
+    #[cfg(feature = "adaptive-stats")]
     stats: Stats,
     dict_prop: u8,
     memory_limit: u64,
@@ -220,6 +236,7 @@ pub struct Lzma2AdaptiveDecoder {
     cancelled: bool,
 }
 
+#[cfg(feature = "adaptive-stats")]
 impl Drop for Lzma2AdaptiveDecoder {
     fn drop(&mut self) {
         if std::env::var_os("LZMA_ADAPTIVE_STATS").is_some() {
@@ -260,6 +277,7 @@ impl Lzma2AdaptiveDecoder {
             return Err(Error::UnsupportedProps);
         }
         Ok(Lzma2AdaptiveDecoder {
+            #[cfg(feature = "adaptive-stats")]
             stats: Stats::default(),
             dict_prop,
             memory_limit: options.memory_limit,
@@ -437,6 +455,7 @@ impl Lzma2AdaptiveDecoder {
     }
 
     /// Samples the accounting for the diagnostic counters.
+    #[cfg(feature = "adaptive-stats")]
     fn note_peak(&mut self) {
         let held = self.held_bytes();
         if held > self.stats.peak_held {
@@ -448,6 +467,11 @@ impl Lzma2AdaptiveDecoder {
         self.stats.peak_spare = self.stats.peak_spare.max(self.spare_cap);
         self.stats.max_outstanding = self.stats.max_outstanding.max(self.outstanding as u64);
     }
+
+    /// Samples the accounting for the diagnostic counters. Built away with
+    /// them.
+    #[cfg(not(feature = "adaptive-stats"))]
+    fn note_peak(&mut self) {}
 
     /// Every byte of buffer the decoder is holding.
     ///
@@ -526,11 +550,11 @@ impl Lzma2AdaptiveDecoder {
         // every page of the input once and faulting in none of them.
         let mut buf = match self.segs.take_spare() {
             Some(buf) => {
-                self.stats.in_reused += 1;
+                stat!(self.stats.in_reused += 1;);
                 buf
             }
             None => {
-                self.stats.in_fresh += 1;
+                stat!(self.stats.in_fresh += 1;);
                 Vec::new()
             }
         };
@@ -542,7 +566,7 @@ impl Lzma2AdaptiveDecoder {
         // the whole stream. A buffer already in hand is used to its capacity,
         // whatever that is - it is mapped either way.
         let take = take.min(PIECE_TARGET.max(buf.capacity()));
-        self.stats.in_grown += u64::from(buf.capacity() < take);
+        stat!(self.stats.in_grown += u64::from(buf.capacity() < take););
         buf.try_reserve_exact(take).map_err(|_| Error::Alloc)?;
         buf.extend_from_slice(&data[..take]);
         self.segs.push_owned(buf);
@@ -918,7 +942,7 @@ impl Lzma2AdaptiveDecoder {
                 Dispatch::Sent => did = true,
                 Dispatch::Busy => {}
                 Dispatch::Chase => {
-                    self.stats.chase_steps += 1;
+                    stat!(self.stats.chase_steps += 1;);
                     if self.st_step(&mut sink, &mut left)? {
                         did = true;
                     }
@@ -945,7 +969,7 @@ impl Lzma2AdaptiveDecoder {
                     let waiting_for_input =
                         !self.chase && !self.input_done && self.held_bytes() < self.memory_limit;
                     if !busy && !waiting_for_input {
-                        self.stats.chase_steps_none_arm += 1;
+                        stat!(self.stats.chase_steps_none_arm += 1;);
                         if self.st_step(&mut sink, &mut left)? {
                             did = true;
                         }
@@ -1186,11 +1210,11 @@ impl Lzma2AdaptiveDecoder {
             .max(OUT_STEP_ST as u64);
         let held = self.spare_out.len();
         if held < self.threads + 2 && self.worth_parking(buf.capacity(), want, held) {
-            self.stats.parked_out += 1;
+            stat!(self.stats.parked_out += 1;);
             self.spare_cap += buf.capacity() as u64;
             self.spare_out.push(buf);
         } else {
-            self.stats.dropped_out += 1;
+            stat!(self.stats.dropped_out += 1;);
         }
     }
 
@@ -1246,23 +1270,23 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Dispatch::None);
         }
         if self.threads <= 1 {
-            self.stats.chase_threads1 += 1;
+            stat!(self.stats.chase_threads1 += 1;);
             return Ok(Dispatch::Chase);
         }
         if self.st_in_run {
-            self.stats.chase_st_in_run += 1;
+            stat!(self.stats.chase_st_in_run += 1;);
             return Ok(Dispatch::Chase);
         }
         let Some(run) = self.pending.front().copied() else {
-            self.stats.none += 1;
+            stat!(self.stats.none += 1;);
             return Ok(Dispatch::None);
         };
         if run.in_offset != self.cursor_in {
-            self.stats.none += 1;
+            stat!(self.stats.none += 1;);
             return Ok(Dispatch::None);
         }
         if self.outstanding >= self.threads {
-            self.stats.busy += 1;
+            stat!(self.stats.busy += 1;);
             return Ok(Dispatch::Busy);
         }
         let unpacked = usize::try_from(run.unpacked_len).map_err(|_| Error::Alloc)?;
@@ -1280,19 +1304,19 @@ impl Lzma2AdaptiveDecoder {
         // allocating more.
         let size = run.unpacked_len + run.packed_len;
         if size > self.memory_limit {
-            self.stats.chase_too_big += 1;
+            stat!(self.stats.chase_too_big += 1;);
             return Ok(Dispatch::Chase);
         }
         if !self.room_for(run) {
             // Room appears when an outstanding block lands. If none is
             // outstanding there is nothing to wait for, so the chase decoder
             // takes it and streams it instead.
-            self.stats.refused_held += self.held_bytes();
+            stat!(self.stats.refused_held += self.held_bytes(););
             return Ok(if self.outstanding == 0 {
-                self.stats.chase_no_room += 1;
+                stat!(self.stats.chase_no_room += 1;);
                 Dispatch::Chase
             } else {
-                self.stats.busy += 1;
+                stat!(self.stats.busy += 1;);
                 Dispatch::Busy
             });
         }
@@ -1316,7 +1340,7 @@ impl Lzma2AdaptiveDecoder {
         }
         if pool.spawned() == 0 {
             // No thread could be created; fall back to decoding inline.
-            self.stats.chase_pool_empty += 1;
+            stat!(self.stats.chase_pool_empty += 1;);
             return Ok(Dispatch::Chase);
         }
 
@@ -1341,8 +1365,8 @@ impl Lzma2AdaptiveDecoder {
             held,
         })?;
 
-        self.stats.sent += 1;
-        self.stats.worker_bytes += run.unpacked_len;
+        stat!(self.stats.sent += 1;);
+        stat!(self.stats.worker_bytes += run.unpacked_len;);
         self.outstanding_unpacked += run.unpacked_len;
         self.outstanding += 1;
         self.outstanding_bytes += held;
