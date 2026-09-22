@@ -516,7 +516,14 @@ impl Lzma2AdaptiveDecoder {
         if take == 0 {
             return Ok(0);
         }
-        self.segs.push_owned(data[..take].to_vec());
+        // Into a buffer the decode has finished with where there is one: on a
+        // stream of large runs this is the difference between faulting in
+        // every page of the input once and faulting in none of them.
+        let mut buf = self.segs.take_spare().unwrap_or_default();
+        buf.clear();
+        buf.try_reserve_exact(take).map_err(|_| Error::Alloc)?;
+        buf.extend_from_slice(&data[..take]);
+        self.segs.push_owned(buf);
         Ok(take)
     }
 
@@ -608,7 +615,11 @@ impl Lzma2AdaptiveDecoder {
             return Ok(0);
         }
         self.release_input();
-        let held = self.segs.held_bytes();
+        // Parked allocations do not stand in the way of the next piece: a copy
+        // goes straight into one, so counting it twice - once where it sits
+        // and again in the room the piece needs - would refuse input for
+        // memory that is about to be the input.
+        let held = self.segs.held_bytes() - self.segs.spare_bytes();
         let mut ceiling = self.buf_budget();
         if !self.has_work_in_hand() {
             ceiling = ceiling.max(self.buf_budget_for(1));
@@ -933,6 +944,13 @@ impl Lzma2AdaptiveDecoder {
     /// move down and no capacity to shrink, because the pieces were never
     /// copied into anything.
     fn release_input(&mut self) {
+        // What a piece the stream is past may be kept for, and in how many
+        // buffers: the same allowance the output pool works to, so that
+        // recycling never sits on a large part of the limit it would otherwise
+        // be dispatching with.
+        let piece = self.segs.last_piece().max(MIN_BUF_BUDGET);
+        let room = (self.memory_limit / 8).min(piece.saturating_mul(self.threads as u64 + 2));
+        self.segs.set_park_budget(room, self.threads + 2);
         self.segs.retain_from(self.cursor_in);
     }
 

@@ -53,6 +53,11 @@ pub(crate) struct Seg {
     /// for the bytes lent, because that is what the decoder added to the
     /// caller's footprint.
     charge: u64,
+    /// Whether the allocation is the decoder's own, and so whether it can be
+    /// kept for the next piece when the stream is past this one. A range lent
+    /// by a caller is not the decoder's to keep; a copy it made, or a buffer
+    /// handed over outright, is.
+    owned: bool,
 }
 
 impl Seg {
@@ -78,8 +83,30 @@ pub(crate) struct SegQueue {
     base: u64,
     /// One past the last stream offset held.
     end: u64,
-    /// What every piece above is charged, together.
+    /// What every piece above is charged, together, plus the parked
+    /// allocations below.
     held: u64,
+    /// Allocations the stream is past, kept for the next piece rather than
+    /// given back to the allocator.
+    ///
+    /// Copying a chunk of input into a fresh allocation and freeing it once
+    /// its runs are claimed costs a page fault per page on the way in and a
+    /// call to the allocator each way. On a stream whose runs are large that
+    /// was the whole cost of holding input as pieces: a gigabyte of input is
+    /// two hundred and fifty thousand faults that a reused buffer does not
+    /// pay. So a piece of the decoder's own is emptied and kept, and the next
+    /// copy goes into it.
+    spare: Vec<Vec<u8>>,
+    /// What the parked allocations cost, counted inside `held`.
+    spare_bytes: u64,
+    /// The most that may sit parked, and in how many buffers. Set by the
+    /// decoder, which is what knows the memory limit.
+    park_room: u64,
+    park_slots: usize,
+    /// The length of the last piece taken: what the next one is expected to
+    /// ask for, and so the size a parked buffer has to be near to be worth
+    /// keeping.
+    last_piece: u64,
 }
 
 impl SegQueue {
@@ -87,16 +114,16 @@ impl SegQueue {
     pub(crate) fn push_owned(&mut self, seg: Vec<u8>) {
         let charge = seg.capacity() as u64;
         let range = 0..seg.len();
-        self.push(Arc::new(seg), range, charge);
+        self.push(Arc::new(seg), range, charge, true);
     }
 
     /// Takes a piece of input the caller is keeping a reference to.
     pub(crate) fn push_shared(&mut self, data: &Arc<Vec<u8>>, range: Range<usize>) {
         let charge = (range.end - range.start) as u64;
-        self.push(Arc::clone(data), range, charge);
+        self.push(Arc::clone(data), range, charge, false);
     }
 
-    fn push(&mut self, data: Arc<Vec<u8>>, range: Range<usize>, charge: u64) {
+    fn push(&mut self, data: Arc<Vec<u8>>, range: Range<usize>, charge: u64, owned: bool) {
         debug_assert!(range.end <= data.len());
         let data = Arc::new(SegData { data });
         if range.is_empty() {
@@ -109,9 +136,36 @@ impl SegQueue {
             range,
             start,
             charge,
+            owned,
         });
         self.end += len;
         self.held += charge;
+        self.last_piece = len;
+    }
+
+    /// Says how much may sit parked: at most `room` bytes in at most `slots`
+    /// buffers. The decoder sets this, because what a small part of the limit
+    /// is is the decoder's arithmetic and not the queue's.
+    pub(crate) fn set_park_budget(&mut self, room: u64, slots: usize) {
+        self.park_room = room;
+        self.park_slots = slots;
+    }
+
+    /// An allocation the stream is past, emptied, for the next piece.
+    ///
+    /// Only ever a buffer nothing holds any more: a piece the decoder or one
+    /// of its workers is still reading is never handed out here.
+    pub(crate) fn take_spare(&mut self) -> Option<Vec<u8>> {
+        let buf = self.spare.pop()?;
+        let cap = buf.capacity() as u64;
+        self.spare_bytes -= cap;
+        self.held -= cap;
+        Some(buf)
+    }
+
+    /// The length of the last piece taken.
+    pub(crate) fn last_piece(&self) -> u64 {
+        self.last_piece
     }
 
     /// One past the last stream offset held.
@@ -129,13 +183,24 @@ impl SegQueue {
     /// holds. Transient, and the measure of how much room a budget has to
     /// leave beyond the run it wants to hold.
     pub(crate) fn dead_bytes(&self) -> u64 {
-        self.held.saturating_sub(self.len())
+        self.held
+            .saturating_sub(self.len())
+            .saturating_sub(self.spare_bytes)
     }
 
     /// What every piece the decoder is keeping alive costs, whether it is
-    /// still in the queue or out with a worker.
+    /// still in the queue or out with a worker, plus what sits parked.
     pub(crate) fn held_bytes(&self) -> u64 {
         self.held
+    }
+
+    /// What sits parked, waiting to be filled again.
+    ///
+    /// Charged, because it is memory the decoder is holding, but not an
+    /// obstacle to taking more input: the next piece copied goes into it, so
+    /// what it costs is already counted against the piece it will become.
+    pub(crate) fn spare_bytes(&self) -> u64 {
+        self.spare_bytes
     }
 
     /// The contiguous run of bytes that starts at `offset`, or nothing when
@@ -203,6 +268,9 @@ impl SegQueue {
                 // memory twice; what keeps it honest is that the queue goes on
                 // charging until the last holder is gone.
                 charge: 0,
+                // A claim is a reader of someone else's allocation, whatever
+                // that allocation is: nothing it drops is the queue's to keep.
+                owned: false,
             });
         }
         Some(out)
@@ -236,9 +304,45 @@ impl SegQueue {
     fn release(&mut self, seg: Seg) {
         if Arc::strong_count(&seg.data) > 1 {
             self.lent.push(seg);
-        } else {
-            self.held -= seg.charge;
+            return;
         }
+        self.give_back(seg);
+    }
+
+    /// Takes the charge off a piece nothing holds any more, and keeps its
+    /// allocation if it is one of the decoder's own and the right size for
+    /// what is arriving.
+    fn give_back(&mut self, seg: Seg) {
+        self.held -= seg.charge;
+        if !seg.owned {
+            return;
+        }
+        // The last holder of an allocation of the decoder's own: take the
+        // buffer back out of its handles and park it if it is the size the
+        // next piece will want.
+        let Ok(data) = Arc::try_unwrap(seg.data) else {
+            return;
+        };
+        let Ok(mut buf) = Arc::try_unwrap(data.data) else {
+            return;
+        };
+        let cap = buf.capacity() as u64;
+        if self.last_piece != 0 && cap > self.last_piece.saturating_mul(2) {
+            return;
+        }
+        // One is always worth keeping - it is what recycling needs, and it is
+        // what the next piece will ask for - and beyond that only while what
+        // is parked stays inside the decoder's allowance.
+        let first = self.spare.is_empty();
+        if !first
+            && (self.spare.len() >= self.park_slots || self.spare_bytes + cap > self.park_room)
+        {
+            return;
+        }
+        buf.clear();
+        self.spare_bytes += cap;
+        self.held += cap;
+        self.spare.push(buf);
     }
 
     /// Gives back every set-aside piece whose last other holder has gone.
@@ -247,7 +351,7 @@ impl SegQueue {
         while i < self.lent.len() {
             if Arc::strong_count(&self.lent[i].data) == 1 {
                 let seg = self.lent.swap_remove(i);
-                self.held -= seg.charge;
+                self.give_back(seg);
             } else {
                 i += 1;
             }
@@ -258,6 +362,8 @@ impl SegQueue {
     pub(crate) fn clear(&mut self) {
         self.q.clear();
         self.lent.clear();
+        self.spare.clear();
+        self.spare_bytes = 0;
         self.held = 0;
         self.base = self.end;
     }
@@ -285,13 +391,62 @@ mod tests {
         assert_eq!(q.held_bytes(), 200);
         assert_eq!(q.dead_bytes(), 50);
 
+        // Past the first piece: its bytes are no longer the stream's, but the
+        // allocation is kept for the next piece, so it is still charged - and
+        // it is not dead weight, because a copy will go into it.
         q.retain_from(100);
-        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.held_bytes(), 200);
+        assert_eq!(q.spare_bytes(), 100);
         assert_eq!(q.dead_bytes(), 0);
 
         q.retain_from(200);
-        assert_eq!(q.held_bytes(), 0);
+        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.spare_bytes(), 100);
         assert_eq!(q.len(), 0);
+
+        // And it comes back emptied, with its capacity, for the next piece.
+        let buf = q.take_spare().expect("parked");
+        assert!(buf.is_empty());
+        assert!(buf.capacity() >= 100);
+        assert_eq!(q.held_bytes(), 0);
+        assert!(q.take_spare().is_none());
+    }
+
+    #[test]
+    fn what_is_parked_stays_inside_the_allowance() {
+        let mut q = SegQueue::default();
+        q.set_park_budget(250, 2);
+        for i in 0..5u8 {
+            q.push_owned(piece(100, i));
+        }
+        q.retain_from(500);
+        // One is always kept; beyond that, two buffers and 250 bytes are all
+        // the allowance permits, so the rest go back to the allocator.
+        assert_eq!(q.spare_bytes(), 200);
+        assert_eq!(q.held_bytes(), 200);
+
+        // A buffer far larger than the pieces now arriving is not worth
+        // keeping, whatever the allowance says.
+        let mut q = SegQueue::default();
+        q.set_park_budget(1 << 20, 4);
+        q.push_owned(piece(4096, 1));
+        q.push_owned(piece(100, 2));
+        q.retain_from(4096 + 100);
+        assert_eq!(q.spare_bytes(), 100);
+    }
+
+    #[test]
+    fn a_lent_range_is_never_parked() {
+        let buf = Arc::new(piece(100, 3));
+        let mut q = SegQueue::default();
+        q.set_park_budget(1 << 20, 4);
+        q.push_shared(&buf, 0..100);
+        q.retain_from(100);
+        // The allocation was the caller's, so there is nothing to keep.
+        assert_eq!(q.spare_bytes(), 0);
+        assert_eq!(q.held_bytes(), 0);
+        assert!(q.take_spare().is_none());
+        assert_eq!(Arc::strong_count(&buf), 1);
     }
 
     #[test]
@@ -312,6 +467,11 @@ mod tests {
 
         drop(claim);
         q.sweep();
+        // Charged no longer for a piece of the stream, but for an allocation
+        // kept to be filled again.
+        assert_eq!(q.spare_bytes(), 100);
+        assert_eq!(q.held_bytes(), 100);
+        assert!(q.take_spare().is_some());
         assert_eq!(q.held_bytes(), 0);
     }
 
