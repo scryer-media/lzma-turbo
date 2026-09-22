@@ -1,17 +1,5 @@
 # Changelog
 
-## 0.6.1 - 2026-09-22
-
-- The wasm host-hook conformance harness moved out of `tests/` into
-  `tools/wasm-conformance`, a workspace member excluded from every
-  workspace-wide `cargo test` and `cargo clippy` (CI, release, `cargo xtask
-  release`). `wasmtime` was a dev-dependency of the crate itself, so every
-  `cargo test` built it; now only the harness's own CI job does.
-- `mt::Lzma2AdaptiveDecoder`'s input refill takes its spare buffer with
-  `unwrap_or_default` rather than a hand-written match. Same behaviour; it
-  is what clippy asks for on the default feature set, which the harness's
-  lint now covers.
-
 ## 0.6.0 - 2026-09-22
 
 - `mt::Lzma2AdaptiveDecoder`: input is held as the pieces it arrived in rather
