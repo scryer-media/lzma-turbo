@@ -200,6 +200,9 @@ pub struct Lzma2AdaptiveDecoder {
     /// What the last run dispatched needed, unpacked and packed. What a parked
     /// buffer is worth keeping for, once the backlog is empty.
     last_unpacked: u64,
+    /// Input allowed while no run size is known. Doubles on demand; see
+    /// [`Lzma2AdaptiveDecoder::room_to_take`].
+    scan_reserve: u64,
     last_packed: u64,
 
     // What each run's decoder checksummed, worker or chase alike. See
@@ -293,6 +296,7 @@ impl Lzma2AdaptiveDecoder {
             ready_bytes: 0,
             chase_bytes: 0,
             last_unpacked: 0,
+            scan_reserve: MIN_BUF_BUDGET,
             last_packed: 0,
             #[cfg(feature = "crc")]
             plan: ChecksumPlan::none(),
@@ -669,7 +673,36 @@ impl Lzma2AdaptiveDecoder {
         if !self.has_work_in_hand() {
             ceiling = ceiling.max(self.buf_budget_for(1));
         }
-        let room = ceiling.saturating_sub(held);
+        let mut room = ceiling.saturating_sub(held);
+        // Before the scanner has seen a whole run there is no run size to
+        // reckon a budget from, and how much input the first one needs is a
+        // property of the stream, not of the limit. Rather than hand out half
+        // the limit against that unknown - which a read-ahead caller takes
+        // immediately and which is then the peak for the whole decode - the
+        // scan reserve starts small and doubles each time the caller has
+        // filled it and the decoder still has nothing to do with what it
+        // holds. The stream's own first run is what stops the doubling: once
+        // its size is known the ordinary budget takes over, so the peak
+        // settles just above what finding that run actually cost.
+        //
+        // A caller handing over a whole piece needs room for all of it or it
+        // is refused outright, so that is what the reserve has to reach for.
+        let need = if whole { len as u64 } else { 1 };
+        while room < need
+            && self.known_run() == 0
+            && !self.has_work_in_hand()
+            && self.scan_reserve < self.input_free() / 2
+        {
+            self.scan_reserve = self
+                .scan_reserve
+                .saturating_mul(2)
+                .min(self.input_free() / 2);
+            let mut ceiling = self.buf_budget();
+            if !self.has_work_in_hand() {
+                ceiling = ceiling.max(self.buf_budget_for(1));
+            }
+            room = ceiling.saturating_sub(held);
+        }
         let take = usize::try_from(room).unwrap_or(usize::MAX).min(len);
         if whole && take < len {
             return Ok(0);
@@ -728,6 +761,10 @@ impl Lzma2AdaptiveDecoder {
             .map_or(0, |r| r.unpacked_len)
             .max(self.last_unpacked);
         let work = run_in.saturating_add(run_out).saturating_mul(slots);
+        // Nothing is known about the runs yet: the scan reserve says how much
+        // input to accept against that, and it is what grows when the scan
+        // needs more. See `room_to_take`.
+        let unknown = run_in == 0 && run_out == 0;
         // A run's packed bytes are not quite enough to claim it: the scanner
         // has to see where the next run starts before it will say the last one
         // is complete, so the floor carries a header's worth beyond it.
@@ -745,7 +782,12 @@ impl Lzma2AdaptiveDecoder {
             .dead_bytes()
             .saturating_add(run_in)
             .saturating_add(MIN_BUF_BUDGET);
-        free.saturating_sub(work).min(free / 2).max(floor).min(free)
+        let share = if unknown {
+            self.scan_reserve
+        } else {
+            free.saturating_sub(work)
+        };
+        share.min(free / 2).max(floor).min(free)
     }
 
     /// Declares that no more input is coming. A stream that then does not end
