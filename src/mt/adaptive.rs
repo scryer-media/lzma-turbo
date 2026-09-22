@@ -117,7 +117,6 @@ struct Stats {
     peak_held: u64,
     peak_buf_cap: u64,
     peak_out_flight: u64,
-    peak_packed_flight: u64,
     peak_ready: u64,
     peak_spare: u64,
     refused_held: u64,
@@ -167,9 +166,8 @@ pub struct Lzma2AdaptiveDecoder {
     pool: Option<Pool>,
     outstanding: usize,
     /// What the runs out with workers are charged for: each one's output
-    /// buffer and the copy of its packed bytes, as they were when they left.
-    /// The job carries the figure and hands it back, so what comes off is
-    /// exactly what went on.
+    /// buffer, as it was when it left. The job carries the figure and hands it
+    /// back, so what comes off is exactly what went on.
     outstanding_bytes: u64,
 
     // Decoded blocks waiting for their turn.
@@ -185,12 +183,10 @@ pub struct Lzma2AdaptiveDecoder {
     spare_out: Vec<Vec<u8>>,
     /// The capacity parked in the two pools above.
     spare_cap: u64,
-    /// The unpacked length of the runs out with workers, and the capacity of
-    /// the packed copies they went with. Both are charged and refunded from
-    /// the figures the job carries, so neither can drift from the buffers it
+    /// The unpacked length of the runs out with workers. Charged and refunded
+    /// from the figure the job carries, so it cannot drift from the buffers it
     /// stands for.
     outstanding_unpacked: u64,
-    outstanding_packed: u64,
     /// Output decoded but not yet handed over, by length: what a caller
     /// steering its read-ahead by [`Lzma2AdaptiveDecoder::in_flight_bytes`]
     /// is told about.
@@ -292,7 +288,6 @@ impl Lzma2AdaptiveDecoder {
             spare_out: Vec::new(),
             spare_cap: 0,
             outstanding_unpacked: 0,
-            outstanding_packed: 0,
             ready_bytes: 0,
             chase_bytes: 0,
             last_unpacked: 0,
@@ -448,11 +443,7 @@ impl Lzma2AdaptiveDecoder {
             self.stats.peak_held = held;
         }
         self.stats.peak_buf_cap = self.stats.peak_buf_cap.max(self.segs.held_bytes());
-        self.stats.peak_out_flight = self
-            .stats
-            .peak_out_flight
-            .max(self.outstanding_bytes - self.outstanding_packed);
-        self.stats.peak_packed_flight = self.stats.peak_packed_flight.max(self.outstanding_packed);
+        self.stats.peak_out_flight = self.stats.peak_out_flight.max(self.outstanding_bytes);
         self.stats.peak_ready = self.stats.peak_ready.max(self.ready_cap);
         self.stats.peak_spare = self.stats.peak_spare.max(self.spare_cap);
         self.stats.max_outstanding = self.stats.max_outstanding.max(self.outstanding as u64);
@@ -822,7 +813,6 @@ impl Lzma2AdaptiveDecoder {
         self.pool = None;
         self.outstanding = 0;
         self.outstanding_bytes = 0;
-        self.outstanding_packed = 0;
         self.outstanding_unpacked = 0;
         // The pool is shut down above, so nothing else holds the input any
         // more and all of it can go at once.
@@ -1079,9 +1069,7 @@ impl Lzma2AdaptiveDecoder {
     fn accept(&mut self, d: Done) {
         // Charged and refunded from the figures the job carries, so these
         // cannot drift or go below zero: the unpacked length is the run's own,
-        // and the input was never charged to the job in the first place.
-        debug_assert_eq!(d.packed_held, 0);
-        self.outstanding_packed -= d.packed_held;
+        // and the input is charged to the queue, never to the job.
         self.outstanding_unpacked -= d.unpacked_len as u64;
         self.outstanding -= 1;
         self.outstanding_bytes -= d.held;
@@ -1339,7 +1327,6 @@ impl Lzma2AdaptiveDecoder {
         // the worker lets go. What is left is the buffer the run is decoded
         // into, which will be grown to the run's length if it is not there
         // already, so it is charged for whichever is the larger.
-        let packed_cap = 0;
         let held = (out.capacity() as u64).max(run.unpacked_len);
 
         let pool = self.pool.as_mut().expect("checked above");
@@ -1352,12 +1339,10 @@ impl Lzma2AdaptiveDecoder {
             packed: claim,
             out,
             held,
-            packed_held: packed_cap,
         })?;
 
         self.stats.sent += 1;
         self.stats.worker_bytes += run.unpacked_len;
-        self.outstanding_packed += packed_cap;
         self.outstanding_unpacked += run.unpacked_len;
         self.outstanding += 1;
         self.outstanding_bytes += held;

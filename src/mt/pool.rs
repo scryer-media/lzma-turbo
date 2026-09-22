@@ -49,11 +49,6 @@ pub(crate) struct Job {
     /// handed back untouched so that what comes off the running total is
     /// exactly what went on it.
     pub(crate) held: u64,
-    /// What the job's input was charged as it left. The input is shared with
-    /// the queue that is already charged for it, so this is zero; it is
-    /// carried anyway, because the accounting is written to refund exactly
-    /// what it charged rather than to assume.
-    pub(crate) packed_held: u64,
     /// What to checksum over the run, in this worker, before the block is
     /// handed back. See [`crate::checksum`].
     #[cfg(feature = "crc")]
@@ -74,8 +69,6 @@ pub(crate) struct Done {
     pub(crate) packed: Vec<Seg>,
     /// What the dispatcher charged for the job, echoed back unchanged.
     pub(crate) held: u64,
-    /// What the job's input was charged when it left, echoed back too.
-    pub(crate) packed_held: u64,
     /// What the worker checksummed, if the run decoded and a plan asked for
     /// it.
     #[cfg(feature = "crc")]
@@ -256,7 +249,6 @@ fn worker(
                 out: job.out,
                 packed: job.packed,
                 held: job.held,
-                packed_held: job.packed_held,
                 #[cfg(feature = "crc")]
                 checks: None,
             });
@@ -282,7 +274,6 @@ fn worker(
                             out: Vec::new(),
                             packed: job.packed,
                             held: job.held,
-                            packed_held: job.packed_held,
                             #[cfg(feature = "crc")]
                             checks: None,
                         });
@@ -313,7 +304,6 @@ fn worker(
                 out,
                 packed: job.packed,
                 held: job.held,
-                packed_held: job.packed_held,
                 #[cfg(feature = "crc")]
                 checks,
             })
