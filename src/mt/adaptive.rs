@@ -562,31 +562,33 @@ impl Lzma2AdaptiveDecoder {
         Ok(take)
     }
 
-    /// How much of the memory limit the input buffer may claim, bytes and
-    /// capacity alike.
-    ///
-    /// Input is not the work; it is what the work is cut from. A buffer
-    /// allowed to claim everything the limit leaves is a decoder that reads
-    /// the whole stream into memory and then has nothing left to decode it
-    /// with: every run is refused for want of room, the calling thread chases
-    /// each one instead, and the more input is read ahead the worse it gets.
-    /// So the buffer gets half of what the rest of the decode is not already
-    /// holding, and the other half stays free for the runs cut out of it.
-    ///
-    /// Half of very little is not enough to assemble a run, so the floor is a
-    /// run's worth of packed bytes - the last one's, for want of a better
-    /// guess at the next - which a decoder near its limit needs if the
-    /// threaded path is ever to claim a run rather than chase it.
-    fn buf_budget(&self) -> u64 {
-        let other = self.held_bytes() - self.buf.capacity() as u64;
-        let free = self.memory_limit.saturating_sub(other);
-        let floor = self
-            .pending
+    /// The packed size of the run the decoder is about to claim, or zero
+    /// before it has seen one. What every rule about the input buffer is
+    /// written in terms of, and what none of them can be written without.
+    fn known_run(&self) -> u64 {
+        self.pending
             .front()
             .map_or(0, |r| r.packed_len)
             .max(self.last_packed)
-            .max(MIN_BUF_BUDGET);
-        (free / 2).max(floor).min(free)
+    }
+
+    fn buf_budget(&self) -> u64 {
+        let other = self.held_bytes() - self.buf.capacity() as u64;
+        let free = self.memory_limit.saturating_sub(other);
+        let run_in = self.known_run();
+        let run_out = self
+            .pending
+            .front()
+            .map_or(0, |r| r.unpacked_len)
+            .max(self.last_unpacked);
+        let work = run_in
+            .saturating_add(run_out)
+            .saturating_mul(self.threads as u64);
+        // A run's packed bytes are not quite enough to claim it: the scanner
+        // has to see where the next run starts before it will say the last one
+        // is complete, so the floor carries a header's worth beyond it.
+        let floor = run_in.saturating_add(MIN_BUF_BUDGET);
+        free.saturating_sub(work).min(free / 2).max(floor).min(free)
     }
 
     /// Makes room for `take` more bytes of input without the buffer's own
