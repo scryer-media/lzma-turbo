@@ -1096,14 +1096,19 @@ fn a_caller_that_feeds_far_ahead_still_gets_its_runs_decoded_by_workers() {
 
     // Once under a limit that holds only a few runs, once under one that holds
     // the lot: the rule is the same either way.
-    // A limit that holds only a few runs leaves the chase real work to do -
-    // there are moments when nothing can be dispatched - while a limit that
-    // holds the lot leaves it almost none.
-    for (limit, share) in [(8u64 << 20, 2u64), (512 << 20, 20)] {
+    //
+    // With the chase turned off there is nothing to cover for a decoder that
+    // refuses every dispatch, so this asks the question without asking the
+    // clock: how much the chase would have taken depends on how quickly the
+    // workers happened to finish, but whether the workers can be given the
+    // runs at all does not.
+    for limit in [8u64 << 20, 512 << 20] {
         let mut dec = Lzma2AdaptiveDecoder::new(20, &opts(4, limit)).expect("props");
+        dec.set_chase(false);
         let mut sink = Sink::default();
         let mut pos = 0usize;
         let mut peak = 0u64;
+        let mut turns = 0u32;
         loop {
             if pos < packed.len() {
                 // Everything, every turn, for as long as it is taken.
@@ -1118,24 +1123,133 @@ fn a_caller_that_feeds_far_ahead_still_gets_its_runs_decoded_by_workers() {
             if status == DrainStatus::Finished {
                 break;
             }
-            if status == DrainStatus::NeedsMoreInput && pos == packed.len() {
-                dec.wait_for_worker();
-            }
+            while dec.wait_for_worker() {}
+            turns += 1;
+            assert!(turns < 10_000, "no progress in {turns} turns");
         }
         assert_eq!(sink.bytes(), plain);
         assert!(
             peak <= limit + SLACK,
             "limit {limit}: peak {peak} over it by more than {SLACK}",
         );
-        // The chase is there to cover the tail of a run that has not arrived,
-        // and here everything has: what it decodes is what the limit forced,
-        // not what a buffer holding the limit forced.
-        let chased = dec.chase_decoded_bytes();
-        assert!(
-            chased * share <= plain.len() as u64,
-            "limit {limit}: {chased} bytes of {} decoded on the calling thread",
-            plain.len(),
-        );
+        // Every run went to a worker: the chase could not have taken one, and
+        // the decode finished all the same.
+        assert_eq!(dec.chase_decoded_bytes(), 0);
         assert_eq!(dec.runs_claimed(), runs.len() as u64);
     }
+}
+
+#[test]
+fn a_caller_handing_over_whole_buffers_stays_inside_the_limit() {
+    // A reader hands the decoder the buffers it read into, whole, and takes
+    // back the one there was no room for to offer again. Nothing is copied on
+    // the way in, so the only thing keeping the decoder inside its limit is
+    // what it refuses - and it has to refuse without ever refusing so much
+    // that the decode stops.
+    let runs: Vec<_> = (0..24)
+        .map(|i| copy_run(&pseudo_random(1 << 20, i + 500)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 8 << 20;
+    const READ: usize = 1 << 20;
+
+    let mut dec = Lzma2AdaptiveDecoder::new(20, &opts(4, LIMIT)).expect("props");
+    // Off, so that what the workers get is not a question of how fast they
+    // happened to be: with no chase to fall back on, a decoder that refused
+    // the input it needs could not finish at all.
+    dec.set_chase(false);
+    let mut sink = Sink::default();
+    let mut pos = 0usize;
+    let mut peak = 0u64;
+    let mut turns = 0u32;
+    // The buffer the reader is holding: either one it has just filled, or the
+    // one the decoder handed back.
+    let mut offered: Option<Vec<u8>> = None;
+    loop {
+        // A reader pumps buffers in until one is handed back, then decodes.
+        loop {
+            if offered.is_none() && pos < packed.len() {
+                let end = (pos + READ).min(packed.len());
+                offered = Some(packed[pos..end].to_vec());
+                pos = end;
+            }
+            let Some(seg) = offered.take() else { break };
+            offered = dec.feed_owned(seg).expect("feed_owned");
+            if offered.is_some() {
+                break;
+            }
+            if pos == packed.len() {
+                dec.end_of_input();
+                break;
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        // Let every worker finish before the next turn, so that what the
+        // decoder does next follows from its own state rather than from how
+        // fast this machine happened to be.
+        while dec.wait_for_worker() {}
+        turns += 1;
+        assert!(turns < 10_000, "no progress in {turns} turns");
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert!(
+        peak <= LIMIT + SLACK,
+        "peak {peak} over the {LIMIT} byte limit by more than {SLACK}",
+    );
+    // And it was a threaded decode, not the chase wearing its clothes.
+    assert_eq!(dec.runs_claimed(), runs.len() as u64);
+    assert_eq!(dec.chase_decoded_bytes(), 0);
+}
+
+#[test]
+fn a_caller_lending_part_of_its_own_buffer_decodes_the_same_stream() {
+    // The same stream, lent rather than handed over: the caller keeps the
+    // buffer and the decoder reads the range it was lent out of it.
+    let runs: Vec<_> = (0..8)
+        .map(|i| copy_run(&pseudo_random(1 << 18, i + 600)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    const LIMIT: u64 = 4 << 20;
+    const LEND: usize = 1 << 17;
+
+    let whole = std::sync::Arc::new(packed.clone());
+    let mut dec = Lzma2AdaptiveDecoder::new(18, &opts(3, LIMIT)).expect("props");
+    let mut sink = Sink::default();
+    let mut peak = 0u64;
+    let mut next = 0usize;
+    let mut offered: Option<std::ops::Range<usize>> = None;
+    loop {
+        if offered.is_none() && next < packed.len() {
+            let end = (next + LEND).min(packed.len());
+            offered = Some(next..end);
+            next = end;
+        }
+        if let Some(range) = offered.take() {
+            offered = dec.feed_shared(&whole, range).expect("feed_shared");
+            if offered.is_none() && next == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        peak = peak.max(dec.held_bytes());
+        let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+        peak = peak.max(dec.held_bytes());
+        if status == DrainStatus::Finished {
+            break;
+        }
+        if status == DrainStatus::NeedsMoreInput && offered.is_none() && next == packed.len() {
+            dec.wait_for_worker();
+        }
+    }
+    assert_eq!(sink.bytes(), plain);
+    assert!(
+        peak <= LIMIT + SLACK,
+        "peak {peak} over the {LIMIT} byte limit by more than {SLACK}",
+    );
+    // The caller's buffer is its own again, and untouched.
+    assert_eq!(*whole, packed);
 }

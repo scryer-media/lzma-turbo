@@ -25,6 +25,7 @@ use std::thread::JoinHandle;
 
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
+use crate::mt::segq::Seg;
 
 #[cfg(feature = "crc")]
 use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
@@ -37,9 +38,10 @@ pub(crate) struct Job {
     pub(crate) out_offset: u64,
     /// What the run's chunk headers say it decodes to.
     pub(crate) unpacked_len: usize,
-    /// The run's compressed bytes, exactly: the next run's control byte is not
-    /// included.
-    pub(crate) packed: Vec<u8>,
+    /// The run's compressed bytes, exactly: the next run's control byte is
+    /// not included. They are references to the pieces of input the run spans,
+    /// not a copy of them, so dispatching a run moves no bytes.
+    pub(crate) packed: Vec<Seg>,
     /// A buffer to decode into, recycled from a previous block.
     pub(crate) out: Vec<u8>,
     /// What the dispatcher charged its memory accounting for this job: the two
@@ -47,8 +49,10 @@ pub(crate) struct Job {
     /// handed back untouched so that what comes off the running total is
     /// exactly what went on it.
     pub(crate) held: u64,
-    /// The packed buffer's capacity as it left: the worker only reads that
-    /// buffer, so this is also what comes back.
+    /// What the job's input was charged as it left. The input is shared with
+    /// the queue that is already charged for it, so this is zero; it is
+    /// carried anyway, because the accounting is written to refund exactly
+    /// what it charged rather than to assume.
     pub(crate) packed_held: u64,
     /// What to checksum over the run, in this worker, before the block is
     /// handed back. See [`crate::checksum`].
@@ -65,11 +69,12 @@ pub(crate) struct Done {
     /// buffer comes back so it can be used again.
     pub(crate) res: Result<(), Error>,
     pub(crate) out: Vec<u8>,
-    /// The job's input buffer, returned for reuse.
-    pub(crate) packed: Vec<u8>,
+    /// The job's references to its input, returned so that the last of them
+    /// is dropped where the queue can see it and give the memory back.
+    pub(crate) packed: Vec<Seg>,
     /// What the dispatcher charged for the job, echoed back unchanged.
     pub(crate) held: u64,
-    /// What the packed buffer's capacity was when it left, echoed back too.
+    /// What the job's input was charged when it left, echoed back too.
     pub(crate) packed_held: u64,
     /// What the worker checksummed, if the run decoded and a plan asked for
     /// it.
@@ -338,19 +343,41 @@ fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
     }
     dec.set_block_dic(out, want);
 
-    let (used, status) = dec.decode_block(want, &job.packed, FinishMode::End)?;
+    // The run arrives as the pieces of input it spans, and it is decoded a
+    // piece at a time. The block decoder keeps its state between calls, so
+    // this is the same decode as one over a contiguous copy of the run, at the
+    // cost of one call per piece instead of one memcpy of the whole run. Only
+    // the last piece may finish the block; the earlier ones must be consumed
+    // whole, which is what says the run was handed over intact.
+    let mut packed = 0usize;
+    let mut used = 0usize;
+    let last = job.packed.len().saturating_sub(1);
+    for (i, seg) in job.packed.iter().enumerate() {
+        let bytes = seg.bytes();
+        packed += bytes.len();
+        let finish = if i == last {
+            FinishMode::End
+        } else {
+            FinishMode::Any
+        };
+        let (took, status) = dec.decode_block(want, bytes, finish)?;
+        used += took;
+        let _ = status;
+        if i != last && took != bytes.len() {
+            return Err(Error::CorruptData);
+        }
+    }
 
     // The run's boundaries came from its own chunk headers, so a worker that
     // did not consume exactly the run, or did not produce exactly what the
     // headers promised, was given something that does not decode.
-    if used != job.packed.len() || dec.dic_pos() != want {
+    if used != packed || dec.dic_pos() != want {
         return Err(Error::CorruptData);
     }
     // The status itself says nothing useful here. A run ends at the next run's
     // control byte, which is not part of the job, so the decoder reports that
     // it wants more input even though the run is complete; what makes it
     // complete is the two counts above, which come from the run's own headers.
-    let _ = status;
     Ok(())
 }
 
