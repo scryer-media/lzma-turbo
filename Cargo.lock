@@ -1088,8 +1088,6 @@ dependencies = [
  "aws-lc-rs",
  "crc-fast",
  "sha2 0.11.0",
- "wasmtime",
- "wasmtime-wasi",
 ]
 
 [[package]]
@@ -1864,6 +1862,17 @@ dependencies = [
  "wasm-encoder 0.254.0",
  "wasmparser 0.254.0",
  "wat",
+]
+
+[[package]]
+name = "wasm-conformance"
+version = "0.0.0"
+dependencies = [
+ "crc-fast",
+ "lzma-turbo",
+ "sha2 0.11.0",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]

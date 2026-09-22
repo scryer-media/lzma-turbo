@@ -32,7 +32,6 @@
 //! Skipped automatically if no reachable toolchain has a `wasm32-wasip1` std.
 
 #![cfg(not(target_family = "wasm"))]
-#![cfg(all(feature = "crc-host", feature = "crypto-host"))]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -236,7 +235,7 @@ fn wasm_toolchain() -> Option<(PathBuf, PathBuf)> {
     }
     if let Some(out) = Command::new("rustup")
         .args(["which", "rustc"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(workspace_root())
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -264,7 +263,7 @@ const GUEST_FEATURES: &str = "std,crc-host,crypto-host,xz";
 /// `.wasm`. A private target dir keeps the nested cargo off the outer test's
 /// target lock.
 fn build_guest(example: &str) -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = workspace_root();
     let target_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm-host-conformance");
     let (cargo, rustc) =
         wasm_toolchain().expect("no toolchain with a wasm32-wasip1 std (checked by the caller)");
@@ -310,12 +309,19 @@ fn build_guest(example: &str) -> PathBuf {
     wasm
 }
 
-/// The fixture root both runs read: `tests/data`, the committed `.xz` vectors
-/// and the source bytes they decode to.
+/// The workspace root: where the nested cargo runs from, and where the guest
+/// examples and fixtures live. This crate sits two directories below it.
+fn workspace_root() -> PathBuf {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root.pop();
+    root
+}
+
+/// The fixture root both runs read: lzma-turbo's `tests/data`, the committed
+/// `.xz` vectors and the source bytes they decode to.
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("data")
+    workspace_root().join("tests").join("data")
 }
 
 /// What a run produced.
@@ -416,7 +422,7 @@ fn run_guest(wasm: &Path, with_hooks: bool) -> (Run, (u64, u64)) {
 /// Run the same example natively, through the in-process backends, and return
 /// its stdout. This is the ground truth the guest report must equal.
 fn run_native(example: &str) -> Run {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = workspace_root();
     let target_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native-conformance");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 

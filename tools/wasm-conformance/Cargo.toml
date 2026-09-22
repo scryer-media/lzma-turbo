@@ -1,0 +1,26 @@
+[package]
+name = "wasm-conformance"
+description = "Runs lzma-turbo's wasm host-hook reference embedding under a native wasmtime and holds its report to the native decoder's"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/scryer-media/lzma-turbo"
+publish = false
+
+# The harness never links lzma-turbo: it builds the crate's wasm guest example
+# with a nested cargo and runs it here. Keeping wasmtime in this crate rather
+# than in lzma-turbo's dev-dependencies is what keeps it out of every other
+# `cargo test` and `cargo clippy` of the workspace; the wasm-conformance CI job
+# is the one place it is built.
+[dev-dependencies]
+wasmtime = "48"
+wasmtime-wasi = "48"
+# The host side of the reference embedding checksums with the same libraries
+# the native build of lzma-turbo does: no hand-written CRC or SHA on either
+# side of the boundary.
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+sha2 = "0.11.0"
+# The seed-contract test holds the host CRCs to the crate's own: the one place
+# the harness links lzma-turbo, and only its native checksum backend.
+lzma-turbo = { path = "../..", default-features = false, features = ["std", "crc"] }
