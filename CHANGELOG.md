@@ -388,13 +388,21 @@ apart for anyone reading the history.
   rather than a list of them, so a stream of a million blocks costs the same
   state as a stream of one. `with_memory_limit`, `with_checks`,
   `allow_unverifiable` and `single_stream` on the reader; everything else on
-  `xz::XzOptions`.
+  `xz::XzOptions`. A reserved bit set in the stream flags or in a block
+  header's flags is an error, not something to skip past: 7-Zip 22.01 accepted
+  both (CVE-2022-47112 for the stream flags, CVE-2022-47111 for the block
+  flags), and a decoder that does not know what a flag means cannot know it
+  parsed the rest of the header correctly.
 - Filters: LZMA2, delta, and the eight BCJ converters (x86, ARM, ARM-Thumb,
   ARM64, PowerPC, SPARC, IA-64, RISC-V), each with the optional four-byte
   start-offset property, in chains of up to four in the order the format
   allows. Ported from `C/Bra.c`, `C/Bra86.c`, `C/BraIA64.c` and `C/Delta.c`,
   and public as `xz::bcj` and `xz::delta` so that other container code in this
-  workspace can use them directly.
+  workspace can use them directly. The chain hands each stage a bounds-checked
+  slice of the caller's buffer and counts what the stage says it wrote, so the
+  class of CVE-2026-14266 (7-Zip before 26.02: the XZ mixer's running count of
+  filtered output outran the destination buffer, a heap overflow) is not
+  expressible here.
 - Checks: none, CRC-32, CRC-64/XZ and SHA-256 (the last behind `crypto` or
   `native-crypto`). A stream whose check this build cannot compute is an error
   unless the caller opts in with `allow_unverifiable`, so unchecked bytes are
