@@ -149,12 +149,33 @@ impl SegQueue {
         if offset < self.base || offset >= self.end {
             return None;
         }
-        let seg = self
-            .q
-            .iter()
-            .find(|s| offset < s.end() && offset >= s.start)?;
+        let seg = self.q.get(self.index_of(offset)?)?;
         let skip = (offset - seg.start) as usize;
         Some(&seg.data.data[seg.range.start + skip..seg.range.end])
+    }
+
+    /// Where in the queue the piece holding `offset` sits.
+    ///
+    /// The pieces are in stream order and do not overlap, so this is a search
+    /// and not a walk. It has to be: a decoder holding a gigabyte of a stream
+    /// that arrived in chunks holds hundreds of pieces, and a walk from the
+    /// front on every step of the decode is quadratic in the number of pieces,
+    /// which showed up as a fifth of the instructions on a stream of very
+    /// large runs before this was a search.
+    fn index_of(&self, offset: u64) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.q.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let seg = &self.q[mid];
+            if offset < seg.start {
+                hi = mid;
+            } else if offset >= seg.end() {
+                lo = mid + 1;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
     }
 
     /// The pieces spanning `range`, as references a worker can be given.
@@ -166,9 +187,10 @@ impl SegQueue {
             return None;
         }
         let mut out = Vec::new();
-        for seg in &self.q {
-            if seg.end() <= range.start || seg.start >= range.end {
-                continue;
+        let first = self.index_of(range.start)?;
+        for seg in self.q.iter().skip(first) {
+            if seg.start >= range.end {
+                break;
             }
             let from = range.start.max(seg.start) - seg.start;
             let to = range.end.min(seg.end()) - seg.start;
