@@ -1330,8 +1330,14 @@ fn a_reader_that_takes_its_buffers_back_stops_allocating() {
     // The same handover over a stream long enough to reach a steady state:
     // once the decode is keeping up, every read goes into a buffer the
     // decoder has finished with, so the number of allocations stops growing
-    // with the length of the stream and settles at how far ahead the reader
-    // is allowed to be.
+    // with the length of the stream.
+    //
+    // One piece is handed over per turn, and every worker is waited for
+    // before the next, so the shape of a turn is the same however fast the
+    // workers are: the read at the top of turn `k` finds the piece the turn
+    // before retired, or nothing. Reading ahead until refused would make the
+    // number of reads a turn takes depend on whether a block came back during
+    // the drain, and with it how many of those reads find a spare.
     let runs: Vec<_> = (0..24)
         .map(|i| copy_run(&pseudo_random(1 << 20, i + 800)))
         .collect();
@@ -1348,27 +1354,22 @@ fn a_reader_that_takes_its_buffers_back_stops_allocating() {
     let mut seen: Vec<usize> = Vec::new();
     let mut offered: Option<Vec<u8>> = None;
     loop {
-        loop {
-            if offered.is_none() && pos < packed.len() {
-                let mut buf = dec.reclaim_piece().unwrap_or_default();
-                let end = (pos + READ).min(packed.len());
-                buf.extend_from_slice(&packed[pos..end]);
-                pos = end;
-                reads += 1;
-                let id = buf.as_ptr() as usize;
-                if !seen.contains(&id) {
-                    seen.push(id);
-                }
-                offered = Some(buf);
+        if offered.is_none() && pos < packed.len() {
+            let mut buf = dec.reclaim_piece().unwrap_or_default();
+            let end = (pos + READ).min(packed.len());
+            buf.extend_from_slice(&packed[pos..end]);
+            pos = end;
+            reads += 1;
+            let id = buf.as_ptr() as usize;
+            if !seen.contains(&id) {
+                seen.push(id);
             }
-            let Some(seg) = offered.take() else { break };
+            offered = Some(buf);
+        }
+        if let Some(seg) = offered.take() {
             offered = dec.feed_owned(seg).expect("feed_owned");
-            if offered.is_some() {
-                break;
-            }
-            if pos == packed.len() {
+            if offered.is_none() && pos == packed.len() {
                 dec.end_of_input();
-                break;
             }
         }
         let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
@@ -1381,12 +1382,16 @@ fn a_reader_that_takes_its_buffers_back_stops_allocating() {
     }
     assert_eq!(sink.bytes(), plain);
     assert_eq!(dec.runs_claimed(), runs.len() as u64);
-    // Half the reads would be a poor showing; the point is that it is a
-    // handful and does not track the stream.
-    assert!(
-        seen.len() * 2 <= reads,
-        "{} allocations for {reads} reads",
+    assert_eq!(reads, packed.len().div_ceil(READ));
+    // A run ends inside the piece after the one it starts in, so a piece is
+    // retired by the turn after it is read and reused by the one after that:
+    // the first two reads allocate, and every read after them goes into a
+    // buffer the decoder has let go of, however long the stream is.
+    assert_eq!(
         seen.len(),
+        2,
+        "{} allocations for {reads} reads",
+        seen.len()
     );
 }
 
