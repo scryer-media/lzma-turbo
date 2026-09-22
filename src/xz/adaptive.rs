@@ -243,6 +243,34 @@ impl XzAdaptiveDecoder {
         self.outstanding_bytes = 0;
     }
 
+    /// Blocks until a worker hands back a finished block, and takes it in.
+    ///
+    /// Returns false at once when no block is outstanding.
+    ///
+    /// [`drain`](XzAdaptiveDecoder::drain) hands control back as soon as there
+    /// is nothing it can do without more input, even with workers still
+    /// decoding, so that the caller can feed the next block rather than wait
+    /// for the last one. A caller whose read-ahead is already satisfied has
+    /// nothing to feed and nothing else to do; without somewhere to wait it
+    /// would call drain again, and again, for as long as the workers took.
+    /// This is that place: one block, no poll interval, no deadline.
+    ///
+    /// Everything else a worker has already finished is taken in along with
+    /// the block waited for. A block that failed is not reported here - what it
+    /// failed with is held until its turn to be handed over comes, and comes
+    /// out of the next drain exactly as it would have without this call.
+    ///
+    /// False also comes back when the outstanding block can no longer arrive:
+    /// the decode was cancelled, or every worker has gone. A caller looping on
+    /// this therefore cannot spin - the next drain turns that state into the
+    /// error it is.
+    pub fn wait_for_worker(&mut self) -> bool {
+        if self.outstanding == 0 {
+            return false;
+        }
+        self.collect(true).unwrap_or(false)
+    }
+
     /// Decodes as much as the bytes fed so far allow, handing each piece of
     /// output to `sink` as `(file offset in the decoded stream, bytes)`.
     ///

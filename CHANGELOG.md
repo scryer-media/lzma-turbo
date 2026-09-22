@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.6.0 - 2026-09-22
+
+- `mt::Lzma2AdaptiveDecoder`: input is held as the pieces it arrived in rather
+  than copied into one growing buffer, so a decode under a memory limit no
+  longer spends most of that limit on input and the packed copy a run used to
+  be given is gone. On an archive of incompressible data - video, already
+  compressed payloads - this is the difference between filling the limit with
+  buffered input and decoding within it. Measured against 0.5.0 through the
+  same reader, on a 1.6 GB archive of incompressible data at four threads:
+  resident memory 2.76 GB to 1.50 GB, wall time unchanged at 3.2 s. An archive
+  of many small runs falls from 1.02 GB resident to 45 MB, and one of large
+  compressible runs at eight threads from 2.43 GB to 2.33 GB for 12% fewer
+  instructions.
+- `mt::Lzma2AdaptiveDecoder`: input buffers can now be handed over rather than
+  copied. `feed_owned` takes a caller's buffer whole, `feed_shared` lends the
+  decoder a range of one the caller keeps, and `reclaim_piece` hands an
+  allocation the decode has finished with back to be filled and handed over
+  again, so a reader and the decoder pass the same few buffers between them
+  instead of copying at every boundary. What a caller lends stays the
+  caller's; what it hands over is counted against the memory limit until the
+  decoder is done with it.
+- `mt::Lzma2AdaptiveDecoder`: a copied input piece is cut to a steady size, so
+  the pieces of a stream recycle through the decoder instead of the allocator
+  mapping and unmapping a differently-sized region for each one.
+- `mt::Lzma2AdaptiveDecoder`: the input budget no longer falls back to half
+  the memory limit before the first run has been scanned. It starts small and
+  grows only while the decoder has nothing it can do with what it holds, which
+  keeps read-ahead from banking half the limit in the first moments of a
+  decode. It also grows to fit a piece handed over whole, so a caller whose
+  pieces cannot be cut up is no longer refused one a little larger than that
+  budget under a tight limit, which could stall a decode outright.
+- `mt::Lzma2AdaptiveDecoder`: `held_bytes` reports every byte of buffer the
+  decoder is holding, including what a caller has handed over and not yet had
+  back. This, not `in_flight_bytes`, is the figure the memory limit is kept
+  under, and dispatch is refused rather than allowed to push it over.
+- `mt::Lzma2AdaptiveDecoder`: `in_flight_bytes` now counts lengths rather than
+  the buffers under them - input buffered and not yet claimed, the runs
+  workers are decoding, and output decoded but not yet handed over. It is a
+  gauge of the work in the decoder, for a caller steering its read-ahead, and
+  it is no longer the figure the memory limit governs.
+- `mt::Lzma2AdaptiveDecoder` and `xz::XzAdaptiveDecoder`: `wait_for_worker`
+  blocks until a worker hands back a finished run and takes it in, returning
+  false at once when no run is outstanding. A caller with nothing else to do
+  waits here instead of spinning on `drain`.
+- `mt::Lzma2AdaptiveDecoder`: `chase_decoded_bytes` reports how much of the
+  output the single-threaded chase decoded on the calling thread rather than a
+  worker, so a caller that expected its runs to be threaded can see that they
+  were not, and what that cost.
+- `mt::Lzma2AdaptiveDecoder`: `feed` copies at most one piece per call - 4 MiB,
+  or the capacity of a buffer it already had in hand - and returns how much it
+  took. A caller handing it a larger slice loops until the slice is consumed,
+  as the returned count has always asked it to.
+- New non-default feature `adaptive-stats`: the adaptive decoder's diagnostic
+  counters, printed at drop when `LZMA_ADAPTIVE_STATS` is set. Without it a
+  build carries neither the counters nor the sampling that maintains them.
+
 ## 0.5.0 - 2026-09-19
 
 - `filters::bcj2`: BCJ2, 7z's four-stream branch converter, ported in both

@@ -11,7 +11,7 @@ build script.
 
 ```toml
 [dependencies]
-lzma-turbo = "0.4"
+lzma-turbo = "0.6"
 ```
 
 ## Reading an `.xz` file
@@ -176,7 +176,7 @@ and a check is one of CRC-32, CRC-64/XZ or SHA-256. `crypto` builds AWS-LC,
 which needs a C toolchain and CMake; a build that wants neither takes
 
 ```toml
-lzma-turbo = { version = "0.4", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+lzma-turbo = { version = "0.6", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
 ```
 
 which is pure Rust and works wherever the decoder does. `native-crypto` wins
@@ -209,7 +209,7 @@ Two features hand those primitives back to the embedding program:
 | `crypto-host` | SHA-256, the check type 10 hash |
 
 ```toml
-lzma-turbo = { version = "0.3", default-features = false, features = [
+lzma-turbo = { version = "0.6", default-features = false, features = [
     "std", "asm", "crc-host", "crypto-host", "xz",
 ] }
 ```

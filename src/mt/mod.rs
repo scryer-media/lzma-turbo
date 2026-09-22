@@ -22,6 +22,7 @@ pub(crate) mod event;
 mod lzma2;
 mod mtdec;
 mod pool;
+pub(crate) mod segq;
 // Only the encoder's `MtCoder` port uses these; the decoder's ring needs
 // nothing but `Event`.
 #[cfg(feature = "enc")]
