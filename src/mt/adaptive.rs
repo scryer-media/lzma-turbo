@@ -523,7 +523,7 @@ impl Lzma2AdaptiveDecoder {
         self.chase_bytes
     }
 
-    /// The limit [`Lzma2AdaptiveDecoder::in_flight_bytes`] is kept under.
+    /// The limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under.
     #[must_use]
     pub fn memory_limit(&self) -> u64 {
         self.memory_limit
