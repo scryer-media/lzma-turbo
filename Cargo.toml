@@ -89,23 +89,19 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 crc-fast = { version = "1.10.0", default-features = false, optional = true }
 sha2 = { version = "0.11.0", default-features = false, optional = true }
 
-# The wasm conformance harness drives the guest examples below through a
-# native `wasmtime` that supplies the reference host functions they import.
-# Those are native-only tooling for that one test: they never reach the crate's
-# own graph, and they must stay off the wasm example build (wasmtime does not
-# build for wasm), hence the target gate.
+# The tests checksum with the same libraries the native build of this crate
+# does: no hand-written CRC or SHA anywhere. Native-only, so they stay off the
+# wasm example build.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-wasmtime = "48"
-wasmtime-wasi = "48"
-# The host side of the reference embedding checksums with the same libraries
-# the native build of this crate does: no hand-written CRC or SHA on either
-# side of the boundary.
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0" }
 
 # The two wasm guest examples are reference embeddings of the `hooks` seam:
 # each declares raw imports in a `host` namespace and installs hooks that
 # forward to them. They only mean anything with the delegating features on.
+# `tools/wasm-conformance` is what runs them: it owns the native `wasmtime`
+# that supplies the host functions they import, and it lives outside this
+# crate so that no other `cargo test` or `cargo clippy` builds wasmtime.
 [[example]]
 name = "wasm_xz_conformance"
 required-features = ["crc-host", "crypto-host", "xz"]
@@ -123,6 +119,7 @@ members = [
     "tools/lzma-bench",
     "tools/sdk-encoder",
     "tools/sdk-oracle",
+    "tools/wasm-conformance",
     "xtask",
 ]
 resolver = "2"

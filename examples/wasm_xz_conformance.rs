@@ -20,7 +20,7 @@
 //! bulk checksums are delegated.
 //!
 //! Every case prints one line, and the lines are the conformance claim: the
-//! native driver in `tests/wasm_host_conformance.rs` runs this same program
+//! native driver in `tools/wasm-conformance/tests/wasm_host_conformance.rs` runs this same program
 //! natively - where the delegating features are inert, so the in-process
 //! `crc-fast` and `sha2`/AWS-LC backends do the work and no hook is called -
 //! and requires the two reports to be byte for byte identical. So the decoded
@@ -34,7 +34,7 @@
 //!
 //! It is not meaningful under a bare `wasmtime` CLI: the `host` imports are
 //! unsatisfied there and instantiation fails. Run it through the driver:
-//!   cargo test -p lzma-turbo --features crc-host,crypto-host --test wasm_host_conformance
+//!   cargo test -p wasm-conformance
 //!
 //! Natively, for debugging (features inert, no hook called):
 //!   cargo run -p lzma-turbo --features crc-host,crypto-host \
@@ -49,7 +49,7 @@ use lzma_turbo::crypto::Sha256;
 /// The example's own raw imports and the hooks that forward to them.
 ///
 /// ABI (a fixed contract, shared with the driver in
-/// `tests/wasm_host_conformance.rs`; this crate itself knows none of it and
+/// `tools/wasm-conformance/tests/wasm_host_conformance.rs`; this crate itself knows none of it and
 /// only ever sees the `fn` pointers):
 ///
 /// ```text

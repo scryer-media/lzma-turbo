@@ -258,7 +258,7 @@ interface definition and never learns which it is. The contract, in short:
 [`examples/wasm_xz_conformance.rs`](examples/wasm_xz_conformance.rs) is a
 complete reference embedding - a `wasm32-wasip1` guest declaring raw imports in
 a `host` namespace - and
-[`tests/wasm_host_conformance.rs`](tests/wasm_host_conformance.rs) is the
+[`tools/wasm-conformance`](tools/wasm-conformance/tests/wasm_host_conformance.rs) is the
 reference host for that ABI, built on `crc-fast` and `sha2`. CI runs it: an
 `.xz` of each check type is decoded in the guest and the report has to equal
 the native decoder's byte for byte, down to the failure text of a stream whose

@@ -548,16 +548,13 @@ impl Lzma2AdaptiveDecoder {
         // Into a buffer the decode has finished with where there is one: on a
         // stream of large runs this is the difference between faulting in
         // every page of the input once and faulting in none of them.
-        let mut buf = match self.segs.take_spare() {
-            Some(buf) => {
-                stat!(self.stats.in_reused += 1;);
-                buf
-            }
-            None => {
-                stat!(self.stats.in_fresh += 1;);
-                Vec::new()
-            }
-        };
+        let spare = self.segs.take_spare();
+        stat!(if spare.is_some() {
+            self.stats.in_reused += 1;
+        } else {
+            self.stats.in_fresh += 1;
+        });
+        let mut buf = spare.unwrap_or_default();
         buf.clear();
         // In pieces of a size that repeats. A copy sized to whatever room
         // happens to be free makes every piece a different size, so a parked
