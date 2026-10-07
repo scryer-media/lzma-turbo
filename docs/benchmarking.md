@@ -74,10 +74,12 @@ means the two produced the same number of bytes.
 The same rules as above: idle machine, mains power, three runs, report the
 median, and measure the oracle in the same session.
 
-The encoder is bit-exact with the SDK's, which is what the parity tests check;
-`xz`'s presets are its own mapping onto LZMA settings and need not agree with
-`LzmaEncProps_Normalize` at every level, so the size column is the honest way
-to read a row rather than an assumption that the two encoded the same thing.
+The encoder is bit-exact with the SDK's, which is what the parity tests check.
+`xz`'s presets are liblzma's own mapping onto LZMA settings and differ from
+7-Zip's levels (`xz -1` uses a 1 MiB dictionary where level 1 uses 256 KiB),
+so the harness encodes with `LzmaEncProps::xz_preset`, the same table `xz -N`
+uses, and the size column should read within a few bytes of `1.0000`. A row
+that drifts from it is a real difference in the encoder, not a preset mismatch.
 
 ### Multi-threaded LZMA2
 

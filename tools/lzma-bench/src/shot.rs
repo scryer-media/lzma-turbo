@@ -344,8 +344,11 @@ fn bcj_kind(name: &str) -> Result<lzma_turbo::filters::bcj::BcjKind, String> {
 /// sink. At one thread it writes one solid block, as `xz -T1` does; above one
 /// it cuts blocks at the size `xz -T<n>` would, so the two are comparable.
 fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
-    let props = LzmaEncProps::new()
-        .with_level(shot.preset)
+    // `xz -N`'s own settings, not 7-Zip's level N: the oracle row runs `xz -N`,
+    // so the size column only means something when both sides use the same
+    // dictionary, match finder and depth.
+    let props = LzmaEncProps::xz_preset(shot.preset, false)
+        .map_err(|e| e.to_string())?
         .with_num_threads(shot.mf_threads.max(1));
     let mut input = open(path)?;
     let mut buf = vec![0u8; IN_CHUNK];

@@ -53,11 +53,14 @@ fn time_xz(preset: u32, threads: usize, data: &[u8]) -> Option<(Duration, u64)> 
         .then_some((dt, out.stdout.len() as u64))
 }
 
-/// The crate's settings for `xz -N`: `LzmaEncProps` normalizes a level the
-/// same way `LzmaEncProps_Normalize` does, which is what `xz` presets 0-9
-/// were chosen to match.
+/// The crate's settings for `xz -N`. `with_level(N)` is 7-Zip's level N,
+/// whose dictionary and match-finder depth differ from liblzma's preset N
+/// (level 1 is a 256 KiB dictionary where `xz -1` uses 1 MiB), so a row
+/// built on it compares two different encodes. `xz_preset` is liblzma's own
+/// table, which is what the oracle column runs.
 fn props_for(preset: u32) -> LzmaEncProps {
-    LzmaEncProps::new().with_level(preset)
+    LzmaEncProps::xz_preset(preset, false)
+        .unwrap_or_else(|e| crate::fail(&format!("preset {preset}: {e}")))
 }
 
 /// Compresses `data` once and returns how long it took and how big it came
