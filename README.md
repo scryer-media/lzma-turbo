@@ -6,8 +6,10 @@
 
 LZMA and LZMA2 in Rust, ported from the 7-Zip reference implementation for its
 speed, including its hand-written `aarch64` and `x86_64` decode loops. The
-encoder is a port too, and is bit-exact with the SDK's. No C bindings, no
-build script.
+encoder is a port too, and is bit-exact with the SDK's. The codec has no C
+bindings and no build script; the one C library in the default build is
+AWS-LC, for the SHA-256 check, and `native-crypto` replaces it with pure Rust
+(see [Features](#features)).
 
 ```toml
 [dependencies]
@@ -42,22 +44,29 @@ Every pure-Rust LZMA decoder descends from the Tukaani XZ-for-Java design: a
 readable object-oriented state machine that pays for per-bit method calls,
 bounds checks and struct-resident coder state. 7-Zip's own decoder is a
 different shape, one large loop with everything in registers and limits
-checked once per symbol, and it decodes the same streams 1.3x to 1.75x faster
-on a single core. This crate ports that shape rather than that lineage.
+checked once per symbol, and it decodes the same streams 1.3x to 1.7x faster
+on a single core (lzma-rust2 and sevenz-rust2 against `7zz -mmt=1`, Apple M5
+Max, 2026-09-15, in [docs/benchmarking.md](docs/benchmarking.md)). This crate
+ports that shape rather than that lineage.
 
 ## Speed
 
-Linux x86_64, Intel Arrow Lake-H, 16 threads, median of three runs. Every
-row decodes the same bytes and is checked byte for byte against `xz`.
+These are dated numbers: Linux x86_64, the 16-thread x86_64 bench box of
+[docs/perf-log.md](docs/perf-log.md), measured with `tools/lzma-bench` in
+September 2026 at commits before 0.6.0, median of three runs. Every row
+decodes the same bytes, checked against the oracle by length and CRC-32. To
+measure the current code on a machine of your own, or on several and merge
+them, use [`bench/lzma-turbo-bench`](bench/lzma-turbo-bench), which also
+records each process's peak RSS.
 
-One thread:
+One thread, pinned to the first three performance cores (`taskset -c 0-5`):
 
 | stream | lzma-turbo | `7zz -mmt=1` | `xz -T1` |
 | --- | --- | --- | --- |
 | 1 GiB LZMA1 | 19.6 s | 19.6 s | 20.5 s |
 | 256 MiB LZMA2 (.xz) | 4.9 s | 5.1 s | 5.1 s |
 
-LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`:
+LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`, unpinned:
 
 | threads | lzma-turbo | `7zz` | lzma-rust2 |
 | --- | --- | --- | --- |
@@ -66,7 +75,7 @@ LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`:
 | 8 | 4.3 s | 3.9 s | 29.3 s |
 | 16 | 4.2 s | 3.9 s | 29.0 s |
 
-`.xz` in parallel, 256 MiB in 16 blocks:
+`.xz` in parallel, 256 MiB in 16 blocks, unpinned (2026-09-16):
 
 | threads | `XzParallelReader` | `xz -T<n>` |
 | --- | --- | --- |
@@ -76,7 +85,9 @@ LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`:
 
 The 8- and 16-thread LZMA2 rows are the one place `7zz` is ahead, by how
 well its threads land on this machine's performance cores; pinned to those
-cores the two are within 5%. The full tables, with peak memory and the macOS
+cores the two are within 5%. docs/perf-log.md names the machine behind the
+first two tables as a 12th-gen Core i5-1240P (Alder Lake-P) and the one behind
+the third as Arrow Lake-H. The full tables, with peak memory and the macOS
 and Windows rows, are in
 [docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md).
 
@@ -114,7 +125,8 @@ pass, and `crc::CrcFolder` folds the pieces into any range the consumer asks
 about without re-reading a byte. This is not a convenience: the ring's write
 callback is its one serialised section, so a CRC computed by the consumer as
 it receives the output costs the decode both its own time and the queueing it
-induces on every other worker — measured at 16% of an eight-thread decode.
+induces on every other worker — measured at 16% of an eight-thread decode
+(Apple M5 Max, in docs/perf-log.md).
 SHA-256 cannot be folded, so it is offered per whole block only, which is the
 unit an xz stream checks.
 
@@ -153,14 +165,16 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | --- | --- | --- |
 | `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
 | `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
-| `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders |
-| `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs` |
-| `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, `XzEncoder`, the `.lzma`/`.xz` writers and the `Write` adapters; implies `crc` |
-| `filters` | yes | the BCJ, BCJ2 and delta converters, `filters::bcj`, `filters::bcj2` and `filters::delta`, on their own: `no_std`, no dependency |
+| `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders; implies `std` |
+| `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs`; implies `std` |
+| `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, the `.lzma` writer and the `Write` adapters, and with `xz` also `XzEncoder` and `XzWriter`; implies `crc` |
+| `filters` | yes, through `xz` | the BCJ, BCJ2 and delta converters, `filters::bcj`, `filters::bcj2` and `filters::delta`, on their own: `no_std`, no dependency |
 | `xz` | yes | the `.xz` container: `xz::XzReader`, `XzParallelReader`, `XzAdaptiveDecoder`, the checks and the index; implies `std`, `crc` and `filters`, and re-exports the converters at `xz::bcj` and `xz::delta` |
 | `native-crypto` | no | the same SHA-256 API over RustCrypto's `sha2`, taking precedence over `crypto` |
 | `crc-host` | no | on `wasm32`, the same CRC API delegated to embedder-installed hooks; implies `crc`. Inert on native targets - see [wasm](#wasm) |
 | `crypto-host` | no | on `wasm32`, the same SHA-256 API delegated to embedder-installed hooks; implies `native-crypto` and `std`. Inert on native targets |
+| `kernel-ab` | no | measurement only: a run-time toggle in front of each kernel that replaced a loop from the C (`LZMA_TURBO_MATCH_RUN`, `LZMA_TURBO_BCJ_SCAN`, `LZMA_TURBO_DELTA`); implies `std`, `enc` and `xz` |
+| `adaptive-stats` | no | diagnostic counters inside the adaptive decoder, printed on drop when `LZMA_ADAPTIVE_STATS` is set; implies `std` |
 
 This crate is LZMA, LZMA2 and the xz container, and nothing else: 7z archives
 are handled by a fork of `sevenz-rust2` that depends on it.
@@ -266,12 +280,12 @@ stored check was corrupted.
 
 ## Platforms
 
-Built and tested on macOS aarch64, Linux x86-64 and windows-msvc x86-64. The
-Windows lane is built with `clang-cl` and links AWS-LC statically, both with
-its assembly generated from source by NASM (`AWS_LC_SYS_PREBUILT_NASM=0`) and
-through its prebuilt objects; the test suite is run there in the assembly
-build and in the portable (`--no-default-features --features std,crc`) build,
-and `docs/perf-log.md` carries its `.xz` numbers.
+Built and tested on macOS aarch64, Linux x86-64, Linux aarch64 and
+windows-msvc x86-64. On Windows x86-64 AWS-LC is built with `aws-lc-sys`'s
+`prebuilt-nasm` feature, so its assembly comes from the prebuilt NASM objects
+and no assembler is installed. The test suite runs on every platform in the
+assembly build and in the portable (`--no-default-features --features std`)
+build, and `docs/perf-log.md` carries the Windows `.xz` numbers.
 
 ## How it is tested
 
@@ -311,15 +325,16 @@ aarch64 and windows-msvc x86-64 unless a stage says otherwise:
 | Path | What |
 | --- | --- |
 | [`src`](src), [`tests`](tests), [`fuzz`](fuzz) | The library crate (published to crates.io), its tests and its fuzz targets. |
-| [`tools/lzma-bench`](tools/lzma-bench) | Decode- and encode-throughput harness used for the acceptance gate. Not published. |
+| [`tools/lzma-bench`](tools/lzma-bench) | Decode- and encode-throughput harness used for the acceptance gate, and the `--shot` measurements `bench/lzma-turbo-bench` drives. Not published. |
+| [`bench/lzma-turbo-bench`](bench/lzma-turbo-bench) | The Go fleet harness: this crate against xz, 7-Zip, 7lzma, lzma-rust2 and liblzma, one process per measurement with its peak RSS, on any host, with a cross-host merge. Not published. |
 | [`tools/sdk-oracle`](tools/sdk-oracle), [`tools/sdk-encoder`](tools/sdk-encoder) | The pinned SDK's decoder and encoder, linked into the differential tests and fuzz targets. Not published. |
 | [`docs/porting.md`](docs/porting.md) | Port rules, C-to-Rust file map, acceptance gate. |
 | [`docs/encoder.md`](docs/encoder.md) | The encoder port: C-to-Rust file map, what was left out, how parity is proved. |
 | [`docs/benchmarking.md`](docs/benchmarking.md) | Fixtures, oracles and how to reproduce a measurement. |
 | [`docs/security.md`](docs/security.md) | Every limit the container layer enforces, and what each one stops. |
 | [`docs/publishing.md`](docs/publishing.md) | Release checklist. |
-| [`xtask`](xtask) | `cargo xtask`: the release checks, the fixture generator, the pre-commit hook and the asm-lab harness, in dependency-free Rust. Not published. |
-| `cargo xtask fixtures` | Generates the benchmark fixtures locally. They are never committed. |
+| [`xtask`](xtask) | `cargo xtask`: the release checks, the fixture generator, the pre-commit hook and the asm-lab harness, in Rust with one dependency (`sha2`, to check downloads against pinned digests). Not published. |
+| `cargo xtask fixtures` | Generates the benchmark fixtures locally ([bench/fixtures/README.md](bench/fixtures/README.md)). They are never committed. |
 
 ## Acknowledgements
 
