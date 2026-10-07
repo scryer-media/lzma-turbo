@@ -66,6 +66,62 @@ impl LzmaEncProps {
         }
     }
 
+    /// The settings `xz -N` uses, rather than the SDK's level `N`.
+    ///
+    /// [`LzmaEncProps::with_level`] is 7-Zip's numbering, resolved by
+    /// `LzmaEncProps_Normalize`; liblzma numbers its presets differently, and
+    /// the two disagree most at the fast end — the SDK's level 1 has a
+    /// 256 KiB dictionary where `xz -1` has 1 MiB. This builds `xz`'s preset
+    /// out of this encoder's own settings, so a stream written with it is
+    /// directly comparable with what `xz -N` (or `--lzma2=preset=N`) writes:
+    /// the same dictionary, `lc`/`lp`/`pb`, parser mode, match finder, nice
+    /// length (fast bytes here) and search depth (match cycles here). With
+    /// `extreme` it is `xz -Ne`.
+    ///
+    /// C: `lzma_lzma_preset` in XZ Utils' `liblzma/lzma/lzma_encoder_presets.c`,
+    /// with the depth `lz_encoder.c` derives when the preset leaves it at zero.
+    /// The one setting with no counterpart is preset 0's three-byte hash
+    /// chain: `LzFind.c` has no `HC3`, so preset 0 gets the four-byte one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Param`] for a preset above 9, which liblzma refuses too.
+    pub const fn xz_preset(preset: u32, extreme: bool) -> Result<Self, Error> {
+        const DICT_POW2: [u8; 10] = [18, 20, 21, 22, 22, 23, 23, 24, 25, 26];
+        const FAST_DEPTH: [u32; 4] = [4, 8, 24, 48];
+        if preset > 9 {
+            return Err(Error::Param);
+        }
+        let level = preset as usize;
+        let (fast, kind, fb, mc) = if extreme {
+            if preset == 3 || preset == 5 {
+                (false, MatchFinderKind::Bt4, 192, 16 + 192 / 2)
+            } else {
+                (false, MatchFinderKind::Bt4, 273, 512)
+            }
+        } else if preset <= 3 {
+            let fb = if preset <= 1 { 128 } else { 273 };
+            (true, MatchFinderKind::Hc4, fb, FAST_DEPTH[level])
+        } else {
+            let fb = match preset {
+                4 => 16,
+                5 => 32,
+                _ => 64,
+            };
+            // `lz_encoder.c`: a binary tree's depth defaults to
+            // `16 + nice_len / 2`.
+            (false, MatchFinderKind::Bt4, fb, 16 + fb / 2)
+        };
+        Ok(LzmaEncProps::new()
+            .with_level(preset)
+            .with_dict_size(1u32 << DICT_POW2[level])
+            .with_lclppb(3, 0, 2)
+            .with_fast_mode(fast)
+            .with_match_finder(kind)
+            .with_fast_bytes(fb)
+            .with_match_cycles(mc))
+    }
+
     /// How many threads one LZMA coder may use, which is 1 or 2: the second
     /// one is the threaded match finder, and it only applies in binary-tree
     /// mode outside fast mode. C: `props.numThreads`.
