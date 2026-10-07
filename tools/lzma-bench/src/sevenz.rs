@@ -55,12 +55,27 @@ pub fn pack_stream(data: &[u8]) -> Option<PackStream> {
     if data.len() < 32 || &data[..6] != b"7z\xBC\xAF\x27\x1C" {
         return None;
     }
-    let next_offset = u64::from_le_bytes(data[12..20].try_into().ok()?);
-    let next_size = u64::from_le_bytes(data[20..28].try_into().ok()?);
-    let start = usize::try_from(32u64.checked_add(next_offset)?).ok()?;
-    let end = start.checked_add(usize::try_from(next_size).ok()?)?;
-    let header = data.get(start..end)?;
+    let (start, len) = header_range(data[..32].try_into().ok()?)?;
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    pack_stream_in_header(data.get(start..end)?)
+}
 
+/// Where the archive's header is, from its 32-byte signature header: the
+/// absolute offset and the length. This is what lets a caller find the pack
+/// stream by reading the two ends of the file rather than all of it.
+pub fn header_range(signature: &[u8; 32]) -> Option<(u64, u64)> {
+    if &signature[..6] != b"7z\xBC\xAF\x27\x1C" {
+        return None;
+    }
+    let next_offset = u64::from_le_bytes(signature[12..20].try_into().ok()?);
+    let next_size = u64::from_le_bytes(signature[20..28].try_into().ok()?);
+    Some((32u64.checked_add(next_offset)?, next_size))
+}
+
+/// [`pack_stream`] given the header bytes alone, as [`header_range`] locates
+/// them.
+pub fn pack_stream_in_header(header: &[u8]) -> Option<PackStream> {
     let mut r = Reader {
         buf: header,
         pos: 0,
