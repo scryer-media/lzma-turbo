@@ -30,7 +30,6 @@ use std::time::Instant;
 use lzma_turbo::xz::{CheckType, FilterFlags, XzOptions, XzParallelReader, XzReader};
 use lzma_turbo::{
     Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader, LzmaEncProps, LzmaReader, XzWriter,
-    auto_block_size,
 };
 
 use crate::{CrcWriter, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_from_prop};
@@ -361,7 +360,9 @@ fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
             .map_err(|e| e.to_string())?;
     }
     if shot.threads > 1 {
-        w.set_block_size(auto_block_size(props.normalized().dict_size));
+        w.set_block_size(crate::encode::xz_mt_block_size(
+            props.normalized().dict_size,
+        ));
         w.set_threads(shot.threads);
     }
     loop {
