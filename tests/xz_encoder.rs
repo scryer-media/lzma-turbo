@@ -393,3 +393,179 @@ fn seven_zip_accepts_what_this_crate_writes() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A deterministic stand-in for machine code, `len` bytes long.
+///
+/// A library of short x86-flavoured routines - a few common opcodes, small
+/// operands, `E8` calls to other routines - is laid out again and again in a
+/// shuffled order, so the same routine recurs at distances well beyond a
+/// 256 KiB dictionary and every copy of a call carries a different relative
+/// target, which is what the x86 converter turns back into one absolute
+/// address. Nothing in it is random at run time: one seed, one payload.
+fn code_like(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    const OPS: [u8; 12] = [
+        0x48, 0x89, 0x8b, 0x83, 0x85, 0x0f, 0x74, 0x75, 0x31, 0xc3, 0x5d, 0x41,
+    ];
+    // Each routine is a list of pieces: plain bytes, or a call to routine `n`.
+    enum Piece {
+        Bytes(Vec<u8>),
+        Call(usize),
+    }
+    let routines = 3000;
+    let mut library: Vec<Vec<Piece>> = Vec::with_capacity(routines);
+    for _ in 0..routines {
+        let mut pieces = vec![Piece::Bytes(vec![0x55, 0x48, 0x89, 0xe5])];
+        let steps = 8 + (next() % 40) as usize;
+        for _ in 0..steps {
+            let r = next();
+            if r % 5 == 0 {
+                pieces.push(Piece::Call((r >> 8) as usize % routines));
+            } else {
+                let n = 2 + (r >> 8) as usize % 6;
+                let bytes = (0..n)
+                    .map(|i| {
+                        let v = next();
+                        if i == 0 {
+                            OPS[v as usize % OPS.len()]
+                        } else {
+                            (v >> 16) as u8 & 0x3f
+                        }
+                    })
+                    .collect();
+                pieces.push(Piece::Bytes(bytes));
+            }
+        }
+        pieces.push(Piece::Bytes(vec![0x5d, 0xc3]));
+        library.push(pieces);
+    }
+    // Where each routine "lives", as a call target.
+    let home: Vec<u32> = (0..routines).map(|i| (i as u32) * 256 + 0x1000).collect();
+
+    let mut out = Vec::with_capacity(len + 4096);
+    let mut order: Vec<usize> = (0..routines).collect();
+    while out.len() < len {
+        // A fresh shuffle each pass, so a routine's neighbours change.
+        for i in (1..order.len()).rev() {
+            order.swap(i, next() as usize % (i + 1));
+        }
+        for &r in &order {
+            for piece in &library[r] {
+                match piece {
+                    Piece::Bytes(b) => out.extend_from_slice(b),
+                    Piece::Call(t) => {
+                        let after = out.len() as u32 + 5;
+                        out.push(0xe8);
+                        out.extend_from_slice(&home[*t].wrapping_sub(after).to_le_bytes());
+                    }
+                }
+            }
+            if out.len() >= len {
+                break;
+            }
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn xz_preset_is_liblzma_preset_table() {
+    // `lzma_lzma_preset` in XZ Utils 5.8: dictionary, mode, match finder,
+    // nice length and depth for each level, with the depth `lz_encoder.c`
+    // derives for a binary tree when the preset leaves it at zero.
+    let dict = [18u32, 20, 21, 22, 22, 23, 23, 24, 25, 26];
+    let nice = [128u32, 128, 273, 273, 16, 32, 64, 64, 64, 64];
+    let depth = [4u32, 8, 24, 48, 24, 32, 48, 48, 48, 48];
+    for preset in 0..=9u32 {
+        let p = LzmaEncProps::xz_preset(preset, false).expect("preset");
+        let n = p.normalized();
+        let i = preset as usize;
+        assert_eq!(n.dict_size, 1 << dict[i], "preset {preset} dictionary");
+        assert_eq!((n.lc, n.lp, n.pb), (3, 0, 2), "preset {preset} lc/lp/pb");
+        assert_eq!(n.fb, nice[i], "preset {preset} nice length");
+        assert_eq!(n.mc, depth[i], "preset {preset} depth");
+        // Levels 0-3 are the fast mode over a hash chain, the rest the normal
+        // mode over a binary tree with a four-byte hash.
+        assert_eq!(n.bt_mode, u32::from(preset > 3), "preset {preset} finder");
+        assert_eq!(n.num_hash_bytes, 4, "preset {preset} hash bytes");
+    }
+    for preset in 0..=9u32 {
+        let n = LzmaEncProps::xz_preset(preset, true)
+            .expect("preset")
+            .normalized();
+        let (fb, mc) = if preset == 3 || preset == 5 {
+            (192, 112)
+        } else {
+            (273, 512)
+        };
+        assert_eq!((n.fb, n.mc, n.bt_mode), (fb, mc, 1), "preset {preset}e");
+        assert_eq!(n.dict_size, 1 << dict[preset as usize], "preset {preset}e");
+    }
+    assert!(LzmaEncProps::xz_preset(10, false).is_err());
+}
+
+#[test]
+fn bcj_x86_at_preset_1_costs_no_more_than_no_filter() {
+    let data = code_like(3 << 20, 0x5eed_c0de);
+    let x86 = [FilterFlags::new(BcjKind::X86.filter_id(), &[]).unwrap()];
+    for (what, props) in [
+        ("xz preset 1", LzmaEncProps::xz_preset(1, false).unwrap()),
+        ("SDK level 1", LzmaEncProps::new().with_level(1)),
+    ] {
+        let plain = encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+        let filtered =
+            encode_xz_with_filters(&data, &props, CheckType::Crc64, 0, &x86).expect("encode");
+        // On code the converter should help, and must never cost more than a
+        // tenth: the filter is a pass over the data, not a different encoder.
+        assert!(
+            filtered.len() * 10 <= plain.len() * 11,
+            "{what}: x86 + LZMA2 {} bytes against {} without the filter",
+            filtered.len(),
+            plain.len()
+        );
+        decode_every_way(&filtered, &data, what);
+    }
+}
+
+#[test]
+fn xz_preset_1_writes_what_xz_1_writes_within_a_few_percent() {
+    let Some(xz_tool) = XZ.find() else {
+        return;
+    };
+    let data = code_like(3 << 20, 0x5eed_c0de);
+    let props = LzmaEncProps::xz_preset(1, false).unwrap();
+    let x86 = FilterFlags::new(BcjKind::X86.filter_id(), &[]).unwrap();
+    for (what, filters, args) in [
+        ("plain", Vec::new(), vec!["-zc", "-T1", "--lzma2=preset=1"]),
+        (
+            "x86",
+            vec![x86],
+            vec!["-zc", "-T1", "--x86", "--lzma2=preset=1"],
+        ),
+    ] {
+        let ours =
+            encode_xz_with_filters(&data, &props, CheckType::Crc64, 0, &filters).expect("encode");
+        let theirs = pipe(&xz_tool, &args, &data).unwrap_or_else(|| panic!("xz failed on {what}"));
+        assert!(
+            ours.len() * 100 <= theirs.len() * 105,
+            "{what}: {} bytes against xz's {}",
+            ours.len(),
+            theirs.len()
+        );
+        let back = pipe(&xz_tool, &["-dc"], &ours).unwrap_or_else(|| panic!("xz -dc on {what}"));
+        assert_eq!(back, data, "xz -dc on {what}");
+        let mut out = Vec::new();
+        XzReader::new(Cursor::new(&theirs))
+            .read_to_end(&mut out)
+            .unwrap_or_else(|e| panic!("{what}: XzReader on xz's stream: {e}"));
+        assert_eq!(out, data, "{what}: XzReader on xz's stream");
+    }
+}

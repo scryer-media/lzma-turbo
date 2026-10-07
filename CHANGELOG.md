@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 - 2026-10-07
+
+- `LzmaEncProps::xz_preset(preset, extreme)`: the settings `xz -N` (and
+  `xz -Ne`) uses, built from this encoder's own: liblzma's dictionary,
+  `lc`/`lp`/`pb`, parser mode, match finder, nice length and depth from
+  `lzma_lzma_preset`. `with_level` is, and stays, 7-Zip's numbering from
+  `LzmaEncProps_Normalize`, which is not liblzma's: the SDK's level 1 has a
+  256 KiB dictionary, a five-byte hash chain, 32 fast bytes and 16 cycles,
+  where `xz -1` has 1 MiB, a four-byte hash chain, a nice length of 128 and a
+  depth of 8. Measured against `xz -1` that dictionary alone looked like a
+  24% ratio regression on a 30 MiB code fixture, with and without each BCJ
+  filter; through `xz_preset(1, false)` the same encoder writes within 0.01%
+  of `xz`'s size on every one of the eight BCJ chains and on the plain
+  stream, and stays faster than `xz -T1`. The filters and the LZMA2 path they
+  feed were already conformant: the converters' output is byte for byte
+  liblzma's, and a filter changes nothing about how the block is encoded.
+  Preset 0's three-byte hash chain has no counterpart in the SDK's match
+  finder, so that preset uses the four-byte one.
+
 ## 0.6.0 - 2026-09-22
 
 - `mt::Lzma2AdaptiveDecoder`: input is held as the pieces it arrived in rather
