@@ -4,7 +4,7 @@ description = "Runs lzma-turbo's wasm host-hook reference embedding under a nati
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.97.1"
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 repository = "https://github.com/scryer-media/lzma-turbo"
 publish = false
 
