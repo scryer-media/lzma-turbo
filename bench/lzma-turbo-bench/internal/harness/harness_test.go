@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -517,5 +518,48 @@ func TestRelativeOracleOverridesBecomeAbsolute(t *testing.T) {
 	t.Setenv("LZMA_TURBO_XZ", "my-xz")
 	if got := envPath("LZMA_TURBO_XZ"); filepath.Base(got) != "my-xz" || filepath.Dir(got) != filepath.Join(dir, "bin") {
 		t.Errorf("a bare name resolved to %q", got)
+	}
+}
+
+// `cargo xtask fixtures` runs `xz` by that name, so an LZMA_TURBO_XZ with
+// another basename needs a shim called xz, as a renamed 7-Zip does.
+func TestARenamedXzGetsAShim(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell-script stand-in")
+	}
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "opt", "xz-5.8.1")
+	if err := os.MkdirAll(filepath.Dir(tool), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Join(dir, "empty"))
+	paths := Paths{Fixtures: filepath.Join(dir, "fixtures")}
+	shim, err := toolShims(paths, Toolchain{XZ: Tool{Name: "xz", Path: tool}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shim == "" {
+		t.Fatal("no shim directory for a renamed xz")
+	}
+	t.Setenv("PATH", shim)
+	if got, err := exec.LookPath("xz"); err != nil || !sameFile(got, tool) {
+		t.Errorf("xz on the shimmed PATH = %q (%v), want %s", got, err, tool)
+	}
+
+	// Already what PATH gives for xz: nothing to shim.
+	named := filepath.Join(dir, "bin", "xz")
+	if err := os.MkdirAll(filepath.Dir(named), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(named, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(named))
+	paths.Fixtures = filepath.Join(dir, "fixtures2")
+	if shim, err := toolShims(paths, Toolchain{XZ: Tool{Name: "xz", Path: named}}); err != nil || shim != "" {
+		t.Errorf("shim = %q (%v) for the xz PATH already has", shim, err)
 	}
 }

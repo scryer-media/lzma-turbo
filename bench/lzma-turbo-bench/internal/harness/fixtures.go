@@ -289,34 +289,51 @@ func FixtureDigests(paths Paths, names []string) (map[string]Digest, error) {
 	return out, nil
 }
 
+// toolShims makes `cargo xtask fixtures`, which runs `xz` and `7zz` by
+// those names off PATH, run the tools the toolchain resolved. A tool that
+// is not already what PATH gives for its name (the pinned 7-Zip download,
+// 7za.exe on Windows, an LZMA_TURBO_XZ such as xz-5.8.1) gets a shim under
+// that name in a directory that goes first on PATH; it returns that
+// directory, or "" when PATH already has both.
+func toolShims(paths Paths, tc Toolchain) (string, error) {
+	shim := filepath.Join(paths.Fixtures, ".tools")
+	made := false
+	for _, tool := range []struct {
+		name string
+		tool Tool
+	}{{"7zz", tc.SevenZip}, {"xz", tc.XZ}} {
+		if !tool.tool.Found() {
+			continue
+		}
+		if onPath, err := exec.LookPath(tool.name); err == nil && sameFile(onPath, tool.tool.Path) {
+			continue
+		}
+		if err := os.MkdirAll(shim, 0o755); err != nil {
+			return "", err
+		}
+		target := filepath.Join(shim, exe(tool.name))
+		_ = os.Remove(target)
+		if err := linkOrCopy(tool.tool.Path, target); err != nil {
+			return "", fmt.Errorf("%s shim: %w", tool.name, err)
+		}
+		made = true
+	}
+	if !made {
+		return "", nil
+	}
+	return shim, nil
+}
+
 // runXtaskFixtures runs `cargo xtask fixtures`, which wants `xz`, `7zz` and
-// `tar` on PATH by those names. When the 7-Zip the toolchain resolved has
-// another name or is not on PATH (the pinned download, or 7za.exe on
-// Windows), a shim directory naming it 7zz goes first on PATH.
+// `tar` on PATH by those names; see toolShims.
 func runXtaskFixtures(ctx context.Context, paths Paths, tc Toolchain, logf func(string, ...any)) error {
 	env := os.Environ()
-	var prepend []string
-	if tc.SevenZip.Found() {
-		if onPath, err := exec.LookPath("7zz"); err != nil || !sameFile(onPath, tc.SevenZip.Path) {
-			shim := filepath.Join(paths.Fixtures, ".tools")
-			if err := os.MkdirAll(shim, 0o755); err != nil {
-				return err
-			}
-			target := filepath.Join(shim, exe("7zz"))
-			_ = os.Remove(target)
-			if err := linkOrCopy(tc.SevenZip.Path, target); err != nil {
-				return fmt.Errorf("7zz shim: %w", err)
-			}
-			prepend = append(prepend, shim)
-		}
+	shim, err := toolShims(paths, tc)
+	if err != nil {
+		return err
 	}
-	if tc.XZ.Found() {
-		if onPath, err := exec.LookPath("xz"); err != nil || !sameFile(onPath, tc.XZ.Path) {
-			prepend = append(prepend, filepath.Dir(tc.XZ.Path))
-		}
-	}
-	if len(prepend) > 0 {
-		env = append(env, "PATH="+strings.Join(append(prepend, os.Getenv("PATH")), string(os.PathListSeparator)))
+	if shim != "" {
+		env = append(env, "PATH="+shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
 	logf("generating fixtures: cargo xtask fixtures")
 	cmd := exec.CommandContext(ctx, "cargo", "xtask", "fixtures")
