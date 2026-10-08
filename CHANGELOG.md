@@ -18,6 +18,29 @@
   liblzma's, and a filter changes nothing about how the block is encoded.
   Preset 0's three-byte hash chain has no counterpart in the SDK's match
   finder, so that preset uses the four-byte one.
+- `XzWriter` and `XzEncoder`: the default single block is compressed as it
+  arrives instead of held whole. Once more than a dictionary's worth of input
+  has gone in, the LZMA2 encoder runs on a thread of its own, pulling the
+  input through a bounded pipe, and the compressed data is written out as it
+  comes; the check is computed and the BCJ and delta filters run over the
+  input as it streams. That block's header leaves both sizes to the index, as
+  `xz`'s single-threaded output does; its compressed data is byte for byte
+  what a one-shot encode writes. Up to a dictionary the block is still held
+  and written with its sizes declared, exactly as before. On a 256 MiB input
+  at one thread, peak RSS falls from 723 MiB to 19 MiB at `xz -1` settings
+  and from 803 MiB to 123 MiB at `xz -5` (Rust heap 875 MiB to 12.5 MiB and
+  956 MiB to 109 MiB), with no loss of speed. An explicit block size, at any
+  thread count, and the one-shot `encode_xz` calls write the same bytes as
+  before.
+- `Lzma2Writer` streams the same way past a dictionary's worth of input, and
+  its output is unchanged: the bytes are `Lzma2Encoder::encode_to_vec`'s over
+  the whole input. `LzmaWriter` still holds its input, because the `.lzma`
+  header carries the uncompressed size.
+- Where no thread can be started, both writers fall back to holding the input
+  and compressing it on `finish`.
+- `xz::filter::Converters::encode_push` and `encode_finish`: the encode
+  direction of `push` and `finish`, so a filter chain can be applied to a
+  block in pieces with the same result as `encode_in_place` over the whole.
 
 ## 0.6.0 - 2026-09-22
 

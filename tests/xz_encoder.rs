@@ -13,10 +13,11 @@ use std::process::{Command, Stdio};
 
 use lzma_turbo::xz::bcj::BcjKind;
 use lzma_turbo::xz::{
-    CheckType, FILTER_DELTA, FilterFlags, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader,
+    BlockHeader, CheckType, FILTER_DELTA, FilterFlags, XzAdaptiveDecoder, XzOptions,
+    XzParallelReader, XzReader,
 };
 use lzma_turbo::{
-    DrainStatus, LzmaEncProps, LzmaWriter, XzWriter, encode_lzma_alone, encode_xz,
+    DrainStatus, LzmaEncProps, LzmaWriter, XzWriter, encode_lzma_alone, encode_xz, encode_xz_mt,
     encode_xz_with_filters,
 };
 
@@ -65,7 +66,7 @@ fn chains() -> Vec<(String, Vec<FilterFlags>)> {
 }
 
 mod corpus;
-use corpus::{corpus, tempdir};
+use corpus::{corpus, max_len, mixed, tempdir};
 
 /// Every check type this build can write.
 fn checks() -> Vec<CheckType> {
@@ -189,6 +190,186 @@ fn the_writer_adapters_produce_the_same_bytes_as_the_one_shot_calls() {
         encode_lzma_alone(&data, &props).expect("encode"),
         "LzmaWriter"
     );
+}
+
+/// Writes `data` through an [`XzWriter`] left at its single block, in writes
+/// of uneven sizes from one byte up.
+fn write_solid(
+    data: &[u8],
+    props: &LzmaEncProps,
+    check: CheckType,
+    filters: &[FilterFlags],
+) -> Vec<u8> {
+    let mut w = XzWriter::new(Vec::new(), props).expect("writer");
+    w.set_check(check).expect("check");
+    w.set_filters(filters).expect("filters");
+    let mut rest = data;
+    let mut step = 1usize;
+    while !rest.is_empty() {
+        let n = step.min(rest.len());
+        w.write_all(&rest[..n]).expect("write");
+        rest = &rest[n..];
+        step = step * 7 % 300_007 + 1;
+    }
+    w.finish().expect("finish")
+}
+
+/// The header of a stream's first block.
+fn first_block(xz: &[u8]) -> BlockHeader {
+    let size = (usize::from(xz[12]) + 1) * 4;
+    BlockHeader::parse(&xz[12..12 + size]).expect("block header")
+}
+
+/// Asserts that `streamed` is `one_shot` written as it arrived: the same
+/// compressed data, the same size overall less what the header saved, and a
+/// header that leaves both sizes to the index.
+fn assert_streamed_form(streamed: &[u8], one_shot: &[u8], what: &str) {
+    let s = first_block(streamed);
+    let o = first_block(one_shot);
+    assert_eq!(
+        (s.compressed_size, s.uncompressed_size),
+        (None, None),
+        "{what}: a streamed block cannot know its sizes up front"
+    );
+    let n = usize::try_from(
+        o.compressed_size
+            .expect("a one-shot block declares its size"),
+    )
+    .expect("size");
+    assert_eq!(
+        streamed[12 + s.header_size..][..n],
+        one_shot[12 + o.header_size..][..n],
+        "{what}: the compressed data"
+    );
+    assert_eq!(
+        streamed.len() - s.header_size,
+        one_shot.len() - o.header_size,
+        "{what}: everything but the block header"
+    );
+}
+
+/// `xz -t` and `xz -dc` over one stream, when `xz` is installed.
+fn xz_accepts(xz: &[u8], want: &[u8], what: &str) {
+    let Some(xz_tool) = XZ.find() else {
+        return;
+    };
+    let dir = tempdir("xz-streamed");
+    let path = dir.join("streamed.xz");
+    std::fs::write(&path, xz).expect("write");
+    let status = Command::new(&xz_tool)
+        .arg("-t")
+        .arg(&path)
+        .status()
+        .expect("run xz -t");
+    assert!(status.success(), "xz -t rejected {what}");
+    let got = pipe(&xz_tool, &["-dc"], xz).unwrap_or_else(|| panic!("xz -dc failed on {what}"));
+    assert!(got == want, "xz -dc on {what} gave different bytes");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Past a dictionary's worth of input the writer's single block is
+/// compressed as it arrives rather than held - the encoder pulls it through a
+/// pipe - and the compressed data is the same as a one-shot encode's.
+#[test]
+fn a_solid_block_longer_than_the_dictionary_streams() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 20);
+    let data = mixed(0x5eed_0001, (6 << 20).min(max_len()));
+    let streamed = write_solid(&data, &props, CheckType::Crc64, &[]);
+    let one_shot = encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+    if data.len() > 1 << 20 {
+        assert_streamed_form(&streamed, &one_shot, "6 MiB");
+    }
+    decode_every_way(&streamed, &data, "streamed solid block");
+    xz_accepts(&streamed, &data, "a streamed solid block");
+}
+
+#[test]
+fn every_check_streams() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 18);
+    let data = mixed(0x5eed_0002, (3 << 19).min(max_len()));
+    for check in checks() {
+        let what = format!("check {check:?}");
+        let streamed = write_solid(&data, &props, check, &[]);
+        let one_shot = encode_xz(&data, &props, check, 0).expect("encode");
+        if data.len() > 1 << 18 {
+            assert_streamed_form(&streamed, &one_shot, &what);
+        }
+        decode_every_way(&streamed, &data, &what);
+        xz_accepts(&streamed, &data, &what);
+    }
+}
+
+/// The filters run over the input as it arrives, keeping each converter's
+/// unconverted tail for the next write; the result must be what converting
+/// the whole block in place makes of it, which the compressed data shows.
+#[test]
+fn every_filter_chain_streams() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+    let data = mixed(0x5eed_0003, 700_000.min(max_len()));
+    for (tag, filters) in chains() {
+        let streamed = write_solid(&data, &props, CheckType::Crc32, &filters);
+        let one_shot =
+            encode_xz_with_filters(&data, &props, CheckType::Crc32, 0, &filters).expect("encode");
+        if data.len() > 1 << 16 {
+            assert_streamed_form(&streamed, &one_shot, &tag);
+        }
+        decode_every_way(&streamed, &data, &tag);
+        xz_accepts(&streamed, &data, &tag);
+    }
+}
+
+/// Up to the dictionary the block is held and compressed at the end, with its
+/// sizes declared: the bytes are the one-shot encode's exactly. One byte more
+/// and it streams.
+#[test]
+fn up_to_the_dictionary_the_writer_holds_the_block() {
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    let dict = props.normalized().dict_size as usize;
+    let data = mixed(0x5eed_0004, dict + 1);
+    for len in [0, 1, 4097, dict - 1, dict] {
+        let streamed = write_solid(&data[..len], &props, CheckType::Crc64, &[]);
+        let one_shot = encode_xz(&data[..len], &props, CheckType::Crc64, 0).expect("encode");
+        assert_eq!(streamed, one_shot, "{len} bytes");
+    }
+    let streamed = write_solid(&data, &props, CheckType::Crc64, &[]);
+    let one_shot = encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+    assert_streamed_form(&streamed, &one_shot, "one byte past the dictionary");
+    decode_every_way(&streamed, &data, "one byte past the dictionary");
+}
+
+/// What [`explicit_blocks_are_written_as_before`] pins.
+const PINNED_LEN: usize = 226_292;
+const PINNED_CRC: u32 = 3_862_509_463;
+
+/// A block size of the caller's own is the path the writer always took, at
+/// one thread and at several: the bytes are pinned to what it wrote before
+/// the solid block could stream.
+#[test]
+fn explicit_blocks_are_written_as_before() {
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    let data = mixed(0x5eed_0005, 1 << 20);
+    let block = 1u64 << 17;
+    let want = encode_xz_mt(&data, &props, CheckType::Crc64, block, &[], 1).expect("encode");
+    // CRC-32 and length of this stream from the writer before the change.
+    assert_eq!(
+        (want.len(), lzma_turbo::crc::crc32(&want)),
+        (PINNED_LEN, PINNED_CRC),
+        "the multi-block stream changed"
+    );
+    for threads in [1usize, 4] {
+        let mut w = XzWriter::new(Vec::new(), &props).expect("writer");
+        w.set_block_size(block);
+        w.set_threads(threads);
+        for chunk in data.chunks(100_003) {
+            w.write_all(chunk).expect("write");
+        }
+        let got = w.finish().expect("finish");
+        assert!(
+            got == want,
+            "{threads} threads: the writer changed the stream"
+        );
+    }
+    decode_every_way(&want, &data, "explicit blocks");
 }
 
 /// One of the external decoders: where it is, and whether it must be there.
