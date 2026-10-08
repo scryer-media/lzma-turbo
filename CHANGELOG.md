@@ -90,6 +90,40 @@
   as a copy; this can. `Lzma2Run` is a public struct with public fields, so a
   caller that builds one by hand now has a field to fill. The scanner adds a
   few integer sums per chunk header and decodes nothing more.
+- Threaded match finder: a failure on the hash thread, such as a panic in the
+  caller's input stream, no longer lets the encoder read past the match data
+  the bt thread had published (an index out of bounds in `lz_find_mt`, seen on
+  Windows CI). The hash thread signalled the failure as an orderly end of
+  stream, taking back bytes earlier blocks had already promised the encoder,
+  which kept consuming positions against that promise into stale ring words.
+  It now sends a header no real block carries, which the bt thread turns into
+  its internal-data failure (C: `failure_BT`), so the lz thread switches to
+  the C's failure buffer and the encode returns an error. A test poisons the
+  ring and fails the stream after one read.
+- `XzWriter` and `Lzma2Writer` keep `std::io::Write`'s promise that an error
+  means none of the buffer was taken. A write that failed to pass compressed
+  output on had already fed its input to the encoder, so a caller retrying
+  the same bytes compressed them twice, and the output it was carrying was
+  lost. Pending output is now sent before new input is accepted and kept
+  until the sink takes it; once input is accepted the write succeeds, and
+  what the sink refuses then is retried by the next write, `flush` or
+  `finish`.
+- `XzEncoder`: whole blocks queued for the parallel batch under an explicit
+  block size are written before a later streaming block starts, instead of
+  after it. Setting the block size back to 0 with blocks queued at more than
+  one thread wrote the streaming block first, out of input order.
+- `crypto::SHA256_BACKEND`: which backend `Sha256` is (`"aws-lc-rs"`,
+  `"rustcrypto"` or `"host"`), by the same features as the re-export.
+- Benchmark harness only (`bench/lzma-turbo-bench`, `tools/lzma-bench`), no
+  library change: decode shots hash their output only in a separate verify
+  run, encode shots count their output without a sink copy, and xz encodes
+  are timed writing to the null device with their size taken from one untimed
+  run, so neither side pays a transport the other does not; a report built
+  from an interrupted or incomplete run fails; the plan counts the verify and
+  size runs; `--threads` replaces a profile's encode sweep; an oracle
+  override that names nothing runnable is missing; `lzma-bench --shot info`
+  names the SHA-256 backend; and a stale or dirty `lzma-bench`, a renamed
+  `xz`, relative overrides and an overridden fixture directory are handled.
 
 ## 0.6.0 - 2026-09-22
 
