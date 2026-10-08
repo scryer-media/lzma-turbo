@@ -42,15 +42,15 @@ fn main() {
     if let Some(head) = resolve(git(&repo, &["rev-parse", "--git-path", "HEAD"])) {
         println!("cargo:rerun-if-changed={}", head.display());
     }
-    if let Some(name) = git(&repo, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(r) = resolve(git(&repo, &["rev-parse", "--git-path", &name])) {
-            println!("cargo:rerun-if-changed={}", r.display());
-        }
+    if let Some(name) = git(&repo, &["symbolic-ref", "-q", "HEAD"])
+        && let Some(r) = resolve(git(&repo, &["rev-parse", "--git-path", &name]))
+    {
+        println!("cargo:rerun-if-changed={}", r.display());
     }
-    if let Some(packed) = resolve(git(&repo, &["rev-parse", "--git-path", "packed-refs"])) {
-        if packed.exists() {
-            println!("cargo:rerun-if-changed={}", packed.display());
-        }
+    if let Some(packed) = resolve(git(&repo, &["rev-parse", "--git-path", "packed-refs"]))
+        && packed.exists()
+    {
+        println!("cargo:rerun-if-changed={}", packed.display());
     }
 
     let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
