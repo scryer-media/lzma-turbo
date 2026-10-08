@@ -563,3 +563,36 @@ func TestARenamedXzGetsAShim(t *testing.T) {
 		t.Errorf("shim = %q (%v) for the xz PATH already has", shim, err)
 	}
 }
+
+// `fixtures --fixtures DIR` must leave DIR able to run the matrix: xtask
+// only writes the checkout's bench/fixtures, so its files are brought over,
+// and the harness extras are left to be built in DIR.
+func TestAnOverriddenFixtureDirectoryIsPopulated(t *testing.T) {
+	base, dir := t.TempDir(), t.TempDir()
+	table := []Fixture{{Name: "p256.bin"}, {Name: "p256.bin.xz"}, {Name: "kept.bin"}, {Name: "p256.none.xz", Extra: true}, {Name: "absent.bin"}}
+	for name, data := range map[string]string{"p256.bin": "payload", "p256.bin.xz": "compressed", "kept.bin": "base copy", "p256.none.xz": "extra"} {
+		if err := os.WriteFile(filepath.Join(base, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kept.bin"), []byte("already here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := populateFixtures(base, dir, table, t.Logf); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"p256.bin": "payload", "p256.bin.xz": "compressed", "kept.bin": "already here"} {
+		if got, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(got) != want {
+			t.Errorf("%s = %q (%v), want %q", name, got, err, want)
+		}
+	}
+	for _, name := range []string{"p256.none.xz", "absent.bin", "p256.bin.partial"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("%s was brought over", name)
+		}
+	}
+	// The checkout's own directory is left alone.
+	if err := populateFixtures(base, base, table, t.Logf); err != nil {
+		t.Error(err)
+	}
+}

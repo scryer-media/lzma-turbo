@@ -203,6 +203,9 @@ func Fixtures(ctx context.Context, paths Paths, tc Toolchain, options FixtureOpt
 		if err := runXtaskFixtures(ctx, paths, tc, logf); err != nil {
 			return nil, err
 		}
+		if err := populateFixtures(filepath.Join(paths.Repo, "bench", "fixtures"), paths.Fixtures, table, logf); err != nil {
+			return nil, err
+		}
 		for _, extra := range extraFixtures() {
 			if reason := buildExtra(ctx, paths, tc, extra, logf); reason != "" {
 				skipped[extra.Name] = reason
@@ -343,10 +346,62 @@ func runXtaskFixtures(ctx context.Context, paths Paths, tc Toolchain, logf func(
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("cargo xtask fixtures: %w", err)
 	}
-	if paths.Fixtures != filepath.Join(paths.Repo, "bench", "fixtures") {
-		logf("note: cargo xtask fixtures always writes to the checkout's bench/fixtures, not %s", paths.Fixtures)
+	return nil
+}
+
+// populateFixtures puts xtask's fixtures into a `--fixtures` directory other
+// than the checkout's bench/fixtures, which is the only place `cargo xtask
+// fixtures` writes: hard-linked where the two share a file system, copied
+// where they do not, so the bytes are read from the chosen directory's own
+// disk. A file already there is kept. The harness extras are built in place
+// afterwards from these.
+func populateFixtures(base, dir string, table []Fixture, logf func(string, ...any)) error {
+	if sameFile(base, dir) {
+		return nil
+	}
+	for _, fixture := range table {
+		if fixture.Extra {
+			continue
+		}
+		to := filepath.Join(dir, fixture.Name)
+		if _, err := os.Stat(to); err == nil {
+			continue
+		}
+		from := filepath.Join(base, fixture.Name)
+		if _, err := os.Stat(from); err != nil {
+			continue // verification reports it missing
+		}
+		logf("fixtures: %s from %s", fixture.Name, base)
+		partial := to + ".partial"
+		_ = os.Remove(partial)
+		if err := os.Link(from, partial); err != nil {
+			if err := copyFile(from, partial); err != nil {
+				_ = os.Remove(partial)
+				return fmt.Errorf("%s: %w", fixture.Name, err)
+			}
+		}
+		if err := os.Rename(partial, to); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func copyFile(from, to string) error {
+	in, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(to, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func sameFile(a, b string) bool {
