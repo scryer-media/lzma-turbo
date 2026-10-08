@@ -4,7 +4,7 @@ description = "Repository tasks: `cargo xtask release`"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.97.1"
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 publish = false
 
 # Kept to as close to nothing as possible: this has to build on a fresh clone,
