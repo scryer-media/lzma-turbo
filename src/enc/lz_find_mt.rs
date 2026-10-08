@@ -68,8 +68,12 @@
 //! A panic on the hash or bt thread is caught at the block it happened in and
 //! turned into the C's own failure protocol instead of a dead thread: the bt
 //! thread marks `failure_BT` and hands the lz thread an empty block, which is
-//! what `C/LzFindMt.c` does with corrupted tables; the hash thread ends the
-//! stream. Either way [`MtShared::thread_failed`] is raised and the encoder's
+//! what `C/LzFindMt.c` does with corrupted tables; the hash thread hands the
+//! bt thread a header no real block carries, which the bt thread turns into
+//! the same `failure_BT`. It must not end the stream instead: the bt blocks
+//! already published promise the lz thread every byte read so far, and a
+//! short end of stream would leave it reading past the last entry the bt
+//! thread wrote. Either way [`MtShared::thread_failed`] is raised and the encoder's
 //! `CheckErrors` returns an error. Before this, a panic left the surviving
 //! threads waiting on semaphores the dead one would never release.
 //!
@@ -1004,12 +1008,19 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
                 }
             }
             if h.failed {
-                // The C's "stream was finished" header with no bytes left,
-                // which sends the bt and lz threads to their end of stream.
+                // Not an end of stream: earlier blocks already promised the
+                // bt and lz threads every byte read so far, and an orderly
+                // `{2, 0}` here would take back the ones not hashed yet,
+                // leaving the lz thread to walk past the last entry the bt
+                // thread published. A count below the two-word header is one
+                // no real block carries; the bt thread turns it into
+                // `failure_BT`, whose empty blocks put the lz thread on the
+                // C's `failureBuf`, which is safe to read for any number of
+                // positions.
                 // SAFETY: the `free` semaphore was taken above, so this block
                 // is this thread's until `filled` is released below.
                 let heads = unsafe { sh.common.hash_block(offset) };
-                heads[0] = 2;
+                heads[0] = 0;
                 heads[1] = 0;
             }
 
@@ -1113,6 +1124,14 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
                 let k = hash_block_offset(bi) as u32;
                 // SAFETY: `get_next_block` has just handed this block over.
                 let h = unsafe { c.hash_all() };
+                if h[k as usize] < 2 {
+                    // The hash thread failed (see `hash_thread_func`). Not in
+                    // the C, whose hash thread cannot fail: handled as its
+                    // "internal data failure" below.
+                    b.failure = true;
+                    d[0] = 0;
+                    return;
+                }
                 avail = h[k as usize + 1];
                 b.hash_buf_pos_limit = k + h[k as usize];
                 b.hash_num_avail = avail;
@@ -1879,8 +1898,12 @@ pub(crate) fn with_threads<T>(
 mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::enc::stream::SliceStream;
+    use super::{MatchFinderMt, with_threads};
+    use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
+    use crate::enc::lz_find::MatchFinderKind;
+    use crate::enc::stream::{SeqInStream, SliceStream};
     use crate::enc::{Lzma2Encoder, LzmaEncProps};
+    use crate::error::Error;
 
     /// The `cyclicBufferSize` whose bt thread panics on purpose. Zero, the
     /// default, matches nothing: a cyclic buffer is never empty. Keyed on a
@@ -1913,5 +1936,71 @@ mod tests {
         let r = enc.encode_send(&mut SliceStream::new(&src), &mut out);
         BT_PANIC_AT_CBS.store(0, Ordering::SeqCst);
         assert!(r.is_err(), "a bt-thread panic was reported as success");
+    }
+
+    /// Hands out `ok` bytes in one read, then panics on the next one.
+    struct PanicAfter<'a> {
+        data: &'a [u8],
+        given: bool,
+    }
+
+    impl SeqInStream for PanicAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+            if self.given {
+                panic!("injected panic in the input stream");
+            }
+            assert!(
+                buf.len() >= self.data.len(),
+                "window smaller than the test input"
+            );
+            buf[..self.data.len()].copy_from_slice(self.data);
+            self.given = true;
+            Ok(self.data.len())
+        }
+    }
+
+    /// A panic in the input stream must not take back bytes the lz thread
+    /// was already promised.
+    ///
+    /// The first bt block's header promises every byte the hash thread had
+    /// read, and the encoder is entitled to consume that many positions -
+    /// `GetOptimum` looks ahead and `Skip`s on that count. The stream panics
+    /// on its second read, when some of those bytes are not hashed yet. The
+    /// hash thread used to hand the bt thread an orderly end of stream with
+    /// no bytes left, so the bt blocks stopped short of the promise and the
+    /// lz thread walked past the last published entry into words no thread
+    /// wrote this run: an out-of-bounds index on the encoder's match array,
+    /// seen on a Windows runner. The ring is poisoned first, so any such read
+    /// fails here on every platform and at every interleaving: what the bt
+    /// thread publishes depends only on the input, and the lz side consumes
+    /// the whole promise whatever the threads' timing.
+    #[test]
+    fn a_stream_panic_never_strands_the_lz_thread_past_the_published_blocks() {
+        let src: alloc::vec::Vec<u8> = (0..600_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 % 17)
+            .collect();
+        let mut mt = MatchFinderMt::new();
+        mt.mfb.kind = MatchFinderKind::Bt4;
+        mt.mfb.num_hash_bytes = 4;
+        mt.mfb.cut_value = 32;
+        mt.create(1 << 16, K_NUM_OPTS as u32, 273, LZMA_MATCH_LEN_MAX + 1)
+            .expect("create");
+        mt.init_mt().expect("init_mt");
+        mt.init();
+        // SAFETY: neither producer thread has been started.
+        unsafe { mt.shared().common.bt_all() }.fill(u32::MAX);
+
+        let sh = alloc::sync::Arc::clone(mt.shared_handle().expect("created"));
+        let mut input = PanicAfter {
+            data: &src,
+            given: false,
+        };
+        let r = with_threads(&sh, &mut input, || {
+            let promised = mt.get_num_available_bytes();
+            assert_eq!(promised as usize, src.len(), "first block's promise");
+            mt.skip(promised);
+            Ok(mt.failed())
+        });
+        assert_eq!(r, Ok(true), "the stream panic was not reported");
     }
 }
