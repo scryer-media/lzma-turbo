@@ -57,6 +57,7 @@ impl Finder {
     }
 
     /// Whether this is the threaded finder.
+    #[cfg(test)]
     pub(crate) fn is_mt(&self) -> bool {
         #[cfg(feature = "std")]
         {
@@ -105,29 +106,46 @@ impl Finder {
     }
 
     /// What this configuration would allocate, without allocating it.
+    ///
+    /// `mt` is `p->mtMode` as `LzmaEnc_Alloc` will compute it, not
+    /// [`Finder::is_mt`]: the estimate is taken before anything is allocated,
+    /// when the finder is still the single-threaded one it was constructed as.
     pub(crate) fn mem_usage(
         &mut self,
+        mt: bool,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
     ) -> Result<u64, Error> {
-        let mt = self.is_mt();
-        let mf = self.cfg();
-        if !mt {
-            return mf.mem_usage(
+        #[cfg(feature = "std")]
+        if mt {
+            return MatchFinderMt::mem_usage(
+                self.cfg(),
                 history_size,
                 keep_add_buffer_before,
                 match_max_len,
                 keep_add_buffer_after,
             );
         }
-        // C: `MatchFinderMt_Create` enlarges both keep sizes and allocates
-        // `hashBuf` and `btBuf` on top of what `MatchFinder_Create` takes.
-        let before = keep_add_buffer_before.saturating_add(MT_EXTRA_BEFORE);
-        let after = keep_add_buffer_after.saturating_add(MT_EXTRA_AFTER);
-        let base = mf.mem_usage(history_size, before, match_max_len, after)?;
-        Ok(base + u64::from(MT_EXTRA_BEFORE) * 4)
+        #[cfg(not(feature = "std"))]
+        let _ = mt;
+        self.cfg().mem_usage(
+            history_size,
+            keep_add_buffer_before,
+            match_max_len,
+            keep_add_buffer_after,
+        )
+    }
+
+    /// What this finder has allocated, in bytes.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self) -> u64 {
+        match self {
+            Finder::St(mf) => mf.allocated(),
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.allocated(),
+        }
     }
 
     /// C: `IMatchFinder2::Init`.
@@ -232,9 +250,3 @@ impl Finder {
         }
     }
 }
-
-/// C: `keepAddBufferBefore += (kHashBufferSize + kBtBufferSize)` in
-/// `MatchFinderMt_Create`, in `u32` words.
-const MT_EXTRA_BEFORE: u32 = (1 << 17) * 2 + (1 << 16) * 16;
-/// C: `keepAddBufferAfter += kMtHashBlockSize`.
-const MT_EXTRA_AFTER: u32 = 1 << 17;

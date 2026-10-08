@@ -102,6 +102,18 @@
   its internal-data failure (C: `failure_BT`), so the lz thread switches to
   the C's failure buffer and the encode returns an error. A test poisons the
   ring and fails the stream after one read.
+- `Lzma2Encoder::mem_usage_per_thread` counts the threaded match finder.
+  With `LzmaEncProps::with_num_threads(2)` the estimate was the
+  single-threaded finder's: it asked the finder whether it was the threaded
+  one, and the finder only becomes that in `LzmaEnc_Alloc`, after the estimate
+  is taken. It now applies the C's `mtMode` rule itself and adds what
+  `MatchFinderMt_Create` allocates: `hashBuf` and `btBuf` (5.0 MiB) and the
+  window grown by the two enlarged keep sizes (2.1 MiB), 7,405,576 bytes per
+  block coder at every dictionary size tested. `set_mem_limit` and
+  `threads_reduced` therefore admit fewer block threads under the same limit
+  when the threaded finder is on. A test prepares a block coder at 64 KiB,
+  1 MiB and 8 MiB dictionaries with one and two finder threads and compares
+  the estimate with the bytes its buffers actually hold.
 - `XzWriter` and `Lzma2Writer` keep `std::io::Write`'s promise that an error
   means none of the buffer was taken. A write that failed to pass compressed
   output on had already fed its input to the encoder, so a caller retrying

@@ -1451,6 +1451,40 @@ impl MatchFinderMt {
         Ok(())
     }
 
+    /// What [`MatchFinderMt::create`] would allocate for this configuration,
+    /// in bytes: `hashBuf` and `btBuf`, and the window and tables of a
+    /// `MatchFinder_Create` given the two enlarged keep sizes. `mfb` is the
+    /// `CMatchFinder` carrying the settings; nothing is allocated.
+    pub(crate) fn mem_usage(
+        mfb: &mut MatchFinder,
+        history_size: u32,
+        keep_add_buffer_before: u32,
+        match_max_len: u32,
+        keep_add_buffer_after: u32,
+    ) -> Result<u64, Error> {
+        if BT_BLOCK_SIZE <= match_max_len * 4 {
+            return Err(Error::Param);
+        }
+        let before = keep_add_buffer_before
+            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .ok_or(Error::Param)?;
+        let after = keep_add_buffer_after
+            .checked_add(HASH_BLOCK_SIZE)
+            .ok_or(Error::Param)?;
+        let base = mfb.mem_usage(history_size, before, match_max_len, after)?;
+        Ok(base + (HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2) as u64 * 4)
+    }
+
+    /// What this finder has allocated, in bytes: the window, the tables, and
+    /// `hashBuf` with `btBuf`.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self) -> u64 {
+        match &self.sh {
+            Some(sh) => sh._win.len() as u64 + (sh._tab.len() as u64 + sh._bufs.len() as u64) * 4,
+            None => self.mfb.allocated(),
+        }
+    }
+
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
     pub(crate) fn init_mt(&self) -> Result<(), Error> {
         let sh = self.shared();

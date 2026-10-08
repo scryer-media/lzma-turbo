@@ -1023,6 +1023,57 @@ mod tests {
         assert_eq!(enc.threads_reduced(), 1);
     }
 
+    /// The estimate covers what a block's coder really allocates, with and
+    /// without the threaded match finder, whose `hashBuf` and `btBuf` and
+    /// wider window it has to count. The allocation is read off the buffers
+    /// the coder holds after `Lzma2EncInt_InitStream` has prepared it.
+    #[test]
+    fn the_estimate_bounds_what_a_block_coder_allocates() {
+        // C: `kHashBufferSize + kBtBufferSize`, in `u32` words.
+        const MT_BUFS: u64 = ((1 << 17) * 2 + (1 << 16) * 16) * 4;
+        for dict_size in [1u32 << 16, 1 << 20, 1 << 23] {
+            let mut per_finder = [0u64; 2];
+            for mf_threads in [1u32, 2] {
+                let props = LzmaEncProps::new()
+                    .with_dict_size(dict_size)
+                    .with_num_threads(mf_threads);
+                let mut enc = Lzma2Encoder::new(&props).unwrap();
+                enc.set_block_size(u64::from(dict_size) * 4);
+                enc.set_threads(4);
+                let what = format!("dict {dict_size}, {mf_threads} finder threads");
+
+                let block = enc.block_size();
+                let per = enc.mem_usage_per_thread();
+                let estimate = enc.coder.enc.mem_usage();
+                assert_eq!(per, estimate + block + (block >> 10) + 16 + block, "{what}");
+
+                enc.coder.enc.prepare(UNPACK_SIZE_MAX).unwrap();
+                let allocated = enc.coder.enc.allocated();
+                assert_eq!(
+                    enc.coder.enc.mf.is_mt(),
+                    cfg!(feature = "std") && mf_threads == 2,
+                    "{what}"
+                );
+                assert!(
+                    estimate >= allocated,
+                    "{what}: estimated {estimate}, allocated {allocated}"
+                );
+                // A bound, and a close one: nothing but rounding is spare.
+                assert!(
+                    estimate - allocated < 1 << 12,
+                    "{what}: estimated {estimate}, allocated {allocated}"
+                );
+                per_finder[mf_threads as usize - 1] = per;
+            }
+            if cfg!(feature = "std") {
+                assert!(
+                    per_finder[1] >= per_finder[0] + MT_BUFS,
+                    "dict {dict_size}: {per_finder:?}"
+                );
+            }
+        }
+    }
+
     /// The thread count also comes down to the number of blocks there are.
     #[test]
     fn fewer_blocks_than_threads_reduces_the_thread_count() {
