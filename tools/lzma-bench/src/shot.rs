@@ -70,7 +70,8 @@ pub struct Shot {
 struct Line {
     bytes_in: u64,
     bytes_out: u64,
-    crc32: u32,
+    /// The output's CRC-32, where the shot computed one.
+    crc32: Option<u32>,
     seconds: f64,
     peak_alloc: u64,
     input_buffered: u64,
@@ -89,7 +90,7 @@ pub fn run(shot: &Shot, file: Option<&Path>) -> i32 {
         Ok(line) => {
             println!(
                 "{{\"lane\":\"{}\",\"threads\":{},\"preset\":{},\"filter\":\"{}\",\
-                 \"direction\":\"{}\",\"bytes_in\":{},\"bytes_out\":{},\"crc32\":\"{:08x}\",\
+                 \"direction\":\"{}\",\"bytes_in\":{},\"bytes_out\":{},\"crc32\":\"{}\",\
                  \"inproc_seconds\":{:.6},\"peak_alloc_bytes\":{},\"input_buffered_bytes\":{}}}",
                 shot.lane,
                 shot.threads,
@@ -102,7 +103,7 @@ pub fn run(shot: &Shot, file: Option<&Path>) -> i32 {
                 },
                 line.bytes_in,
                 line.bytes_out,
-                line.crc32,
+                line.crc32.map(|c| format!("{c:08x}")).unwrap_or_default(),
                 line.seconds,
                 line.peak_alloc,
                 line.input_buffered,
@@ -180,7 +181,7 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             Ok(Line {
                 bytes_in,
                 bytes_out,
-                crc32: sink.crc.finish(),
+                crc32: Some(sink.crc.finish()),
                 seconds: t0.elapsed().as_secs_f64(),
                 peak_alloc: alloc_watch_peak(base),
                 input_buffered: 0,
@@ -259,7 +260,7 @@ fn read_all<R: Read>(
     Ok(Line {
         bytes_in,
         bytes_out,
-        crc32: sink.crc.finish(),
+        crc32: Some(sink.crc.finish()),
         seconds,
         peak_alloc: alloc_watch_peak(base),
         input_buffered: 0,
@@ -340,7 +341,9 @@ fn bcj_kind(name: &str) -> Result<lzma_turbo::filters::bcj::BcjKind, String> {
 }
 
 /// `XzWriter` at a preset, streaming the input through it into a counting
-/// sink. At one thread it writes one solid block, as `xz -T1` does; above one
+/// sink. Only counting: `xz`'s output goes to a sink that counts it too, and
+/// no one checks an encoder's CRC, so hashing here would time work only this
+/// side does. At one thread it writes one solid block, as `xz -T1` does; above one
 /// it cuts blocks at the size `xz -T<n>` would, so the two are comparable.
 fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     // `xz -N`'s own settings, not 7-Zip's level N: the oracle row runs `xz -N`,
@@ -353,7 +356,7 @@ fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     let mut buf = vec![0u8; IN_CHUNK];
     let base = alloc_watch_reset();
     let t0 = Instant::now();
-    let mut w = XzWriter::new(CrcWriter::new(), &props).map_err(|e| e.to_string())?;
+    let mut w = XzWriter::new(CountWriter::default(), &props).map_err(|e| e.to_string())?;
     w.set_check(CheckType::Crc64).map_err(|e| e.to_string())?;
     if let Some(f) = &shot.filter {
         w.set_filters(&[filter_flags(f)?])
@@ -372,12 +375,12 @@ fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
         }
         w.write_all(&buf[..n]).map_err(|e| e.to_string())?;
     }
-    let mut sink = w.finish().map_err(|e| e.to_string())?;
+    let sink = w.finish().map_err(|e| e.to_string())?;
     let seconds = t0.elapsed().as_secs_f64();
     Ok(Line {
         bytes_in,
         bytes_out: sink.written,
-        crc32: sink.crc.finish(),
+        crc32: None,
         seconds,
         peak_alloc: alloc_watch_peak(base),
         input_buffered: 0,
@@ -413,7 +416,7 @@ fn filter(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
             return Ok(Line {
                 bytes_in,
                 bytes_out: out,
-                crc32: crc.finish(),
+                crc32: Some(crc.finish()),
                 seconds,
                 peak_alloc: alloc_watch_peak(base),
                 input_buffered: buffered,
@@ -432,7 +435,7 @@ fn filter(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
         return Ok(Line {
             bytes_in,
             bytes_out: out.len() as u64,
-            crc32: crc.finish(),
+            crc32: Some(crc.finish()),
             seconds,
             peak_alloc: alloc_watch_peak(base),
             input_buffered: buffered,
@@ -475,9 +478,85 @@ fn filter(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     Ok(Line {
         bytes_in,
         bytes_out: data.len() as u64,
-        crc32: crc.finish(),
+        crc32: Some(crc.finish()),
         seconds,
         peak_alloc: alloc_watch_peak(base),
         input_buffered: buffered,
     })
+}
+
+/// A sink that only counts what it is given, as the harness's own sink for
+/// `xz`'s output does.
+#[derive(Default)]
+struct CountWriter {
+    written: u64,
+}
+
+impl Write for CountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch file of its own for each test, removed when dropped.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str, data: &[u8]) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("lzma-bench-{}-{name}", std::process::id()));
+            std::fs::write(&path, data).expect("write scratch file");
+            Scratch(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn payload() -> Vec<u8> {
+        (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 23) as u8)
+            .collect()
+    }
+
+    fn shot(lane: &str) -> Shot {
+        Shot {
+            lane: lane.into(),
+            threads: 1,
+            preset: 1,
+            mf_threads: 1,
+            filter: None,
+            encode: false,
+        }
+    }
+
+    /// The encode shot counts its output and hashes none of it: `xz`'s
+    /// output goes to a counting sink, so a hash here is work only this side
+    /// would be timed doing.
+    #[test]
+    fn an_encode_shot_counts_and_does_not_hash() {
+        let data = payload();
+        let input = Scratch::new("encode.bin", &data);
+        let line = measure(&shot("encode"), &input.0).expect("encode shot");
+        assert_eq!(line.crc32, None);
+
+        let props = LzmaEncProps::xz_preset(1, false).expect("preset");
+        let mut w = XzWriter::new(Vec::new(), &props).expect("writer");
+        w.set_check(CheckType::Crc64).expect("check");
+        w.write_all(&data).expect("write");
+        let want = w.finish().expect("finish").len() as u64;
+        assert_eq!(line.bytes_out, want);
+    }
 }
