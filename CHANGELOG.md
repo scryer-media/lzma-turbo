@@ -2,6 +2,8 @@
 
 ## 0.7.0 - 2026-10-07
 
+- The crate is now licensed Apache-2.0 instead of GPL-3.0-or-later, matching
+  `sevenz-turbo`. Earlier releases stay under their published license.
 - `LzmaEncProps::xz_preset(preset, extreme)`: the settings `xz -N` (and
   `xz -Ne`) uses, built from this encoder's own: liblzma's dictionary,
   `lc`/`lp`/`pb`, parser mode, match finder, nice length and depth from

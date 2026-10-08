@@ -359,8 +359,10 @@ to be named first.
 
 The decoder is derived from `C/LzmaDec.c`, `C/Lzma2Dec.c`, `C/Lzma2DecMt.c`,
 `C/MtDec.c` and `Asm/` in the LZMA SDK by Igor Pavlov, which are in the
-public domain. This crate's source is licensed GPL-3.0-or-later; see
-[LICENSE](LICENSE).
+public domain. This crate's source is licensed under the
+[Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0); see
+[LICENSE](LICENSE). Releases before 0.7.0 were published under GPL-3.0-or-later
+and remain available under that license.
 
 ## Contributing
 
