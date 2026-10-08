@@ -535,6 +535,10 @@ impl XzEncoder {
     /// If no thread can be started the encoder comes back, nothing is
     /// written, and the block is held and compressed at the end as before.
     fn start_stream(&mut self) -> Result<(), Error> {
+        // Whole blocks queued under an earlier block size come first: the
+        // streaming block writes straight into the output from here on.
+        #[cfg(feature = "std")]
+        self.flush_queue()?;
         let lzma2 = self.lzma2.take().ok_or(Error::InternalFailure)?;
         let pipe = match Lzma2Pipe::start(lzma2) {
             Ok(pipe) => pipe,

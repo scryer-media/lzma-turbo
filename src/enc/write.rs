@@ -37,6 +37,25 @@ fn io(e: Error) -> io::Error {
     io::Error::other(e)
 }
 
+/// Writes `out` to `inner`, removing from it what `inner` accepted, so that a
+/// failure part way leaves exactly the unsent tail for the next attempt.
+fn send(inner: &mut dyn Write, out: &mut Vec<u8>) -> io::Result<()> {
+    let mut done = 0;
+    let r = loop {
+        if done == out.len() {
+            break Ok(());
+        }
+        match inner.write(&out[done..]) {
+            Ok(0) => break Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+    out.drain(..done);
+    r
+}
+
 /// Writes a `.lzma` (LZMA-Alone) file.
 ///
 /// The 13-byte header carries the uncompressed size, so nothing can be
@@ -159,12 +178,7 @@ impl<W: Write> Lzma2Writer<W> {
 
     /// Hands what the encoder has produced to the wrapped writer.
     fn drain(&mut self) -> io::Result<()> {
-        if self.out.is_empty() {
-            return Ok(());
-        }
-        self.inner.as_mut().expect("open").write_all(&self.out)?;
-        self.out.clear();
-        Ok(())
+        send(self.inner.as_mut().expect("open"), &mut self.out)
     }
 
     /// Compresses everything written so far, writes it out, and returns the
@@ -192,7 +206,12 @@ impl<W: Write> Lzma2Writer<W> {
 }
 
 impl<W: Write> Write for Lzma2Writer<W> {
+    /// An error from the wrapped writer is returned before any of `buf` is
+    /// taken: output an earlier call could not hand over goes out first, and
+    /// once `buf` has gone into the encoder a failure to pass its output on
+    /// is held for the next call to report, as `Write` asks.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.drain()?;
         let mut data = buf;
         if self.pipe.is_none() {
             let take = if self.may_stream {
@@ -220,7 +239,9 @@ impl<W: Write> Write for Lzma2Writer<W> {
         if let Some(pipe) = &mut self.pipe {
             pipe.write(data, &mut self.out).map_err(io)?;
         }
-        self.drain()?;
+        // `buf` is taken; what `inner` refuses now stays held, and the next
+        // `write`, `flush` or `finish` returns the error.
+        let _ = self.drain();
         Ok(buf.len())
     }
 
@@ -245,6 +266,8 @@ impl<W: Write> Write for Lzma2Writer<W> {
 pub struct XzWriter<W: Write> {
     inner: Option<W>,
     enc: XzEncoder,
+    /// Encoder output the wrapped writer has not accepted yet.
+    out: Vec<u8>,
 }
 
 #[cfg(feature = "xz")]
@@ -259,6 +282,7 @@ impl<W: Write> XzWriter<W> {
         Ok(XzWriter {
             inner: Some(inner),
             enc: XzEncoder::new(props)?,
+            out: Vec::new(),
         })
     }
 
@@ -301,28 +325,38 @@ impl<W: Write> XzWriter<W> {
     ///
     /// Whatever the encoder or the wrapped writer returns.
     pub fn finish(mut self) -> io::Result<W> {
-        let mut inner = self.inner.take().expect("finish once");
         self.enc.finish().map_err(io)?;
-        inner.write_all(&self.enc.take_output())?;
+        self.drain()?;
+        let mut inner = self.inner.take().expect("finish once");
         inner.flush()?;
         Ok(inner)
     }
 
-    /// Hands whatever the encoder has produced to the wrapped writer.
+    /// Hands whatever the encoder has produced to the wrapped writer, keeping
+    /// what it does not accept.
     fn drain(&mut self) -> io::Result<()> {
-        if self.enc.output().is_empty() {
-            return Ok(());
+        if !self.enc.output().is_empty() {
+            let mut out = self.enc.take_output();
+            if self.out.is_empty() {
+                self.out = out;
+            } else {
+                self.out.append(&mut out);
+            }
         }
-        let out = self.enc.take_output();
-        self.inner.as_mut().expect("open").write_all(&out)
+        send(self.inner.as_mut().expect("open"), &mut self.out)
     }
 }
 
 #[cfg(feature = "xz")]
 impl<W: Write> Write for XzWriter<W> {
+    /// As [`Lzma2Writer`]'s: an error from the wrapped writer is returned
+    /// before any of `buf` is taken.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.enc.push(buf).map_err(io)?;
         self.drain()?;
+        self.enc.push(buf).map_err(io)?;
+        // `buf` is taken; what `inner` refuses now stays held, and the next
+        // `write`, `flush` or `finish` returns the error.
+        let _ = self.drain();
         Ok(buf.len())
     }
 

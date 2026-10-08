@@ -161,3 +161,77 @@ fn lzma2_writer_streams_the_one_shot_bytes() {
         }
     }
 }
+
+/// A sink that, while armed, refuses every third write, and takes only part
+/// of the others.
+struct Flaky {
+    out: Vec<u8>,
+    calls: usize,
+    armed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Write for Flaky {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.armed.get() && self.calls % 3 == 0 {
+            return Err(std::io::Error::other("refused"));
+        }
+        let n = buf.len().min(4000);
+        self.out.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `Write` says an error means none of the buffer was written, so a caller
+/// may retry the same bytes. The writer used to take them into the encoder
+/// and only then fail to pass the output on, so the retry compressed them
+/// twice; and a refused write lost the output it was carrying.
+///
+/// The sink is refused only while input goes in, and some output is certain
+/// to come back then whatever the threads' timing: the input channel holds
+/// two chunks, so the last writes wait on the encoder having read, and so
+/// having written, most of four megabytes.
+#[test]
+fn lzma2_writer_takes_nothing_from_a_write_that_fails() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+    let data = mixed(0x5eed_0007, (4 << 20).min(max_len()));
+    let armed = std::rc::Rc::new(std::cell::Cell::new(true));
+    let mut w = Lzma2Writer::new(
+        Flaky {
+            out: Vec::new(),
+            calls: 0,
+            armed: std::rc::Rc::clone(&armed),
+        },
+        &props,
+    )
+    .expect("writer");
+    let mut refused = 0;
+    for chunk in data.chunks(10_000) {
+        loop {
+            match w.write(chunk) {
+                Ok(n) => {
+                    assert_eq!(n, chunk.len(), "a short write");
+                    break;
+                }
+                Err(_) => refused += 1,
+            }
+        }
+    }
+    while w.flush().is_err() {
+        refused += 1;
+    }
+    armed.set(false);
+    let prop = w.properties();
+    let sink = w.finish().expect("finish");
+    assert!(refused > 0, "the sink never refused a write");
+    let mut back = Vec::new();
+    Lzma2Reader::new(std::io::Cursor::new(&sink.out), prop)
+        .expect("reader")
+        .read_to_end(&mut back)
+        .expect("decode");
+    assert!(back == data, "the retried writes changed the stream");
+}

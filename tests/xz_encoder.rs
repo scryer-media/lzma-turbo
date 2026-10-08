@@ -782,3 +782,97 @@ fn a_block_size_set_after_input_keeps_every_byte() {
     let xz = w.finish().expect("finish");
     decode_every_way(&xz, &data[..60_000], "block size set while held");
 }
+
+/// Blocks queued for a parallel batch come out before a solid block that
+/// starts after them. With two threads one whole block waits in the queue for
+/// a second; a switch back to the default size then streams the rest, and the
+/// streamed block used to be written ahead of the queued one, which `finish`
+/// appended after it: every byte present, in the wrong order.
+#[test]
+fn queued_blocks_stay_ahead_of_a_block_that_starts_streaming() {
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 23) as u8)
+        .collect();
+    let (head, tail) = data.split_at(4096);
+    let mut w = XzWriter::new(Vec::new(), &props).expect("writer");
+    w.set_threads(2);
+    w.set_block_size(4096);
+    w.write_all(head).expect("write");
+    w.set_block_size(0);
+    w.write_all(tail).expect("write");
+    let xz = w.finish().expect("finish");
+    decode_every_way(&xz, &data, "queued block, then a streaming one");
+}
+
+/// A sink that, while armed, refuses every third write, and takes only part
+/// of the others.
+struct Flaky {
+    out: Vec<u8>,
+    calls: usize,
+    armed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Write for Flaky {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.armed.get() && self.calls % 3 == 0 {
+            return Err(std::io::Error::other("refused"));
+        }
+        let n = buf.len().min(4000);
+        self.out.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `Write` says an error means none of the buffer was written, so a caller
+/// may retry the same bytes. The writer used to take them into the encoder
+/// and only then fail to pass the output on, so the retry compressed them
+/// twice; and a refused write lost the output it had already taken.
+///
+/// The sink is refused only while input goes in. With a block size the
+/// output comes back on the push that fills a block; streaming, the input
+/// channel holds two chunks, so the last writes wait on the encoder having
+/// read, and so having written, most of four megabytes. Either way some is
+/// refused whatever the threads' timing.
+#[test]
+fn xz_writer_takes_nothing_from_a_write_that_fails() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+    let data = mixed(0x5eed_0008, (4 << 20).min(max_len()));
+    for block in [0u64, 1 << 16] {
+        let armed = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut w = XzWriter::new(
+            Flaky {
+                out: Vec::new(),
+                calls: 0,
+                armed: std::rc::Rc::clone(&armed),
+            },
+            &props,
+        )
+        .expect("writer");
+        w.set_block_size(block);
+        let mut refused = 0;
+        for chunk in data.chunks(10_000) {
+            loop {
+                match w.write(chunk) {
+                    Ok(n) => {
+                        assert_eq!(n, chunk.len(), "a short write");
+                        break;
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        while w.flush().is_err() {
+            refused += 1;
+        }
+        armed.set(false);
+        let sink = w.finish().expect("finish");
+        assert!(refused > 0, "block {block}: the sink never refused a write");
+        decode_every_way(&sink.out, &data, &format!("block {block}, retried writes"));
+    }
+}
