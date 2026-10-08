@@ -16,8 +16,8 @@ size and digest vary.
 
 | File | Size | SHA-256 | How |
 | --- | --- | --- | --- |
-| `payload.bin` | 1073741824 | `24fe0a372a6da43fa26ec284783ca00363ed81be79c39aeaaf805db197331d85` | synthetic, seeded; compresses to about 0.88 |
-| `p256.bin` | 268435456 | `5e46cec853b0a2ce98c7b424be67fab4f1c6076c4bd5e7e30896a06269216ee8` | first 256 MiB of payload.bin |
+| `payload.bin` | 1073741824 | `5d6dea8564e6412763756bf5a3e05d15e40592f28ae6a8800e1d91c10a386658` | synthetic, seeded; compresses to about 0.88 |
+| `p256.bin` | 268435456 | `1f01b30af4ef1142dc8fc0c9f7298028d029ea163b385e9d87b8ef15079498a6` | first 256 MiB of payload.bin |
 | `p256.bin.lzma` | ~224 MiB | - | `xz -T1 -5 --format=lzma` (LZMA1) |
 | `payload.bin.lzma` | ~897 MiB | - | same, on payload.bin |
 | `p256.bin.xz` | ~224 MiB | - | `xz -T1 -5` (one LZMA2 block in an .xz) |
