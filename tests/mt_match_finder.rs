@@ -13,7 +13,9 @@
 
 use std::io::Read as _;
 
-use lzma_turbo::{Lzma2Encoder, Lzma2Reader, LzmaEncProps, MatchFinderKind, SliceStream};
+use lzma_turbo::{
+    Error, Lzma2Encoder, Lzma2Reader, LzmaEncProps, MatchFinderKind, SeqInStream, SliceStream,
+};
 
 #[path = "corpus/mod.rs"]
 mod shared;
@@ -139,5 +141,113 @@ fn the_big_hash_heads_round_trip() {
             .with_dict_size(dict));
         let (prop, out) = encode_stream(&props, &src);
         round_trip(prop, &out, &src, &format!("big hash dict {dict}"));
+    }
+}
+
+/// Pseudo-random bytes with back-references sprinkled through them: mostly
+/// incompressible, so the bt thread keeps pace with the hash thread instead of
+/// lagging a long chain behind it, with enough matches for the tree to be
+/// walked. That pacing is what the sliding-window reproduction below needs.
+fn mixed(len: usize) -> Vec<u8> {
+    let len = len.min(shared::max_len());
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut v = Vec::with_capacity(len);
+    while v.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if (x >> 60) < 4 {
+            let n = ((x >> 8) as usize % 64 + 4).min(len - v.len());
+            let back = (x >> 20) as usize % 100_000 + 1;
+            if back < v.len() {
+                for _ in 0..n {
+                    v.push(v[v.len() - back]);
+                }
+                continue;
+            }
+        }
+        v.push(x as u8);
+    }
+    v
+}
+
+/// An input longer than the window, through `encode_send`, so that
+/// `MatchFinder_MoveBlock` slides the window under the bt and lz threads.
+///
+/// This used to panic on the bt thread ("range end index ... out of range" in
+/// `match_run`) and then hang: the move rewrote the bt thread's window index
+/// while that thread held a `&mut` to it across `get_next_block`, so the
+/// compiled bt thread carried on from its old index and ran off the end of the
+/// window. 8 MiB dictionaries failed from about 15 MB of input, 1 MiB ones at
+/// 16 MiB.
+///
+/// The output must decode back, and be the single-threaded finder's output
+/// byte for byte: the port's threaded finder finds the same matches (see
+/// `src/enc/lz_find_mt.rs`), so even the size tolerance a different match
+/// choice would need is not called for.
+#[test]
+fn the_threaded_finder_survives_the_window_sliding_past_the_input() {
+    for (dict, len) in [(8u32 << 20, 16_000_000usize), (1 << 20, 16 << 20)] {
+        let src = mixed(len);
+        let st = LzmaEncProps::new().with_level(6).with_dict_size(dict);
+        let (prop, out) = encode_stream(&mt(&st), &src);
+        round_trip(prop, &out, &src, &format!("dict {dict} len {len}"));
+
+        let (_, single) = encode_stream(&st, &src);
+        assert!(
+            out == single,
+            "dict {dict} len {len}: threaded finder {} bytes, single-threaded {}",
+            out.len(),
+            single.len()
+        );
+    }
+}
+
+/// A source that hands out `ok` bytes of `data` and then fails, either with an
+/// error or by panicking.
+struct FailingStream<'a> {
+    data: &'a [u8],
+    pos: usize,
+    ok: usize,
+    panic: bool,
+}
+
+impl SeqInStream for FailingStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.pos >= self.ok {
+            if self.panic {
+                panic!("injected panic in the input stream");
+            }
+            return Err(Error::Read);
+        }
+        let n = buf.len().min(self.ok - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// A source that fails part way must make the threaded encode return an
+/// error. The stream is read on the hash thread, so a panic there used to
+/// leave the bt and lz threads waiting for blocks that never came; it now ends
+/// the stream and the encoder's `CheckErrors` reports it.
+#[test]
+fn a_failing_input_returns_an_error_from_the_threaded_finder() {
+    let src = mixed(3_000_000);
+    let props = mt(&LzmaEncProps::new().with_level(6).with_dict_size(1 << 20));
+    for panic in [false, true] {
+        let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+        let mut out = Vec::new();
+        let mut input = FailingStream {
+            data: &src,
+            pos: 0,
+            ok: src.len().min(2_000_000),
+            panic,
+        };
+        let r = enc.encode_send(&mut input, &mut out);
+        assert!(
+            r.is_err(),
+            "panic {panic}: the failed read was not reported"
+        );
     }
 }

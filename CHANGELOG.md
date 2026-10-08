@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 - 2026-10-07
+
+- Threaded match finder (`LzmaEncProps::with_num_threads(2)`): an input longer
+  than the window no longer panics the bt thread and hangs the encoder. When
+  the hash thread slid the window (`MatchFinder_MoveBlock`) it rewrote the bt
+  and lz threads' window indices itself, as the C does, while each of those
+  threads held a `&mut` to its state across the very call the move happens
+  inside; the compiled bt thread carried on from its old index and ran off
+  the end of the window ("range end index ... out of range" in `match_run`).
+  The move now publishes its shift and each thread applies it when it next
+  enters its critical section. Reproduced through `Lzma2Encoder::encode_send`
+  with an 8 MiB dictionary from about 15 MB of input and a 1 MiB dictionary at
+  16 MiB; the output is again byte for byte the single-threaded finder's.
+- Threaded match finder: a panic on the hash or bt thread, including one in
+  the caller's input stream, is caught at the block it happened in and becomes
+  an error from the encode instead of a hang, and the encoder's `CheckErrors`
+  now reports the bt thread's internal failure (C: `failure_LZ_BT`), which it
+  had dropped.
+
 ## 0.6.0 - 2026-09-22
 
 - `mt::Lzma2AdaptiveDecoder`: input is held as the pieces it arrived in rather
