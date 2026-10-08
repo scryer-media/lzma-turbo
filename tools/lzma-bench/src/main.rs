@@ -98,6 +98,7 @@ fn main() {
     let mut shot_preset = 6u32;
     let mut shot_filter: Option<String> = None;
     let mut shot_encode = false;
+    let mut shot_verify = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -141,6 +142,7 @@ fn main() {
                     _ => fail("--direction takes encode or decode"),
                 };
             }
+            "--verify" => shot_verify = true,
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -179,6 +181,7 @@ fn main() {
             mf_threads,
             filter: shot_filter,
             encode: shot_encode,
+            verify: shot_verify,
         };
         std::process::exit(shot::run(&shot, files.first().map(PathBuf::as_path)));
     }

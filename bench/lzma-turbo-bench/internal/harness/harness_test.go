@@ -17,7 +17,8 @@ import (
 )
 
 // fakeShotEnv makes the test binary stand in for `lzma-bench --shot`: it
-// prints a shot line whose CRC is the input file's, as a decoder's is.
+// prints a shot line, with the input file's CRC under --verify as a
+// decoder's is, and none otherwise. Set to "bad", the CRC is wrong.
 const fakeShotEnv = "LZMA_TURBO_BENCH_TEST_FAKE_SHOT"
 
 func TestMain(m *testing.M) {
@@ -29,7 +30,16 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		line := ShotLine{Lane: "xz", Direction: "decode", BytesIn: int64(len(data)), BytesOut: int64(len(data)),
-			CRC32: fmt.Sprintf("%08x", crc32.ChecksumIEEE(data)), InprocSeconds: 0.001, PeakAllocBytes: 4096}
+			InprocSeconds: 0.001, PeakAllocBytes: 4096}
+		for _, arg := range os.Args[1:] {
+			if arg == "--verify" {
+				crc := crc32.ChecksumIEEE(data)
+				if os.Getenv(fakeShotEnv) == "bad" {
+					crc++
+				}
+				line.CRC32 = fmt.Sprintf("%08x", crc)
+			}
+		}
 		out, _ := json.Marshal(line)
 		fmt.Println(string(out))
 		os.Exit(0)
@@ -343,26 +353,50 @@ func TestExecuteMeasuresEachContenderAsItsOwnProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw.Runs) != 4 {
-		t.Fatalf("%d runs, want 2 contenders x 2 repeats", len(raw.Runs))
+	if len(raw.Runs) != 6 {
+		t.Fatalf("%d runs, want 2 contenders x (1 verify + 2 repeats)", len(raw.Runs))
 	}
-	for _, run := range raw.Runs {
+	for i, run := range raw.Runs {
 		if run.Status != StatusOK {
 			t.Errorf("%s %s: %s %s", run.Contender, run.Status, run.Failure, run.Reason)
 		}
 		if run.MaxRSSBytes <= 0 || run.RSSSource == "" {
 			t.Errorf("%s: no peak RSS recorded", run.Contender)
 		}
-		if run.CRC32 != run.ExpectedCRC32 {
-			t.Errorf("%s: CRC %s, want %s", run.Contender, run.CRC32, run.ExpectedCRC32)
+		// The verify runs come first and carry the checked CRC; the timed
+		// runs only count, so they carry none.
+		if verify := i < 2; run.Verify != verify || strings.Contains(run.Command, "--verify") != verify {
+			t.Errorf("run %d (%s): verify %v, command %q", i, run.Contender, run.Verify, run.Command)
+		} else if verify && (run.CRC32 == "" || run.CRC32 != run.ExpectedCRC32) {
+			t.Errorf("%s: verified CRC %q, want %q", run.Contender, run.CRC32, run.ExpectedCRC32)
+		} else if !verify && run.CRC32 != "" {
+			t.Errorf("%s: a timed run hashed its output (CRC %s)", run.Contender, run.CRC32)
 		}
 	}
-	if raw.Runs[0].Contender != "lzma-turbo" || raw.Runs[2].Contender != "lzma-rust2" {
-		t.Errorf("the second repeat did not reverse the order: %s then %s", raw.Runs[2].Contender, raw.Runs[3].Contender)
+	if raw.Runs[2].Contender != "lzma-turbo" || raw.Runs[4].Contender != "lzma-rust2" {
+		t.Errorf("the second repeat did not reverse the order: %s then %s", raw.Runs[4].Contender, raw.Runs[5].Contender)
 	}
 	report := BuildReport(raw)
-	if !report.OK() || len(report.Rows) != 1 || len(report.Rows[0].Ratios) != 1 {
+	if !report.OK() || len(report.Rows) != 1 || len(report.Rows[0].Ratios) != 1 || report.Rows[0].Contenders[0].Runs != 2 {
 		t.Errorf("report = %+v", report)
+	}
+
+	// A wrong CRC in the verify run fails the scenario before any timing.
+	t.Setenv(fakeShotEnv, "bad")
+	raw, err = Execute(context.Background(), RunOptions{
+		Paths:     Paths{Fixtures: dir, LzmaBench: self},
+		Toolchain: Toolchain{LzmaBench: Tool{Name: "lzma-bench", Path: self}},
+		Matrix:    []Scenario{scenario},
+		Settings:  RunSettings{Repeats: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Runs) != 2 || raw.Runs[0].Failure != "crc-mismatch" {
+		t.Fatalf("runs = %+v, want the two verify runs, ours a CRC mismatch", raw.Runs)
+	}
+	if BuildReport(raw).OK() {
+		t.Error("a failed verify run did not fail the report")
 	}
 }
 

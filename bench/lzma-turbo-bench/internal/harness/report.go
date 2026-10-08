@@ -122,9 +122,9 @@ func BuildReport(raw *Raw) *Report {
 	if report.Dropped == nil {
 		report.Dropped = []DroppedContender{}
 	}
-	// Warmups go in too: they are kept out of the figures, but a contender
-	// that fails one never reaches its measured passes, so the warmup is the
-	// only record of that failure and must reach the row.
+	// Warmups and verify runs go in too: they are kept out of the figures,
+	// but a contender that fails one never reaches its measured passes, so
+	// that run is the only record of the failure and must reach the row.
 	runs := map[string][]RunRecord{}
 	for _, run := range raw.Runs {
 		key := run.Scenario + "\x00" + run.Contender
@@ -153,7 +153,7 @@ func BuildReport(raw *Raw) *Report {
 			}
 			summary := summarize(scenario, contender, list, row.PayloadBytes)
 			for _, run := range list {
-				if run.LoadBefore >= 0 && !run.Warmup {
+				if run.LoadBefore >= 0 && !run.Warmup && !run.Verify {
 					loads = append(loads, run.LoadBefore)
 				}
 			}
@@ -223,7 +223,7 @@ func summarize(scenario Scenario, contender Contender, runs []RunRecord, payload
 			summary.Status, summary.Reason = run.Status, run.Reason
 			continue
 		}
-		if run.Warmup {
+		if run.Warmup || run.Verify {
 			continue
 		}
 		summary.Runs++

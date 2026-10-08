@@ -129,9 +129,12 @@ oversubscribed, and `all` is dropped when it equals a count already in the
 sweep. Encoding a single thread at presets 1, 3, 5, 6 and 9, and the MT
 encode at presets 5 and 6, completes the defaults.
 
-Every decode that lzma-turbo, lzma-rust2 or liblzma runs is checked: the
-output's CRC-32 has to equal the source file's, or the run fails.
-`xz`, `7zz` and `7lzma` check their own streams. A reference that exits
+Every decode that lzma-turbo, lzma-rust2 or liblzma runs is checked, in a
+run of its own before the warmups (`--verify`): the output's CRC-32 has to
+equal the source file's, or the scenario fails. That run is kept out of the
+figures; the timed runs only count their output, as `xz -dc` writing to the
+null device does, so neither side is timed hashing what it decoded. Encode
+shots likewise only count. `xz`, `7zz` and `7lzma` check their own streams. A reference that exits
 non-zero or times out is marked DNF and its remaining runs are skipped. When
 lzma-turbo fails, or a run finishes without a peak RSS, the row fails.
 

@@ -11,15 +11,21 @@
 //! Every shot streams its input from the file, as `7zz` and `xz` do, so the
 //! input is not resident unless the API being timed needs all of it; the
 //! line says when it did (`input_buffered_bytes`). The line carries what the
-//! harness checks and reports: bytes in and out, a CRC-32 of the output (of
-//! the decoded bytes for a decoder, so it can be compared with the source
-//! file's), the time spent in the timed region, and the high-water mark of
-//! bytes this process had allocated while it ran.
+//! harness checks and reports: bytes in and out, the time spent in the timed
+//! region, and the high-water mark of bytes this process had allocated while
+//! it ran.
+//!
+//! A decoder only counts its output, as `xz -dc > /dev/null` does, unless
+//! asked with `--verify` for a CRC-32 of the decoded bytes, which the harness
+//! compares with the source file's. That costs a pass over the output only
+//! this side would make, so the harness verifies in a run of its own and
+//! times the others without it. The filter lane hashes outside its timed
+//! region and always reports the CRC.
 //!
 //! ```text
 //! lzma-bench --shot info
 //! lzma-bench --shot <lane> [--threads N] [--preset P] [--mf-threads N]
-//!            [--filter F] [--direction encode|decode] <file>
+//!            [--filter F] [--direction encode|decode] [--verify] <file>
 //! ```
 
 use std::fs::File;
@@ -32,7 +38,7 @@ use lzma_turbo::{
     Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader, LzmaEncProps, LzmaReader, XzWriter,
 };
 
-use crate::{CrcWriter, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_from_prop};
+use crate::{Crc32, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_from_prop};
 
 const IN_CHUNK: usize = 1 << 20;
 
@@ -53,7 +59,9 @@ pub const HELP: &str = "\
                    filter         one converter over the whole file in memory,
                                   --filter F --direction encode|decode
                  F is x86, arm, armthumb, arm64, ppc, sparc, ia64, riscv,
-                 delta:N (distance N) or bcj2 (filter lane only)";
+                 delta:N (distance N) or bcj2 (filter lane only)
+  --verify       a decoder shot also reports a CRC-32 of what it decoded,
+                 at the cost of a pass over it inside the timed region";
 
 /// What a shot was asked to do.
 pub struct Shot {
@@ -63,6 +71,8 @@ pub struct Shot {
     pub mf_threads: u32,
     pub filter: Option<String>,
     pub encode: bool,
+    /// Whether a decoder hashes its output for the harness to check.
+    pub verify: bool,
 }
 
 /// What a shot reports.
@@ -157,13 +167,13 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
     match shot.lane.as_str() {
         "lzma1" => {
             let file = open(path)?;
-            read_all(bytes_in, || {
+            read_all(bytes_in, shot.verify, || {
                 LzmaReader::with_memory_limit(file, u64::MAX).map_err(|e| e.to_string())
             })
         }
         "lzma2" => {
             let (prop, stream) = lzma2_stream(path)?;
-            read_all(bytes_in, || {
+            read_all(bytes_in, shot.verify, || {
                 Lzma2Reader::with_memory_limit(stream, prop, u64::MAX).map_err(|e| e.to_string())
             })
         }
@@ -174,14 +184,14 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
                 memory_limit: u64::MAX,
             };
             let dec = Lzma2ParallelDecoder::new(prop, &opts).map_err(|e| e.to_string())?;
-            let mut sink = CrcWriter::new();
+            let mut sink = Sink::new(shot.verify);
             let base = alloc_watch_reset();
             let t0 = Instant::now();
             let bytes_out = dec.decode(stream, &mut sink).map_err(|e| e.to_string())?;
             Ok(Line {
                 bytes_in,
                 bytes_out,
-                crc32: Some(sink.crc.finish()),
+                crc32: sink.crc.map(|mut c| c.finish()),
                 seconds: t0.elapsed().as_secs_f64(),
                 peak_alloc: alloc_watch_peak(base),
                 input_buffered: 0,
@@ -191,25 +201,25 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             let (prop, stream) = lzma2_stream(path)?;
             let dict = dict_size_from_prop(prop);
             let threads = u32::try_from(shot.threads.max(1)).map_err(|e| e.to_string())?;
-            read_all(bytes_in, || {
+            read_all(bytes_in, shot.verify, || {
                 Ok(lzma_rust2::Lzma2ReaderMt::new(stream, dict, None, threads))
             })
         }
         "xz" => {
             let file = open(path)?;
-            read_all(bytes_in, || Ok(XzReader::new(file)))
+            read_all(bytes_in, shot.verify, || Ok(XzReader::new(file)))
         }
         "xz-par" => {
             let file = File::open(path).map_err(|e| e.to_string())?;
             let opts = XzOptions::default().with_threads(shot.threads.max(1));
-            read_all(bytes_in, || {
+            read_all(bytes_in, shot.verify, || {
                 XzParallelReader::with_options(file, opts).map_err(|e| e.to_string())
             })
         }
         "liblzma" => {
             let file = open(path)?;
             let threads = u32::try_from(shot.threads.max(1)).map_err(|e| e.to_string())?;
-            read_all(bytes_in, || {
+            read_all(bytes_in, shot.verify, || {
                 let r: Box<dyn Read> = if threads > 1 {
                     let stream = liblzma::stream::MtStreamBuilder::new()
                         .threads(threads)
@@ -236,13 +246,14 @@ fn open(path: &Path) -> Result<BufReader<File>, String> {
 }
 
 /// Builds a reader inside the timed region, as a consumer would, and drains
-/// it into a CRC.
+/// it into a sink that counts, and hashes as well when `verify` is set.
 fn read_all<R: Read>(
     bytes_in: u64,
+    verify: bool,
     build: impl FnOnce() -> Result<R, String>,
 ) -> Result<Line, String> {
     let mut buf = vec![0u8; OUT_CHUNK];
-    let mut sink = CrcWriter::new();
+    let mut sink = Sink::new(verify);
     let base = alloc_watch_reset();
     let t0 = Instant::now();
     let mut reader = build()?;
@@ -260,7 +271,7 @@ fn read_all<R: Read>(
     Ok(Line {
         bytes_in,
         bytes_out,
-        crc32: Some(sink.crc.finish()),
+        crc32: sink.crc.map(|mut c| c.finish()),
         seconds,
         peak_alloc: alloc_watch_peak(base),
         input_buffered: 0,
@@ -356,7 +367,7 @@ fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     let mut buf = vec![0u8; IN_CHUNK];
     let base = alloc_watch_reset();
     let t0 = Instant::now();
-    let mut w = XzWriter::new(CountWriter::default(), &props).map_err(|e| e.to_string())?;
+    let mut w = XzWriter::new(Sink::new(false), &props).map_err(|e| e.to_string())?;
     w.set_check(CheckType::Crc64).map_err(|e| e.to_string())?;
     if let Some(f) = &shot.filter {
         w.set_filters(&[filter_flags(f)?])
@@ -485,15 +496,27 @@ fn filter(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     })
 }
 
-/// A sink that only counts what it is given, as the harness's own sink for
-/// `xz`'s output does.
-#[derive(Default)]
-struct CountWriter {
+/// Where a shot's output goes: counted, as the harness counts `xz`'s or
+/// sends it to the null device, and hashed only when a CRC was asked for.
+struct Sink {
+    crc: Option<Crc32>,
     written: u64,
 }
 
-impl Write for CountWriter {
+impl Sink {
+    fn new(hash: bool) -> Self {
+        Sink {
+            crc: hash.then(Crc32::new),
+            written: 0,
+        }
+    }
+}
+
+impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(crc) = &mut self.crc {
+            crc.update(buf);
+        }
         self.written += buf.len() as u64;
         Ok(buf.len())
     }
@@ -539,6 +562,7 @@ mod tests {
             mf_threads: 1,
             filter: None,
             encode: false,
+            verify: false,
         }
     }
 
@@ -558,5 +582,30 @@ mod tests {
         w.write_all(&data).expect("write");
         let want = w.finish().expect("finish").len() as u64;
         assert_eq!(line.bytes_out, want);
+    }
+
+    /// A decoder shot counts its output unless asked to verify it, and then
+    /// reports the CRC of exactly what it decoded.
+    #[test]
+    fn a_decode_shot_hashes_only_when_verifying() {
+        let data = payload();
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let xz = lzma_turbo::encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+        let input = Scratch::new("decode.xz", &xz);
+        let mut want = Crc32::new();
+        want.update(&data);
+        let want = want.finish();
+
+        for lane in ["xz", "xz-par", "lzma2", "lzma2-mt"] {
+            let mut s = shot(lane);
+            let line = measure(&s, &input.0).expect("decode shot");
+            assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
+            assert_eq!(line.crc32, None, "{lane}: hashed without --verify");
+
+            s.verify = true;
+            let line = measure(&s, &input.0).expect("verify shot");
+            assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
+            assert_eq!(line.crc32, Some(want), "{lane}: --verify");
+        }
     }
 }

@@ -51,6 +51,9 @@ type RunRecord struct {
 	Role      string `json:"role"`
 	Repeat    int    `json:"repeat"`
 	Warmup    bool   `json:"warmup,omitempty"`
+	// Verify marks the untimed-for-the-report run that checks a decode's
+	// output CRC; like a warmup it is kept out of every figure.
+	Verify bool `json:"verify,omitempty"`
 	// Position is the contender's place in this repeat's order.
 	Position int    `json:"position"`
 	Status   string `json:"status"`
@@ -196,8 +199,40 @@ func Execute(ctx context.Context, options RunOptions) (*Raw, error) {
 		}
 		logf("[%d/%d] %s (%d contenders, %d repeats)", index+1, len(options.Matrix), scenario.ID, len(contenders), options.Settings.Repeats)
 		stopped := map[string]string{}
+		keep := func(record RunRecord, contender Contender, label string) {
+			if options.Journal != nil {
+				if line, err := json.Marshal(record); err == nil {
+					_, _ = options.Journal.Write(append(line, '\n'))
+				}
+			}
+			raw.Runs = append(raw.Runs, record)
+			switch record.Status {
+			case StatusDNF:
+				stopped[contender.Name] = record.Reason
+				logf("    %s DNF: %s", contender.Name, record.Reason)
+			case StatusFailed:
+				stopped[contender.Name] = record.Reason
+				logf("    %s FAILED: %s", contender.Name, record.Reason)
+			default:
+				logf("    %s%s: %.3f s, %s MiB peak", contender.Name, label,
+					timeOf(scenario, record), procmeasure.MiB(record.MaxRSSBytes))
+			}
+		}
+		// A decode's output is checked in a run of its own. Hashing it is a
+		// pass over the output that xz, writing to the null device, never
+		// makes, so the timed runs only count it.
+		if want != "" {
+			for position, contender := range contenders {
+				if contender.Kind != KindShot {
+					continue
+				}
+				record := runOne(ctx, options, scenario, contender, null, want, true)
+				record.Repeat, record.Verify, record.Position = -1, true, position
+				keep(record, contender, " (verify)")
+			}
+		}
 		total := options.Settings.Warmups + options.Settings.Repeats
-		for pass := 0; pass < total; pass++ {
+		for pass := 0; pass < total && stopped[scenario.Ours().Name] == ""; pass++ {
 			warmup := pass < options.Settings.Warmups
 			repeat := pass - options.Settings.Warmups
 			for position, i := range orderFor(len(contenders), pass) {
@@ -205,31 +240,12 @@ func Execute(ctx context.Context, options RunOptions) (*Raw, error) {
 				if why := stopped[contender.Name]; why != "" {
 					continue
 				}
-				record := runOne(ctx, options, scenario, contender, null, want)
+				record := runOne(ctx, options, scenario, contender, null, want, false)
 				record.Repeat, record.Warmup, record.Position = repeat, warmup, position
 				if warmup {
 					record.Repeat = -1
 				}
-				if options.Journal != nil {
-					if line, err := json.Marshal(record); err == nil {
-						_, _ = options.Journal.Write(append(line, '\n'))
-					}
-				}
-				raw.Runs = append(raw.Runs, record)
-				switch record.Status {
-				case StatusDNF:
-					stopped[contender.Name] = record.Reason
-					logf("    %s DNF: %s", contender.Name, record.Reason)
-				case StatusFailed:
-					stopped[contender.Name] = record.Reason
-					logf("    %s FAILED: %s", contender.Name, record.Reason)
-				default:
-					logf("    %s%s: %.3f s, %s MiB peak", contender.Name, map[bool]string{true: " (warmup)"}[warmup],
-						timeOf(scenario, record), procmeasure.MiB(record.MaxRSSBytes))
-				}
-			}
-			if stopped[scenario.Ours().Name] != "" {
-				break
+				keep(record, contender, map[bool]string{true: " (warmup)"}[warmup])
 			}
 		}
 	}
@@ -320,8 +336,9 @@ func repeatedCRC(path string, repeat int) (string, error) {
 	return fmt.Sprintf("%08x", crc.Sum32()), nil
 }
 
-// command builds the process for one contender.
-func command(options RunOptions, scenario Scenario, contender Contender) procmeasure.Command {
+// command builds the process for one contender; verify asks a shot for the
+// CRC of its output.
+func command(options RunOptions, scenario Scenario, contender Contender, verify bool) procmeasure.Command {
 	program := options.Paths.LzmaBench
 	switch contender.Kind {
 	case KindXZ:
@@ -332,22 +349,24 @@ func command(options RunOptions, scenario Scenario, contender Contender) procmea
 		program = options.Toolchain.SevenLZMA.Path
 	}
 	input := filepath.Join(options.Paths.Fixtures, scenario.Input)
-	args := make([]string, len(contender.Args))
-	for i, arg := range contender.Args {
+	args := make([]string, 0, len(contender.Args)+1)
+	if verify && contender.Kind == KindShot {
+		args = append(args, "--verify")
+	}
+	for _, arg := range contender.Args {
 		switch arg {
 		case "{in}":
-			args[i] = input
+			arg = input
 		case "{null}":
-			args[i] = os.DevNull
-		default:
-			args[i] = arg
+			arg = os.DevNull
 		}
+		args = append(args, arg)
 	}
 	return procmeasure.Command{Path: program, Args: args, Dir: options.Paths.Fixtures, Timeout: options.Timeout}
 }
 
-func runOne(ctx context.Context, options RunOptions, scenario Scenario, contender Contender, null *os.File, want string) RunRecord {
-	cmd := command(options, scenario, contender)
+func runOne(ctx context.Context, options RunOptions, scenario Scenario, contender Contender, null *os.File, want string, verify bool) RunRecord {
+	cmd := command(options, scenario, contender, verify)
 	var counter procmeasure.CountingWriter
 	switch contender.Stdout {
 	case StdoutDiscard:
@@ -391,7 +410,12 @@ func runOne(ctx context.Context, options RunOptions, scenario Scenario, contende
 		}
 		record.Shot = &line
 		record.BytesIn, record.BytesOut, record.CRC32 = line.BytesIn, line.BytesOut, line.CRC32
-		if want != "" {
+		if verify && want != "" && line.CRC32 == "" {
+			return fail(StatusFailed, "no-crc", "lzma-bench --verify reported no CRC-32 (rebuild it)")
+		}
+		// A timed decode only counts its output and reports no CRC; the
+		// filter lane hashes outside its timed region and always does.
+		if want != "" && line.CRC32 != "" {
 			record.ExpectedCRC32 = want
 			if line.CRC32 != want {
 				return fail(StatusFailed, "crc-mismatch", fmt.Sprintf("output CRC-32 %s, want %s", line.CRC32, want))
