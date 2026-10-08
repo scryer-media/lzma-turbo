@@ -38,6 +38,13 @@
   header carries the uncompressed size.
 - Where no thread can be started, both writers fall back to holding the input
   and compressing it on `finish`.
+- `XzEncoder::set_block_size` (and `XzWriter`'s) called after input has gone
+  in no longer loses any of it. Once the single block was streaming, input
+  pushed after a new size was set was held for a block of its own and then
+  left out by `finish`, which wrote a valid stream without it; the rest of
+  the input now goes into the streaming block. Input held under the default
+  size that is already past the new size becomes one block instead of
+  underflowing the room left in it.
 - `xz::filter::Converters::encode_push` and `encode_finish`: the encode
   direction of `push` and `finish`, so a filter chain can be applied to a
   block in pieces with the same result as `encode_in_place` over the whole.

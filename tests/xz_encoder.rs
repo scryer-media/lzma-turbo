@@ -750,3 +750,35 @@ fn xz_preset_1_writes_what_xz_1_writes_within_a_few_percent() {
         assert_eq!(out, data, "{what}: XzReader on xz's stream");
     }
 }
+
+/// A block size set after input has gone in must not lose any of it: once
+/// the single block is streaming the rest still goes into that block, and
+/// input held under the default size becomes a block of its own even when it
+/// is already past the new size.
+#[test]
+fn a_block_size_set_after_input_keeps_every_byte() {
+    let props = LzmaEncProps::new().with_level(3).with_dict_size(1 << 16);
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 23) as u8)
+        .collect();
+
+    // Past the dictionary, so the block is streaming; then a tail shorter
+    // than the new block size, which used to be held and then dropped.
+    let (head, tail) = data.split_at(200_000);
+    let mut w = XzWriter::new(Vec::new(), &props).expect("writer");
+    w.write_all(head).expect("write");
+    w.set_block_size(1 << 20);
+    w.write_all(tail).expect("write");
+    let xz = w.finish().expect("finish");
+    decode_every_way(&xz, &data, "block size set while streaming");
+
+    // Under the dictionary, so the input is still held; the new size is
+    // smaller than what is held.
+    let (head, tail) = data[..60_000].split_at(40_000);
+    let mut w = XzWriter::new(Vec::new(), &props).expect("writer");
+    w.write_all(head).expect("write");
+    w.set_block_size(4096);
+    w.write_all(tail).expect("write");
+    let xz = w.finish().expect("finish");
+    decode_every_way(&xz, &data[..60_000], "block size set while held");
+}

@@ -323,6 +323,11 @@ impl XzEncoder {
     /// encoder's own dictionary and tables, whatever the input's length. A
     /// block size of its own bounds what is held to one block per thread
     /// instead, and every block's header then declares both of its sizes.
+    ///
+    /// Set it before the first push. Once the single block has started
+    /// streaming, a new size has no effect: the rest of the input still goes
+    /// into that block. Input held before then becomes a block of its own,
+    /// however large, and the new size applies to what follows it.
     pub fn set_block_size(&mut self, bytes: u64) {
         self.block_size = if bytes == 0 {
             DEFAULT_BLOCK_SIZE
@@ -369,6 +374,11 @@ impl XzEncoder {
         if self.finished {
             return Err(Error::Param);
         }
+        // A streaming block takes the rest of the input whatever the block
+        // size says now: a size set after it started cannot split it.
+        if let Some(stream) = &mut self.stream {
+            return stream.push(data, &mut self.out);
+        }
         if self.block_size == DEFAULT_BLOCK_SIZE && self.may_stream {
             if self.stream.is_none() {
                 // Hold the input up to the dictionary; one byte past it and
@@ -391,7 +401,9 @@ impl XzEncoder {
             // No thread could be started: hold everything, as before.
         }
         while !data.is_empty() {
-            let room = self.block_size - self.pending.len() as u64;
+            // Input held under the default size can already be past a size
+            // set since; it is then a whole block, and the take is zero.
+            let room = self.block_size.saturating_sub(self.pending.len() as u64);
             let take = core::cmp::min(room, data.len() as u64) as usize;
             self.pending.try_reserve(take).map_err(|_| Error::Alloc)?;
             self.pending.extend_from_slice(&data[..take]);
@@ -473,7 +485,10 @@ impl XzEncoder {
         }
         if let Some(stream) = self.stream.take() {
             self.finish_stream(stream)?;
-        } else if !self.pending.is_empty() {
+        }
+        // Empty once a stream has started, which takes everything held; never
+        // skipped on that account, so no input can be left out of the file.
+        if !self.pending.is_empty() {
             self.block_ready()?;
         }
         #[cfg(feature = "std")]
