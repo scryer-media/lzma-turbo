@@ -451,3 +451,34 @@ func TestAWarmupFailureFailsTheReport(t *testing.T) {
 		t.Errorf("a passing warmup changed the figures: %+v", report.Rows[0])
 	}
 }
+
+// A prebuilt lzma-bench is measured only when it is provably the checkout
+// the report names: same commit, built clean, checkout clean. One the
+// harness has just built need only agree on the commit.
+func TestAStaleLzmaBenchIsRefused(t *testing.T) {
+	yes, no := true, false
+	head := Crate{Commit: "aaaa"}
+	dirty := Crate{Commit: "aaaa", Dirty: true}
+	for _, c := range []struct {
+		name  string
+		info  BuildInfo
+		crate Crate
+		built bool
+		ok    bool
+	}{
+		{"prebuilt, same commit, clean", BuildInfo{BuildCommit: "aaaa", BuildDirty: &no}, head, false, true},
+		{"prebuilt, another commit", BuildInfo{BuildCommit: "bbbb", BuildDirty: &no}, head, false, false},
+		{"prebuilt, no commit", BuildInfo{}, head, false, false},
+		{"prebuilt, built dirty", BuildInfo{BuildCommit: "aaaa", BuildDirty: &yes}, head, false, false},
+		{"prebuilt, dirty flag unknown", BuildInfo{BuildCommit: "aaaa"}, head, false, false},
+		{"prebuilt, checkout dirty", BuildInfo{BuildCommit: "aaaa", BuildDirty: &no}, dirty, false, false},
+		{"prebuilt, checkout commit unknown", BuildInfo{BuildCommit: "aaaa", BuildDirty: &no}, Crate{}, false, false},
+		{"built, dirty checkout", BuildInfo{BuildCommit: "aaaa", BuildDirty: &yes}, dirty, true, true},
+		{"built, no git", BuildInfo{}, Crate{}, true, true},
+		{"built, another commit", BuildInfo{BuildCommit: "bbbb", BuildDirty: &no}, head, true, false},
+	} {
+		if got := stale(c.info, c.crate, c.built); (got == "") != c.ok {
+			t.Errorf("%s: stale = %q, want ok=%v", c.name, got, c.ok)
+		}
+	}
+}

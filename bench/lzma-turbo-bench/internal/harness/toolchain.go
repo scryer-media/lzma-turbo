@@ -43,6 +43,41 @@ type BuildInfo struct {
 	CRC64Tier             string   `json:"crc64_tier"`
 	SHA256Backend         string   `json:"sha256_backend"`
 	CompileTargetFeatures []string `json:"compile_target_features"`
+	// BuildCommit is the commit the binary was built from, and BuildDirty
+	// whether its sources had uncommitted changes then; empty and nil where
+	// git could not say.
+	BuildCommit string `json:"build_commit"`
+	BuildDirty  *bool  `json:"build_dirty"`
+}
+
+// stale says why a binary cannot be reported as the checkout it is measured
+// from, or "". One the harness just built is the checkout's by construction,
+// so only its commit is checked; a prebuilt one must name the checkout's
+// commit, have been built clean, and the checkout must be clean too, because
+// otherwise nothing shows that its source is what the report names.
+func stale(info BuildInfo, crate Crate, built bool) string {
+	const rebuild = " (rebuild with `run --build`)"
+	switch {
+	case crate.Commit == "":
+		if built {
+			return ""
+		}
+		return "the checkout's commit is unknown, so a prebuilt lzma-bench cannot be tied to it" + rebuild
+	case info.BuildCommit == "":
+		if built {
+			return ""
+		}
+		return "lzma-bench does not say which commit it was built from" + rebuild
+	case info.BuildCommit != crate.Commit:
+		return fmt.Sprintf("lzma-bench was built from %s, the checkout is at %s", info.BuildCommit, crate.Commit) + rebuild
+	case built:
+		return ""
+	case info.BuildDirty == nil || *info.BuildDirty:
+		return "lzma-bench was built from uncommitted changes" + rebuild
+	case crate.Dirty:
+		return "the checkout has uncommitted changes a prebuilt lzma-bench may not contain" + rebuild
+	}
+	return ""
 }
 
 // Crate is the checkout being measured.
@@ -144,6 +179,7 @@ func ResolveToolchain(ctx context.Context, paths Paths, options ToolchainOptions
 		} else {
 			tc.Build = &info
 			tc.LzmaBench.Version = "lzma-turbo " + info.LzmaTurbo
+			tc.LzmaBench.Missing = stale(info, tc.Crate, options.Build)
 		}
 	}
 
