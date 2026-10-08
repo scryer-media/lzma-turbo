@@ -155,7 +155,7 @@ fn info() -> String {
     format!(
         "{{\"lane\":\"info\",\"lzma_turbo\":\"{}\",\"asm_loop\":{},\"target_arch\":\"{}\",\
          \"target_os\":\"{}\",\"crc32_tier\":\"{}\",\"crc64_tier\":\"{}\",\
-         \"sha256_backend\":\"aws-lc-rs\",\"compile_target_features\":[{features}],\
+         \"sha256_backend\":\"{}\",\"compile_target_features\":[{features}],\
          \"build_commit\":\"{}\",\"build_dirty\":{}}}",
         lzma_turbo::VERSION,
         lzma_turbo::ASM_LOOP,
@@ -163,6 +163,7 @@ fn info() -> String {
         std::env::consts::OS,
         crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
         crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc64Xz),
+        lzma_turbo::crypto::SHA256_BACKEND,
         env!("LZMA_BENCH_BUILD_COMMIT"),
         match env!("LZMA_BENCH_BUILD_DIRTY") {
             "" => "null",

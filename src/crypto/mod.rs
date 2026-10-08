@@ -50,6 +50,17 @@ pub mod rustcrypto;
 pub const SHA256_IS_HOST_DELEGATED: bool =
     cfg!(all(target_arch = "wasm32", feature = "crypto-host"));
 
+/// Which backend [`Sha256`] is: `"aws-lc-rs"`, `"rustcrypto"` (the `sha2`
+/// crate) or `"host"`. Chosen by the same features as the re-export below,
+/// so a program reporting its build can say which one it measured.
+pub const SHA256_BACKEND: &str = if SHA256_IS_HOST_DELEGATED {
+    "host"
+} else if cfg!(feature = "native-crypto") {
+    "rustcrypto"
+} else {
+    "aws-lc-rs"
+};
+
 #[cfg(all(
     feature = "crypto",
     not(feature = "native-crypto"),
@@ -89,6 +100,19 @@ pub const SHA256_LEN: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name says which module `Sha256` is re-exported from.
+    #[test]
+    fn the_backend_name_is_the_selected_backend() {
+        let module = match SHA256_BACKEND {
+            "aws-lc-rs" => "::awslc::",
+            "rustcrypto" => "::rustcrypto::",
+            "host" => "::host::",
+            other => panic!("unknown backend name {other:?}"),
+        };
+        let ty = core::any::type_name::<Sha256>();
+        assert!(ty.contains(module), "{SHA256_BACKEND} names {ty}");
+    }
 
     /// NIST's SHA-256 short-message vectors, plus the empty string.
     #[test]
