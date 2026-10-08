@@ -43,6 +43,73 @@ pub struct Lzma2Run {
     /// which is malformed but is reported rather than rejected here: the
     /// decoder is the thing that decides a stream is bad.
     pub has_dict_reset: bool,
+    /// What the run's chunks are, by kind, as their headers declare them.
+    pub chunks: Lzma2RunChunks,
+}
+
+/// The chunks of one [`Lzma2Run`], counted and sized by kind.
+///
+/// An LZMA2 chunk is either stored (control byte 1 or 2: its payload is the
+/// output, and decoding it is a copy) or LZMA-coded (control byte `0x80` and
+/// up). The two cost entirely different amounts to decode, and the ratio of a
+/// run's packed size to its unpacked size cannot tell them apart: data that
+/// barely compresses is LZMA-coded a shade under its own size, and data that
+/// does not compress at all is stored a shade over it. These are the chunk
+/// headers' own figures, so the split is exact rather than inferred.
+///
+/// Every byte of the run is in exactly one kind: `lzma_packed + copy_packed`
+/// is the run's [`packed_len`](Lzma2Run::packed_len) and `lzma_unpacked +
+/// copy_unpacked` its [`unpacked_len`](Lzma2Run::unpacked_len). Packed sizes
+/// include the chunk headers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lzma2RunChunks {
+    /// LZMA-coded chunks in the run.
+    pub lzma_chunks: u64,
+    /// Bytes the LZMA-coded chunks occupy in the stream, headers included.
+    pub lzma_packed: u64,
+    /// Bytes the LZMA-coded chunks decode to.
+    pub lzma_unpacked: u64,
+    /// Stored chunks in the run.
+    pub copy_chunks: u64,
+    /// Bytes the stored chunks occupy in the stream, headers included.
+    pub copy_packed: u64,
+    /// Bytes the stored chunks decode to, which is their payload.
+    pub copy_unpacked: u64,
+    /// LZMA-coded chunks that reset the coder state (control byte `0xA0` and
+    /// up, so including those that also carry new properties or reset the
+    /// dictionary).
+    pub state_resets: u64,
+    /// LZMA-coded chunks that carry new `lc`/`lp`/`pb` properties (control
+    /// byte `0xC0` and up).
+    pub prop_resets: u64,
+}
+
+impl Lzma2RunChunks {
+    /// Chunks of either kind.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.lzma_chunks + self.copy_chunks
+    }
+
+    /// Adds one chunk whose header has just been read.
+    fn add(&mut self, control: u8, header_len: u64, payload_len: u64, unpacked_len: u64) {
+        let packed = header_len + payload_len;
+        if is_uncompressed_state(control) {
+            self.copy_chunks += 1;
+            self.copy_packed += packed;
+            self.copy_unpacked += unpacked_len;
+        } else {
+            self.lzma_chunks += 1;
+            self.lzma_packed += packed;
+            self.lzma_unpacked += unpacked_len;
+            if control >= 0xA0 {
+                self.state_resets += 1;
+            }
+            if control >= 0xC0 {
+                self.prop_resets += 1;
+            }
+        }
+    }
 }
 
 /// Incremental discovery of the runs in an LZMA2 stream.
@@ -72,6 +139,7 @@ struct OpenRun {
     in_offset: u64,
     out_offset: u64,
     has_dict_reset: bool,
+    chunks: Lzma2RunChunks,
 }
 
 impl Default for Lzma2RunScanner {
@@ -209,12 +277,24 @@ impl Lzma2RunScanner {
                     return Err(Error::CorruptData);
                 }
                 Lzma2State::Data => {
-                    self.out_pos += u64::from(self.frame.unpack_size);
-                    self.data_remaining = if is_uncompressed_state(self.frame.control) {
-                        u64::from(self.frame.unpack_size)
+                    let control = self.frame.control;
+                    let unpacked = u64::from(self.frame.unpack_size);
+                    self.out_pos += unpacked;
+                    // A stored chunk's header is the control byte and two size
+                    // bytes; an LZMA one adds two packed-size bytes and, when
+                    // it carries new properties, one more.
+                    let (header_len, payload) = if is_uncompressed_state(control) {
+                        (3, unpacked)
                     } else {
-                        u64::from(self.frame.pack_size)
+                        (
+                            5 + u64::from(control & 0x40 != 0),
+                            u64::from(self.frame.pack_size),
+                        )
                     };
+                    self.data_remaining = payload;
+                    if let Some(open) = self.open.as_mut() {
+                        open.chunks.add(control, header_len, payload, unpacked);
+                    }
                     // The decoder decrements `unpackSize` as it produces the
                     // chunk's output, so by the time the next control byte
                     // arrives it is zero, and `LZMA2_STATE_UNPACK0` ORs into
@@ -248,6 +328,7 @@ impl Lzma2RunScanner {
                 in_offset: self.in_pos,
                 out_offset: self.out_pos,
                 has_dict_reset: starts_run,
+                chunks: Lzma2RunChunks::default(),
             });
         }
         true
@@ -261,6 +342,7 @@ impl Lzma2RunScanner {
                 out_offset: o.out_offset,
                 unpacked_len: self.out_pos - o.out_offset,
                 has_dict_reset: o.has_dict_reset,
+                chunks: o.chunks,
             });
         }
     }
@@ -360,5 +442,75 @@ pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
     match failed {
         Some(e) => Err(e),
         None => Ok(runs),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// An LZMA chunk header and a payload of `pack` filler bytes. The scanner
+    /// steps over payloads, so they need not decode.
+    fn lzma_chunk(out: &mut Vec<u8>, control: u8, unpack: u32, pack: u32) {
+        let u = unpack - 1;
+        out.push(control | ((u >> 16) as u8 & 0x1F));
+        out.extend_from_slice(&(u as u16).to_be_bytes());
+        out.extend_from_slice(&((pack - 1) as u16).to_be_bytes());
+        if control >= 0xC0 {
+            out.push(0x5D);
+        }
+        out.extend(core::iter::repeat_n(0xAA, pack as usize));
+    }
+
+    fn copy_chunk(out: &mut Vec<u8>, control: u8, len: u16) {
+        out.push(control);
+        out.extend_from_slice(&(len - 1).to_be_bytes());
+        out.extend(core::iter::repeat_n(0x55, usize::from(len)));
+    }
+
+    #[test]
+    fn every_chunk_header_shape_is_sized_and_classified() {
+        let mut s = Vec::new();
+        lzma_chunk(&mut s, 0xE0, 1 << 21, 40_000); // dict reset + props: 6-byte header
+        lzma_chunk(&mut s, 0x80, 300_000, 9_000); // no reset: 5
+        lzma_chunk(&mut s, 0xA0, 70_000, 65_536); // state reset: 5
+        lzma_chunk(&mut s, 0xC0, 1, 1); // state reset + props: 6
+        copy_chunk(&mut s, 0x02, 65_535); // stored, no reset: 3
+        let first_run = s.len() as u64;
+        copy_chunk(&mut s, 0x01, 7); // stored with a dictionary reset: a new run
+        s.push(0);
+
+        let mut scanner = Lzma2RunScanner::new();
+        assert_eq!(scanner.feed(&s), Ok(s.len()));
+        let a = scanner.next_run().expect("first run");
+        let b = scanner.next_run().expect("second run");
+        assert!(scanner.next_run().is_none());
+
+        assert_eq!(a.packed_len, first_run);
+        assert_eq!(
+            a.chunks,
+            Lzma2RunChunks {
+                lzma_chunks: 4,
+                lzma_packed: (6 + 40_000) + (5 + 9_000) + (5 + 65_536) + (6 + 1),
+                lzma_unpacked: (1 << 21) + 300_000 + 70_000 + 1,
+                copy_chunks: 1,
+                copy_packed: 3 + 65_535,
+                copy_unpacked: 65_535,
+                state_resets: 3,
+                prop_resets: 2,
+            }
+        );
+        assert_eq!(a.chunks.count(), 5);
+        assert_eq!(
+            b.chunks,
+            Lzma2RunChunks {
+                copy_chunks: 1,
+                copy_packed: 10,
+                copy_unpacked: 7,
+                ..Lzma2RunChunks::default()
+            }
+        );
+        assert_eq!(b.chunks.lzma_packed + b.chunks.copy_packed, b.packed_len);
     }
 }

@@ -64,6 +64,16 @@
   an error from the encode instead of a hang, and the encoder's `CheckErrors`
   now reports the bt thread's internal failure (C: `failure_LZ_BT`), which it
   had dropped.
+- `Lzma2Run::chunks` (`Lzma2RunChunks`): what a run's chunks are, by kind,
+  from their headers. Stored and LZMA-coded chunks are counted and sized
+  separately (packed sizes include the headers, so the two kinds add up to the
+  run's `packed_len` and `unpacked_len` exactly), with the LZMA chunks that
+  reset the coder state or carry new properties. A packed-to-unpacked ratio
+  cannot tell data that barely compresses, which is LZMA-coded and slow to
+  decode, from data that does not compress at all, which is stored and decodes
+  as a copy; this can. `Lzma2Run` is a public struct with public fields, so a
+  caller that builds one by hand now has a field to fill. The scanner adds a
+  few integer sums per chunk header and decodes nothing more.
 
 ## 0.6.0 - 2026-09-22
 

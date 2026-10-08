@@ -81,7 +81,7 @@ pub use lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
 pub use lzma2::Lzma2Decoder;
 #[cfg(feature = "std")]
 pub use lzma2::scan::run_boundaries;
-pub use lzma2::scan::{Lzma2Run, Lzma2RunScanner};
+pub use lzma2::scan::{Lzma2Run, Lzma2RunChunks, Lzma2RunScanner};
 
 #[cfg(feature = "std")]
 pub use mt::adaptive::{DrainStatus, Lzma2AdaptiveDecoder};

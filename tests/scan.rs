@@ -3,7 +3,7 @@
 
 mod common;
 
-use lzma_turbo::{Error, Lzma2Run, Lzma2RunScanner};
+use lzma_turbo::{Error, Lzma2Run, Lzma2RunChunks, Lzma2RunScanner};
 
 use common::{copy_run, join_runs, multi_run, pseudo_random, xz_run};
 
@@ -137,4 +137,84 @@ fn nothing_past_the_end_marker_is_consumed() {
     assert_eq!(s.feed(&packed), Ok(len));
     assert!(s.finished());
     assert_eq!(s.in_position(), len as u64);
+}
+
+/// Appends `0x02` chunks (stored, no reset) holding `plain` to a run, so the
+/// run goes on without a dictionary reset.
+fn append_copy_chunks(packed: &mut Vec<u8>, plain: &[u8]) {
+    for piece in plain.chunks(1 << 16) {
+        packed.push(0x02);
+        packed.extend_from_slice(&((piece.len() - 1) as u16).to_be_bytes());
+        packed.extend_from_slice(piece);
+    }
+}
+
+fn assert_chunks_cover_the_run(r: &Lzma2Run) {
+    let c = r.chunks;
+    assert_eq!(c.lzma_packed + c.copy_packed, r.packed_len, "{r:?}");
+    assert_eq!(c.lzma_unpacked + c.copy_unpacked, r.unpacked_len, "{r:?}");
+    assert!(c.count() > 0);
+}
+
+#[test]
+fn a_run_record_accounts_for_every_byte_by_chunk_kind() {
+    let names = ["text.p1.xz", "mixed.p1.xz", "rand.p1.xz", "zeros.p1.xz"];
+    let (_, packed, _) = multi_run(&names, 2);
+    let whole = scan(&packed, usize::MAX).expect("scan");
+    for r in &whole {
+        assert_chunks_cover_the_run(r);
+        // An LZMA-coded run starts with a chunk that resets the dictionary,
+        // which is also a state reset with new properties; xz stores the
+        // random fixture, and a stored run has neither.
+        if r.chunks.lzma_chunks > 0 {
+            assert!(r.chunks.state_resets >= 1 && r.chunks.prop_resets >= 1);
+        } else {
+            assert_eq!((r.chunks.state_resets, r.chunks.prop_resets), (0, 0));
+        }
+    }
+    // How the bytes arrive changes nothing in the record.
+    for chunk in [1usize, 3, 6, 4099] {
+        assert_eq!(scan(&packed, chunk).expect("scan"), whole, "chunk={chunk}");
+    }
+}
+
+#[test]
+fn a_stored_run_is_all_copy_chunks() {
+    let plain = pseudo_random(200_000, 5);
+    let (packed, _) = join_runs(&[copy_run(&plain)]);
+    let found = scan(&packed, 5).expect("scan");
+    assert_eq!(found.len(), 1);
+    assert_chunks_cover_the_run(&found[0]);
+    assert_eq!(
+        found[0].chunks,
+        Lzma2RunChunks {
+            copy_chunks: 4,
+            copy_packed: 200_000 + 4 * 3,
+            copy_unpacked: 200_000,
+            ..Lzma2RunChunks::default()
+        }
+    );
+}
+
+#[test]
+fn an_lzma_run_that_goes_on_in_stored_chunks_is_split_exactly() {
+    let (_, lzma) = xz_run("text.p1.xz");
+    let lzma_packed = lzma.packed.len() as u64;
+    let lzma_unpacked = lzma.plain.len() as u64;
+    let mut run = lzma;
+    let tail = pseudo_random(150_000, 11);
+    append_copy_chunks(&mut run.packed, &tail);
+    let (packed, _) = join_runs(&[run, copy_run(&pseudo_random(10, 3))]);
+    let found = scan(&packed, 7).expect("scan");
+    assert_eq!(found.len(), 2);
+    let c = found[0].chunks;
+    assert_chunks_cover_the_run(&found[0]);
+    assert_eq!(c.lzma_packed, lzma_packed);
+    assert_eq!(c.lzma_unpacked, lzma_unpacked);
+    assert_eq!(c.copy_chunks, 3);
+    assert_eq!(c.copy_unpacked, 150_000);
+    assert_eq!(c.copy_packed, 150_000 + 3 * 3);
+    // The stored run after it starts with `0x01` and is all copy.
+    assert_eq!(found[1].chunks.lzma_chunks, 0);
+    assert_eq!(found[1].chunks.copy_unpacked, 10);
 }

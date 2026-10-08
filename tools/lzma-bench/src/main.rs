@@ -241,8 +241,14 @@ fn run_index(path: &Path) {
     while let Some(r) = scanner.next_run() {
         if n < 8 {
             println!(
-                "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {}",
-                r.in_offset, r.packed_len, r.out_offset, r.unpacked_len, r.has_dict_reset
+                "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {} chunks lzma {} copy {}",
+                r.in_offset,
+                r.packed_len,
+                r.out_offset,
+                r.unpacked_len,
+                r.has_dict_reset,
+                r.chunks.lzma_chunks,
+                r.chunks.copy_chunks
             );
         }
         n += 1;
