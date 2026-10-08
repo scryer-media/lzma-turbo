@@ -10,12 +10,12 @@
 //! embedding exists to avoid, and not return a wrong answer.
 //!
 //! It declares no imports at all, so it needs no host: the driver in
-//! `tests/wasm_host_conformance.rs` instantiates it under plain WASI, runs it,
-//! and requires both a non-zero exit (a panic under `panic = "abort"` traps)
-//! and the documented text on stderr.
+//! `tools/wasm-conformance/tests/wasm_host_conformance.rs` instantiates it
+//! under plain WASI, runs it, and requires both a non-zero exit (a panic under
+//! `panic = "abort"` traps) and the documented text on stderr.
 //!
 //! Run it through the driver:
-//!   cargo test -p lzma-turbo --features crc-host,crypto-host --test wasm_host_conformance
+//!   cargo test -p wasm-conformance
 //!
 //! Natively it prints the checksum and exits 0, because the delegating
 //! features are inert off wasm - which is itself the claim the native lane

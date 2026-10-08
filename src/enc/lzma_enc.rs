@@ -1442,6 +1442,11 @@ impl LzmaEnc {
         if self.rc.res.is_err() {
             self.result = Err(Error::Write);
         }
+        // C: `if (p->mtMode && p->matchFinderMt.failure_LZ_BT) p->result =
+        // MY_HRES_ERROR_INTERNAL_ERROR;`
+        if self.mf.mt_failed() {
+            self.result = Err(Error::InternalFailure);
+        }
         if self.mf.result().is_err() {
             self.result = Err(Error::Read);
         }

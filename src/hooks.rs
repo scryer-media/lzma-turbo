@@ -45,7 +45,7 @@
 //! `examples/wasm_xz_conformance.rs` is a complete reference embedding: a
 //! `wasm32-wasip1` guest that declares raw imports in a `host` namespace and
 //! installs hooks that forward to them, driven by the native `wasmtime` harness
-//! in `tests/wasm_host_conformance.rs`.
+//! in `tools/wasm-conformance/tests/wasm_host_conformance.rs`.
 //!
 //! ## Contract the hooks must satisfy
 //!
@@ -73,7 +73,7 @@
 //! [`crate::crc::Crc64Xz`] carry a plain integer across `update` calls. A host
 //! whose CRC library exposes only a running (pre-final-xor) register seeds it
 //! with `!seed` and applies the final xor on the way out; the reference host in
-//! `tests/wasm_host_conformance.rs` does exactly that with `crc-fast`'s
+//! `tools/wasm-conformance/tests/wasm_host_conformance.rs` does exactly that with `crc-fast`'s
 //! `Digest::new_with_init_state`, and the native test at the bottom of
 //! [`crate::crc`] proves the three properties above through the real registry.
 //!
