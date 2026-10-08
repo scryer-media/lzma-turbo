@@ -83,17 +83,84 @@ type MatrixOptions struct {
 	Threads   []int // 0 means every logical CPU ("all")
 	Presets   []int
 	MTPresets []int
+	// MTThreads, when set, is the multi-threaded encode sweep in place of
+	// Threads, so the encoder can be swept wider than the decoders.
+	MTThreads []int
 	Sizes     []string // p256, 1g
-	Only      []string
-	CPUs      int
+	// Extra admits these scenario IDs even when their size is not in Sizes:
+	// one 1 GiB row kept as a sanity check on a p256-only matrix.
+	Extra []string
+	Only  []string
+	CPUs  int
+}
+
+// Profiles are the named matrices `run --profile` selects.
+const (
+	ProfileQuick = "quick" // a smoke test: p256, threads 1 and all, one repeat
+	ProfileFull  = "full"  // every sweep, both sizes, five repeats
+	ProfileFleet = "fleet" // full's shape trimmed to fit a fleet host's budget
+)
+
+// Profiles lists the profile names in the order the help text gives them.
+var Profiles = []string{ProfileQuick, ProfileFull, ProfileFleet}
+
+// ProfileDefaults are a profile's matrix plus its default repeats and warmups.
+type ProfileDefaults struct {
+	Matrix  MatrixOptions
+	Repeats int
+	Warmups int
+}
+
+// ProfileOptions returns a named profile's defaults.
+//
+// fleet keeps every scenario quick has at three repeats, then adds what
+// quick leaves out at the cost that matters on a fleet: presets 1, 5 and 9
+// on one thread, a 2/4/8/all multi-threaded encode sweep at preset 5 only,
+// and a single 1 GiB row (the eight-block .xz at preset 5 through
+// XzParallelReader at every CPU) to show the 256 MiB numbers hold at size.
+func ProfileOptions(name string) (ProfileDefaults, error) {
+	switch name {
+	case ProfileQuick:
+		return ProfileDefaults{Matrix: MatrixOptions{Quick: true, Threads: []int{1, 0}, Presets: []int{1, 5}, MTPresets: []int{5}, Sizes: []string{"p256"}}, Repeats: 1, Warmups: 0}, nil
+	case ProfileFull, "":
+		return ProfileDefaults{Matrix: MatrixOptions{Threads: []int{1, 2, 4, 8, 16, 0}, Presets: []int{1, 3, 5, 6, 9}, MTPresets: []int{5, 6}, Sizes: []string{"p256", "1g"}}, Repeats: 5, Warmups: 1}, nil
+	case ProfileFleet:
+		return ProfileDefaults{Matrix: MatrixOptions{Threads: []int{1, 0}, Presets: []int{1, 5, 9}, MTPresets: []int{5}, MTThreads: []int{2, 4, 8, 0},
+			Sizes: []string{"p256"}, Extra: []string{"decode/xz-par/1g.t8/tall"}}, Repeats: 3, Warmups: 1}, nil
+	}
+	return ProfileDefaults{}, fmt.Errorf("unknown profile %q (want %s)", name, strings.Join(Profiles, ", "))
 }
 
 // DefaultMatrixOptions are the brief's sweeps; quick trims them to a smoke.
 func DefaultMatrixOptions(quick bool) MatrixOptions {
+	name := ProfileFull
 	if quick {
-		return MatrixOptions{Quick: true, Threads: []int{1, 0}, Presets: []int{1, 5}, MTPresets: []int{5}, Sizes: []string{"p256"}}
+		name = ProfileQuick
 	}
-	return MatrixOptions{Threads: []int{1, 2, 4, 8, 16, 0}, Presets: []int{1, 3, 5, 6, 9}, MTPresets: []int{5, 6}, Sizes: []string{"p256", "1g"}}
+	p, _ := ProfileOptions(name)
+	return p.Matrix
+}
+
+// PlanCounts are what a matrix will cost: scenarios that will run, the
+// report rows they produce (one per contender), and the processes launched
+// at the given repeats and warmups.
+type PlanCounts struct {
+	Scenarios, Skipped, Rows, Processes int
+}
+
+// Plan counts a built matrix.
+func Plan(scenarios []Scenario, repeats, warmups int) PlanCounts {
+	var c PlanCounts
+	for _, s := range scenarios {
+		if s.Skip != "" {
+			c.Skipped++
+			continue
+		}
+		c.Scenarios++
+		c.Rows += len(s.Contenders)
+		c.Processes += len(s.Contenders) * (repeats + warmups)
+	}
+	return c
 }
 
 // ParseInts reads "1,2,all" style lists; "all" is 0.
@@ -165,17 +232,29 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 		return ""
 	}
 	// Deduplicate the sweep after "all" resolves (all = 16 on a 16-CPU host).
-	var threads []int
-	seen := map[int]bool{}
-	for _, t := range options.Threads {
-		if r := resolve(t); !seen[r] {
-			seen[r] = true
-			threads = append(threads, t)
+	dedupe := func(sweep []int) []int {
+		var out []int
+		seen := map[int]bool{}
+		for _, t := range sweep {
+			if r := resolve(t); !seen[r] {
+				seen[r] = true
+				out = append(out, t)
+			}
 		}
+		return out
+	}
+	threads := dedupe(options.Threads)
+	mtThreads := threads
+	if len(options.MTThreads) > 0 {
+		mtThreads = dedupe(options.MTThreads)
 	}
 	sizes := map[string]bool{}
 	for _, s := range options.Sizes {
 		sizes[s] = true
+	}
+	extra := map[string]bool{}
+	for _, id := range options.Extra {
+		extra[id] = true
 	}
 
 	var out []Scenario
@@ -186,7 +265,7 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 		if s.Size == "" {
 			s.Size = "p256"
 		}
-		if !sizes[s.Size] {
+		if !sizes[s.Size] && !extra[s.ID] {
 			return
 		}
 		if !selected(options.Only, s.ID) {
@@ -282,7 +361,7 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 	}
 	for _, p := range options.MTPresets {
 		ps := strconv.Itoa(p)
-		for _, t := range threads {
+		for _, t := range mtThreads {
 			n := resolve(t)
 			if n == 1 {
 				continue

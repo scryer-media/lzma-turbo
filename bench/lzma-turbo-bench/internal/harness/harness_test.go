@@ -163,7 +163,13 @@ func TestTheMatrix(t *testing.T) {
 	quick.CPUs = 4
 	full := DefaultMatrixOptions(false)
 	full.CPUs = 4
-	for name, options := range map[string]MatrixOptions{"quick": quick, "full": full} {
+	fleetDefaults, err := ProfileOptions(ProfileFleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := fleetDefaults.Matrix
+	fleet.CPUs = 16
+	for name, options := range map[string]MatrixOptions{"quick": quick, "full": full, "fleet": fleet} {
 		ids := map[string]bool{}
 		for _, s := range BuildMatrix(options) {
 			if ids[s.ID] {
@@ -206,6 +212,53 @@ func TestTheMatrix(t *testing.T) {
 		if !strings.HasPrefix(s.ID, "encode/st/") {
 			t.Errorf("--only encode/st/* selected %s", s.ID)
 		}
+	}
+}
+
+func TestFleetProfile(t *testing.T) {
+	quickDefaults, _ := ProfileOptions(ProfileQuick)
+	quick := quickDefaults.Matrix
+	quick.CPUs = 16
+	fleetDefaults, err := ProfileOptions(ProfileFleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fleetDefaults.Repeats != 3 || fleetDefaults.Warmups != 1 {
+		t.Errorf("fleet runs %d repeats + %d warmups, want 3 + 1", fleetDefaults.Repeats, fleetDefaults.Warmups)
+	}
+	fleet := fleetDefaults.Matrix
+	fleet.CPUs = 16
+	ids := map[string]bool{}
+	var big []string
+	for _, s := range BuildMatrix(fleet) {
+		ids[s.ID] = true
+		if s.Size == "1g" {
+			big = append(big, s.ID)
+		}
+	}
+	// Every quick row is a fleet row.
+	for _, s := range BuildMatrix(quick) {
+		if !ids[s.ID] {
+			t.Errorf("fleet drops quick's %s", s.ID)
+		}
+	}
+	if fmt.Sprint(big) != "[decode/xz-par/1g.t8/tall]" {
+		t.Errorf("fleet 1 GiB rows = %v, want the one sanity row", big)
+	}
+	for _, id := range []string{"encode/st/p1", "encode/st/p5", "encode/st/p9",
+		"encode/mt/p5/t2", "encode/mt/p5/t4", "encode/mt/p5/t8", "encode/mt/p5/tall"} {
+		if !ids[id] {
+			t.Errorf("fleet lacks %s", id)
+		}
+	}
+	for id := range ids {
+		if strings.HasPrefix(id, "encode/mt/p6") || id == "encode/st/p3" || id == "encode/st/p6" ||
+			id == "decode/7z-mt/p256/t4" || id == "decode/xz-par/p256.t8/t8" {
+			t.Errorf("fleet selected %s", id)
+		}
+	}
+	if _, err := ProfileOptions("nightly"); err == nil {
+		t.Error("an unknown profile is accepted")
 	}
 }
 

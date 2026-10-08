@@ -5,7 +5,7 @@
 //
 //	lzma-turbo-bench fixtures  [--verify-only]
 //	lzma-turbo-bench toolchain [--build] [--fetch-7zz]
-//	lzma-turbo-bench run       [--quick] [--repeats N] [--out DIR] [--machine LABEL] ...
+//	lzma-turbo-bench run       [--profile quick|full|fleet] [--quick] [--repeats N] [--out DIR] [--machine LABEL] ...
 //	lzma-turbo-bench report    --input raw.json [--out report.json] [--md report.md]
 //	lzma-turbo-bench merge     --out merged.md report.json...
 //
@@ -194,9 +194,12 @@ func cmdRun(ctx context.Context, args []string) int {
 	c.register(fs)
 	out := fs.String("out", "", "output directory (default: <repo>/bench/results/<machine>-<UTC time>)")
 	machine := fs.String("machine", "", "host label in the reports (default: <os>-<arch>-<cpus>cpu)")
-	quick := fs.Bool("quick", false, "p256 only, threads 1,all, presets 1,5, MT preset 5")
-	repeats := fs.Int("repeats", 0, "measured repeats per contender (default 5, or 1 with --quick)")
-	warmups := fs.Int("warmups", -1, "unmeasured warmup passes per scenario (default 1, or 0 with --quick)")
+	profile := fs.String("profile", "", "matrix profile: quick (smoke: p256, threads 1,all, presets 1,5, MT preset 5, 1 repeat), "+
+		"full (every sweep, p256 and 1 GiB, 5 repeats; the default) or "+
+		"fleet (quick's rows plus presets 1,5,9, an MT encode sweep 2,4,8,all at preset 5 and one 1 GiB decode row, 3 repeats, 1 warmup)")
+	quick := fs.Bool("quick", false, "the same as --profile quick")
+	repeats := fs.Int("repeats", 0, "measured repeats per contender (default: the profile's, 5 full, 3 fleet, 1 quick)")
+	warmups := fs.Int("warmups", -1, "unmeasured warmup passes per scenario (default: the profile's, 1 full and fleet, 0 quick)")
 	threads := fs.String("threads", "", "thread sweep, e.g. 1,2,4,8,16,all")
 	presets := fs.String("presets", "", "single-thread encode presets, e.g. 1,3,5,6,9")
 	mtPresets := fs.String("mt-presets", "", "multi-threaded encode presets, e.g. 5,6")
@@ -208,8 +211,22 @@ func cmdRun(ctx context.Context, args []string) int {
 	if rc := parse(fs, args); rc != exitOK {
 		return max(rc, 0)
 	}
-	matrix := harness.DefaultMatrixOptions(*quick)
-	var err error
+	if *quick {
+		if *profile != "" && *profile != harness.ProfileQuick {
+			logf("--quick and --profile %s disagree", *profile)
+			return exitUsage
+		}
+		*profile = harness.ProfileQuick
+	}
+	if *profile == "" {
+		*profile = harness.ProfileFull
+	}
+	defaults, err := harness.ProfileOptions(*profile)
+	if err != nil {
+		logf("%v", err)
+		return exitUsage
+	}
+	matrix := defaults.Matrix
 	for _, f := range []struct {
 		text string
 		into *[]int
@@ -226,16 +243,19 @@ func cmdRun(ctx context.Context, args []string) int {
 	}
 	matrix.Only = splitList(*only)
 	if *repeats == 0 {
-		*repeats = map[bool]int{true: 1, false: 5}[*quick]
+		*repeats = defaults.Repeats
 	}
 	if *warmups < 0 {
-		*warmups = map[bool]int{true: 0, false: 1}[*quick]
+		*warmups = defaults.Warmups
 	}
 	if *repeats < 1 {
 		logf("--repeats must be at least 1")
 		return exitUsage
 	}
 	scenarios := harness.BuildMatrix(matrix)
+	plan := harness.Plan(scenarios, *repeats, *warmups)
+	planLine := fmt.Sprintf("profile %s: %d scenarios (%d skipped on this host), %d contender rows, %d processes at %d repeat(s) + %d warmup(s)",
+		*profile, plan.Scenarios, plan.Skipped, plan.Rows, plan.Processes, *repeats, *warmups)
 	if *list {
 		for _, s := range scenarios {
 			skip := ""
@@ -244,6 +264,7 @@ func cmdRun(ctx context.Context, args []string) int {
 			}
 			fmt.Printf("%s%s\n", s.ID, skip)
 		}
+		fmt.Println(planLine)
 		return exitOK
 	}
 	if len(scenarios) == 0 {
@@ -280,8 +301,9 @@ func cmdRun(ctx context.Context, args []string) int {
 	}
 	defer journal.Close()
 	logf("host %s: %s, %d CPUs, tier %s; writing %s", host.Label, host.CPU, host.CPUCount, host.Tier, dir)
+	logf("%s", planLine)
 
-	settings := harness.RunSettings{Quick: *quick, Repeats: *repeats, Warmups: *warmups, Threads: matrix.Threads,
+	settings := harness.RunSettings{Profile: *profile, Quick: *profile == harness.ProfileQuick, Repeats: *repeats, Warmups: *warmups, Threads: matrix.Threads,
 		Presets: matrix.Presets, MTPresets: matrix.MTPresets, Sizes: matrix.Sizes, Only: matrix.Only,
 		TimeoutSeconds: timeout.Seconds(), CommandLine: strings.Join(append([]string{"lzma-turbo-bench", "run"}, args...), " ")}
 	raw, runErr := harness.Execute(ctx, harness.RunOptions{Paths: paths, Toolchain: tc, Host: host, Matrix: scenarios,

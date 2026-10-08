@@ -49,7 +49,8 @@ in `Cargo.lock`, so they are on every host.
 ```sh
 lzma-turbo-bench toolchain [--build] [--fetch-7zz]
 lzma-turbo-bench fixtures  [--verify-only] [--json]
-lzma-turbo-bench run       [--quick] [--repeats N] [--warmups N] [--out DIR]
+lzma-turbo-bench run       [--profile quick|full|fleet] [--quick]
+                           [--repeats N] [--warmups N] [--out DIR]
                            [--machine LABEL] [--threads 1,2,4,8,16,all]
                            [--presets 1,3,5,6,9] [--mt-presets 5,6]
                            [--sizes p256,1g] [--only PREFIX|GLOB,...]
@@ -73,10 +74,26 @@ lzma-turbo-bench merge     [--out merged.md] host-a/report.json host-b/report.js
   writes `runs.jsonl` as each process finishes, then `raw.json`,
   `report.json` and `report.md`. Without `--out` the files go to
   `bench/results/<machine>-<UTC time>/`, which is gitignored.
-  - `--quick` is the smoke test: the 256 MiB payload only, threads 1 and all,
-    presets 1 and 5, MT preset 5, and one repeat with no warmup.
-  - The full run uses five repeats and one warmup pass.
-  - `--list` prints the scenario IDs the flags select.
+  - `--profile` picks the matrix; the explicit sweep flags then narrow or
+    widen it. There are three profiles:
+    - `quick` (the same as `--quick`) is the smoke test: the 256 MiB payload
+      only, threads 1 and all, presets 1 and 5, MT preset 5, and one repeat
+      with no warmup.
+    - `full`, the default, is every sweep at both sizes, with five repeats
+      and one warmup pass.
+    - `fleet` is sized for one run per fleet host in about an hour and a
+      half. It keeps every `quick` row and adds presets 1, 5 and 9 on one
+      thread and a 2, 4, 8 and all-CPU multi-threaded encode sweep at preset
+      5 only. It keeps one 1 GiB row, `decode/xz-par/1g.t8/tall`, as a check
+      that the 256 MiB numbers hold at size. It runs three repeats and one
+      warmup pass, 66 scenarios in all. On the hosts measured so far it
+      takes about 45 minutes on an Apple M5 Max, 75 minutes on an i5-1240P
+      under Linux and 70 minutes on a Ryzen 5 3600 under Windows. The
+      single-thread preset 9 and 5 encodes take about 40% of that.
+  - `--list` prints the scenario IDs the flags select, then the plan: the
+    scenario count, the contender rows the report will have and the number
+    of processes the run will launch. `run` logs the same plan line before
+    it starts.
 - `report` rebuilds `report.json` and `report.md` from a `raw.json`, so a
   change to the report needs no re-measurement.
 - `merge` lays several hosts' `report.json` side by side in one Markdown

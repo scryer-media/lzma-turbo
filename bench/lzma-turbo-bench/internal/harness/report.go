@@ -333,7 +333,7 @@ func RenderMarkdown(report *Report) string {
 		fmt.Fprintf(&b, "- Cargo.lock: %s\n", strings.Join(parts, ", "))
 	}
 	fmt.Fprintf(&b, "- Run: %s to %s, %d repeat(s), %d warmup(s)%s; load average before each run is in report.json\n",
-		report.Started, report.Finished, report.Settings.Repeats, report.Settings.Warmups, map[bool]string{true: ", quick matrix"}[report.Settings.Quick])
+		report.Started, report.Finished, report.Settings.Repeats, report.Settings.Warmups, profileNote(report.Settings))
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## How to read the ratios")
 	fmt.Fprintln(&b)
@@ -567,4 +567,16 @@ func renderAllocations(b *strings.Builder, rows []Row) {
 		}
 	}
 	fmt.Fprintln(b)
+}
+
+// profileNote names the matrix profile in the report header; runs from
+// before profiles existed carry only the quick flag.
+func profileNote(s RunSettings) string {
+	switch {
+	case s.Profile != "":
+		return ", " + s.Profile + " profile"
+	case s.Quick:
+		return ", quick matrix"
+	}
+	return ""
 }

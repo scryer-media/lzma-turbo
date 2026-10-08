@@ -85,6 +85,7 @@ type DroppedContender struct {
 
 // RunSettings are the knobs a run used, kept with its data.
 type RunSettings struct {
+	Profile        string   `json:"profile,omitempty"`
 	Quick          bool     `json:"quick"`
 	Repeats        int      `json:"repeats"`
 	Warmups        int      `json:"warmups"`
