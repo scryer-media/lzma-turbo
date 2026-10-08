@@ -300,7 +300,7 @@ impl Converters {
     /// Pushes the next decoded bytes through every stage and appends whatever
     /// comes out the far end to `out`.
     pub fn push(&mut self, data: &[u8], out: &mut Vec<u8>) {
-        self.run(data, out, false);
+        self.run(data, out, false, false);
     }
 
     /// Pushes the last bytes of the block and flushes every stage's tail.
@@ -310,10 +310,27 @@ impl Converters {
     /// exactly what the C's loop does when `Load_more_input_data` returns
     /// nothing.
     pub fn finish(&mut self, data: &[u8], out: &mut Vec<u8>) {
-        self.run(data, out, true);
+        self.run(data, out, true, false);
     }
 
-    fn run(&mut self, data: &[u8], out: &mut Vec<u8>, flush: bool) {
+    /// Pushes the next bytes of a block being *written* through every stage,
+    /// in encode order, and appends whatever comes out to `out`.
+    ///
+    /// Chunked or whole, the result is what [`Converters::encode_in_place`]
+    /// makes of the same block: each converter keeps the tail it could not
+    /// convert yet and converts it once the next chunk has arrived, exactly
+    /// as [`Converters::push`] does in the other direction.
+    pub fn encode_push(&mut self, data: &[u8], out: &mut Vec<u8>) {
+        self.run(data, out, false, true);
+    }
+
+    /// Pushes the last bytes of a block being written and flushes every
+    /// stage's tail, which the end of the block leaves as it stands.
+    pub fn encode_finish(&mut self, data: &[u8], out: &mut Vec<u8>) {
+        self.run(data, out, true, true);
+    }
+
+    fn run(&mut self, data: &[u8], out: &mut Vec<u8>, flush: bool, encode: bool) {
         // `cur` walks down the stages; `scratch` is the other half of a
         // double buffer so no stage allocates per call.
         let mut cur = core::mem::take(&mut self.scratch);
@@ -321,16 +338,28 @@ impl Converters {
         cur.extend_from_slice(data);
 
         let mut next = Vec::new();
-        for stage in &mut self.stages {
+        let stages = self.stages.len();
+        for k in 0..stages {
+            // `stages` is decode order; an encoder runs it backwards, as
+            // `encode_in_place` does.
+            let stage = &mut self.stages[if encode { stages - 1 - k } else { k }];
             let mut buf = core::mem::take(&mut stage.carry);
             buf.extend_from_slice(&cur);
             let done = match &mut stage.conv {
                 Conv::Delta(d) => {
-                    d.decode(&mut buf);
+                    if encode {
+                        d.encode(&mut buf);
+                    } else {
+                        d.decode(&mut buf);
+                    }
                     buf.len()
                 }
                 Conv::Bcj(b) => {
-                    let n = b.decode(&mut buf);
+                    let n = if encode {
+                        b.encode(&mut buf)
+                    } else {
+                        b.decode(&mut buf)
+                    };
                     if flush { buf.len() } else { n }
                 }
             };

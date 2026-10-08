@@ -3,7 +3,26 @@
 ## Fixtures
 
 Run `cargo xtask fixtures` once. It writes to `bench/fixtures/` (ignored).
-See `bench/fixtures/README.md` for the list.
+See `bench/fixtures/README.md` for the list. `lzma-turbo-bench fixtures`
+(below) runs it, adds the few shapes the fleet matrix needs on top, and
+checks every file against that README: the seeded payloads by SHA-256, the
+compressed fixtures, which depend on the local xz and 7-Zip, by size.
+
+## Two harnesses
+
+`tools/lzma-bench` is the in-process harness this document's sections
+describe: one command, one machine, every decoder timed from inside one
+process, ratios printed as ours/oracle (below 1.000 is faster).
+
+[`bench/lzma-turbo-bench`](../bench/lzma-turbo-bench) is the fleet harness.
+It runs every contender as its own process, through `lzma-bench --shot` for
+this crate, lzma-rust2 and liblzma and directly for `xz`, `7zz` and `7lzma`,
+so each row carries the process's own peak RSS beside its wall and CPU time.
+It interleaves the contenders, reversing the order on alternate repeats,
+records the host's CPU, ISA flags and load, and writes `report.json` and
+`report.md` per host plus a cross-host merge. Its speed ratios are the other
+way up, reference/lzma-turbo, so above 1.000 is faster; its README has the
+matrix, the oracles each OS needs and the exit codes.
 
 ## Oracles
 
@@ -13,7 +32,10 @@ See `bench/fixtures/README.md` for the list.
 | 7-Zip C decoder (no asm) | `7lzma d in.lzma /dev/null` | C parity checkpoint. Built from `C/Util/Lzma` with the default makefile (`make -f makefile.gcc`). The harness takes the binary named by `LZMA_TURBO_7LZMA`, or else whatever `7lzma` is on `PATH`. |
 | XZ Utils | `xz -dc -T1 in.xz > /dev/null` / `xz -dc --format=lzma in.lzma > /dev/null` | Tukaani C decoder; also the correctness reference for output bytes. |
 
-Reference numbers on Apple M5 Max, 7-Zip 26.01, XZ Utils 5.8 (2026-09-15):
+Reference numbers on Apple M5 Max, 7-Zip 26.01, XZ Utils 5.8 (2026-09-15).
+They are dated; re-measure with either harness rather than quoting them. The
+sevenz-rust2 column was measured outside this repository's harnesses, which
+do not depend on it:
 
 | Input | `7zz -mmt=1` | `xz -T1` | lzma-rust2 0.20.1 | sevenz-rust2 0.22.2 |
 | --- | --- | --- | --- | --- |
@@ -52,10 +74,12 @@ means the two produced the same number of bytes.
 The same rules as above: idle machine, mains power, three runs, report the
 median, and measure the oracle in the same session.
 
-The encoder is bit-exact with the SDK's, which is what the parity tests check;
-`xz`'s presets are its own mapping onto LZMA settings and need not agree with
-`LzmaEncProps_Normalize` at every level, so the size column is the honest way
-to read a row rather than an assumption that the two encoded the same thing.
+The encoder is bit-exact with the SDK's, which is what the parity tests check.
+`xz`'s presets are liblzma's own mapping onto LZMA settings and differ from
+7-Zip's levels (`xz -1` uses a 1 MiB dictionary where level 1 uses 256 KiB),
+so the harness encodes with `LzmaEncProps::xz_preset`, the same table `xz -N`
+uses, and the size column should read within a few bytes of `1.0000`. A row
+that drifts from it is a real difference in the encoder, not a preset mismatch.
 
 ### Multi-threaded LZMA2
 
@@ -73,7 +97,9 @@ only; the library has none.
 
 The in-process decoders are also measured for peak allocated bytes, through a
 counting global allocator that is reset at the start of each timed decode.
-`7zz` is a subprocess and is not accounted for this way.
+`7zz` is a subprocess and is not accounted for this way; for a peak that
+covers every contender alike, the process's resident set, use
+`bench/lzma-turbo-bench`.
 
 `.7z` inputs are read by the harness's own pack-stream helper, which handles
 exactly the shape the fixtures have - one file, one folder, one LZMA2 coder -
@@ -116,8 +142,8 @@ decoder is configured for.
 ## Differential correctness
 
 `cargo test -p lzma-turbo` decodes every fixture it can find under
-`bench/fixtures` and small committed vectors under `tests`,
-and compares the bytes with `xz -dc`. Fuzzing (`cargo fuzz`) targets the
+`bench/fixtures`, comparing length and CRC-32 with `xz -dc`, and the small
+vectors committed under `tests`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.
 
 The `decode_xz` target does the same for the container: it decodes arbitrary

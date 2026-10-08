@@ -11,5 +11,8 @@ publish = false
 [dependencies]
 lzma-turbo = { path = "../.." }
 lzma-rust2 = "0.20.1"
+# Only to name the CRC tier `crc-fast` selects at run time (`--shot info`);
+# the same version the library resolves to, so the tier is the library's.
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 # The C library this crate exists to replace, for the `--xz` lane only.
 liblzma = { version = "0.4.8", features = ["parallel"] }

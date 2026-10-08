@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.7.0 - 2026-10-07
+
+- `LzmaEncProps::xz_preset(preset, extreme)`: the settings `xz -N` (and
+  `xz -Ne`) uses, built from this encoder's own: liblzma's dictionary,
+  `lc`/`lp`/`pb`, parser mode, match finder, nice length and depth from
+  `lzma_lzma_preset`. `with_level` is, and stays, 7-Zip's numbering from
+  `LzmaEncProps_Normalize`, which is not liblzma's: the SDK's level 1 has a
+  256 KiB dictionary, a five-byte hash chain, 32 fast bytes and 16 cycles,
+  where `xz -1` has 1 MiB, a four-byte hash chain, a nice length of 128 and a
+  depth of 8. Measured against `xz -1` that dictionary alone looked like a
+  24% ratio regression on a 30 MiB code fixture, with and without each BCJ
+  filter; through `xz_preset(1, false)` the same encoder writes within 0.01%
+  of `xz`'s size on every one of the eight BCJ chains and on the plain
+  stream, and stays faster than `xz -T1`. The filters and the LZMA2 path they
+  feed were already conformant: the converters' output is byte for byte
+  liblzma's, and a filter changes nothing about how the block is encoded.
+  Preset 0's three-byte hash chain has no counterpart in the SDK's match
+  finder, so that preset uses the four-byte one.
+- `XzWriter` and `XzEncoder`: the default single block is compressed as it
+  arrives instead of held whole. Once more than a dictionary's worth of input
+  has gone in, the LZMA2 encoder runs on a thread of its own, pulling the
+  input through a bounded pipe, and the compressed data is written out as it
+  comes; the check is computed and the BCJ and delta filters run over the
+  input as it streams. That block's header leaves both sizes to the index, as
+  `xz`'s single-threaded output does; its compressed data is byte for byte
+  what a one-shot encode writes. Up to a dictionary the block is still held
+  and written with its sizes declared, exactly as before. On a 256 MiB input
+  at one thread, peak RSS falls from 723 MiB to 19 MiB at `xz -1` settings
+  and from 803 MiB to 123 MiB at `xz -5` (Rust heap 875 MiB to 12.5 MiB and
+  956 MiB to 109 MiB), with no loss of speed. An explicit block size, at any
+  thread count, and the one-shot `encode_xz` calls write the same bytes as
+  before.
+- `Lzma2Writer` streams the same way past a dictionary's worth of input, and
+  its output is unchanged: the bytes are `Lzma2Encoder::encode_to_vec`'s over
+  the whole input. `LzmaWriter` still holds its input, because the `.lzma`
+  header carries the uncompressed size.
+- Where no thread can be started, both writers fall back to holding the input
+  and compressing it on `finish`.
+- `LzmaPushEncoder` and `Lzma2PushEncoder`: raw LZMA and solid LZMA2 encoders
+  that are pushed their input in slices of any size and finished once, with
+  no thread, so a `wasm32` guest or any other single-threaded writer can
+  stream instead of holding its input. They run the encoder's own block loop
+  (`LzmaEnc_CodeOneBlock`, one LZMA2 chunk per `Lzma2EncInt_EncodeSubblock`)
+  only while a bounded queue holds more than that call can advance plus the
+  match finder's look-ahead, so the finder never runs dry mid-stream; a read
+  from an empty queue before `finish` is an internal failure, not the end of
+  the input. Memory is the encoder's window and tables plus a 192 KiB queue
+  for LZMA or one 2 MiB chunk and 64 KiB for LZMA2, whatever the input's
+  length. The bytes are exactly `LzmaEncoder::encode`'s and
+  `Lzma2Encoder::encode`'s over the whole input with the same settings and no
+  announced size; tests compare them across lengths that straddle the queue
+  depth, the look-ahead and several 2 MiB chunks, for empty input and for
+  slices of one to seven bytes. The match finder is always the
+  single-threaded one, which finds the same matches.
+- `XzEncoder::set_block_size` (and `XzWriter`'s) called after input has gone
+  in no longer loses any of it. Once the single block was streaming, input
+  pushed after a new size was set was held for a block of its own and then
+  left out by `finish`, which wrote a valid stream without it; the rest of
+  the input now goes into the streaming block. Input held under the default
+  size that is already past the new size becomes one block instead of
+  underflowing the room left in it.
+- `xz::filter::Converters::encode_push` and `encode_finish`: the encode
+  direction of `push` and `finish`, so a filter chain can be applied to a
+  block in pieces with the same result as `encode_in_place` over the whole.
+- Threaded match finder (`LzmaEncProps::with_num_threads(2)`): an input longer
+  than the window no longer panics the bt thread and hangs the encoder. When
+  the hash thread slid the window (`MatchFinder_MoveBlock`) it rewrote the bt
+  and lz threads' window indices itself, as the C does, while each of those
+  threads held a `&mut` to its state across the very call the move happens
+  inside; the compiled bt thread carried on from its old index and ran off
+  the end of the window ("range end index ... out of range" in `match_run`).
+  The move now publishes its shift and each thread applies it when it next
+  enters its critical section. Reproduced through `Lzma2Encoder::encode_send`
+  with an 8 MiB dictionary from about 15 MB of input and a 1 MiB dictionary at
+  16 MiB; the output is again byte for byte the single-threaded finder's.
+- Threaded match finder: a panic on the hash or bt thread, including one in
+  the caller's input stream, is caught at the block it happened in and becomes
+  an error from the encode instead of a hang, and the encoder's `CheckErrors`
+  now reports the bt thread's internal failure (C: `failure_LZ_BT`), which it
+  had dropped.
+- `Lzma2Run::chunks` (`Lzma2RunChunks`): what a run's chunks are, by kind,
+  from their headers. Stored and LZMA-coded chunks are counted and sized
+  separately (packed sizes include the headers, so the two kinds add up to the
+  run's `packed_len` and `unpacked_len` exactly), with the LZMA chunks that
+  reset the coder state or carry new properties. A packed-to-unpacked ratio
+  cannot tell data that barely compresses, which is LZMA-coded and slow to
+  decode, from data that does not compress at all, which is stored and decodes
+  as a copy; this can. `Lzma2Run` is a public struct with public fields, so a
+  caller that builds one by hand now has a field to fill. The scanner adds a
+  few integer sums per chunk header and decodes nothing more.
+- Threaded match finder: a failure on the hash thread, such as a panic in the
+  caller's input stream, no longer lets the encoder read past the match data
+  the bt thread had published (an index out of bounds in `lz_find_mt`, seen on
+  Windows CI). The hash thread signalled the failure as an orderly end of
+  stream, taking back bytes earlier blocks had already promised the encoder,
+  which kept consuming positions against that promise into stale ring words.
+  It now sends a header no real block carries, which the bt thread turns into
+  its internal-data failure (C: `failure_BT`), so the lz thread switches to
+  the C's failure buffer and the encode returns an error. A test poisons the
+  ring and fails the stream after one read.
+- `XzWriter` and `Lzma2Writer` keep `std::io::Write`'s promise that an error
+  means none of the buffer was taken. A write that failed to pass compressed
+  output on had already fed its input to the encoder, so a caller retrying
+  the same bytes compressed them twice, and the output it was carrying was
+  lost. Pending output is now sent before new input is accepted and kept
+  until the sink takes it; once input is accepted the write succeeds, and
+  what the sink refuses then is retried by the next write, `flush` or
+  `finish`.
+- `XzEncoder`: whole blocks queued for the parallel batch under an explicit
+  block size are written before a later streaming block starts, instead of
+  after it. Setting the block size back to 0 with blocks queued at more than
+  one thread wrote the streaming block first, out of input order.
+- `crypto::SHA256_BACKEND`: which backend `Sha256` is (`"aws-lc-rs"`,
+  `"rustcrypto"` or `"host"`), by the same features as the re-export.
+- Benchmark harness only (`bench/lzma-turbo-bench`, `tools/lzma-bench`), no
+  library change: decode shots hash their output only in a separate verify
+  run, encode shots count their output without a sink copy, and xz encodes
+  are timed writing to the null device with their size taken from one untimed
+  run, so neither side pays a transport the other does not; a report built
+  from an interrupted or incomplete run fails; the plan counts the verify and
+  size runs; `--threads` replaces a profile's encode sweep; an oracle
+  override that names nothing runnable is missing; `lzma-bench --shot info`
+  names the SHA-256 backend; and a stale or dirty `lzma-bench`, a renamed
+  `xz`, relative overrides and an overridden fixture directory are handled.
+
 ## 0.6.0 - 2026-09-22
 
 - `mt::Lzma2AdaptiveDecoder`: input is held as the pieces it arrived in rather

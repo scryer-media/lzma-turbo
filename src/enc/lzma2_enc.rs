@@ -41,12 +41,12 @@ const CONTROL_COPY_NO_RESET: u8 = 2;
 /// C: `LZMA2_CONTROL_COPY_RESET_DIC`.
 const CONTROL_COPY_RESET_DIC: u8 = 1;
 /// C: `LZMA2_CONTROL_EOF`.
-const CONTROL_EOF: u8 = 0;
+pub(crate) const CONTROL_EOF: u8 = 0;
 
 /// C: `LZMA2_PACK_SIZE_MAX`, which is also `LZMA2_COPY_CHUNK_SIZE`.
 const PACK_SIZE_MAX: usize = 1 << 16;
 /// C: `LZMA2_UNPACK_SIZE_MAX`, which is also `LZMA2_KEEP_WINDOW_SIZE`.
-const UNPACK_SIZE_MAX: u32 = 1 << 21;
+pub(crate) const UNPACK_SIZE_MAX: u32 = 1 << 21;
 /// C: `LZMA2_CHUNK_SIZE_COMPRESSED_MAX`.
 const CHUNK_SIZE_COMPRESSED_MAX: usize = (1 << 16) + 16;
 
@@ -179,6 +179,20 @@ impl Lzma2EncInt {
         self.need_init_prop = true;
     }
 
+    /// The head of [`Self::encode_mt1_stream`]'s block loop for a
+    /// [`BLOCK_SIZE_SOLID`] block whose length was never announced: what the
+    /// push encoder starts its one block with.
+    pub(crate) fn begin_solid(&mut self) -> Result<(), Error> {
+        self.init_block();
+        self.enc.set_data_size(u64::MAX);
+        self.enc.prepare(UNPACK_SIZE_MAX)
+    }
+
+    /// C: `p->srcPos`, how much of the block has been encoded.
+    pub(crate) fn src_pos(&self) -> u64 {
+        self.src_pos
+    }
+
     /// C: `Lzma2Enc_EncodeMt1`'s `inStream` path, the whole loop over blocks.
     ///
     /// `expected_data_size` is `me->expectedDataSize` and `finished` is the C's
@@ -281,7 +295,7 @@ impl Lzma2EncInt {
 
     /// C: `Lzma2EncInt_EncodeSubblock`, in the `outStream` form. Returns how
     /// many bytes it wrote, which is zero when the block is finished.
-    fn encode_subblock(
+    pub(crate) fn encode_subblock(
         &mut self,
         input: &mut dyn SeqInStream,
         out: &mut dyn SeqOutStream,
@@ -370,7 +384,7 @@ impl Lzma2EncInt {
 pub struct Lzma2Encoder {
     props: LzmaEncProps,
     /// C: `me->coders[0]`, the coder the single-threaded path uses.
-    coder: Lzma2EncInt,
+    pub(crate) coder: Lzma2EncInt,
     dict_size: u32,
     /// C: `props.blockSize`.
     block_size: u64,
@@ -470,7 +484,7 @@ impl Lzma2Encoder {
 
     /// Rebuilds the single-threaded coder if the block size has changed what
     /// [`Lzma2Encoder::effective_props`] resolves to.
-    fn sync_coder(&mut self) -> Result<(), Error> {
+    pub(crate) fn sync_coder(&mut self) -> Result<(), Error> {
         let want = self.effective_props();
         if want == self.coder_props {
             return Ok(());

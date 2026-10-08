@@ -83,6 +83,33 @@ fn repeats(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// A long input of every shape at once: text, runs and repeated phrases, and
+/// stretches of noise, in segments of up to 64 KiB. Compressible, but with
+/// matches at every distance up to the whole input, which is what an input
+/// longer than the dictionary needs to exercise the window moving.
+#[must_use]
+pub fn mixed(seed: u64, len: usize) -> Vec<u8> {
+    let mut rng = Rng(seed);
+    let mut out = Vec::with_capacity(len + (1 << 16));
+    while out.len() < len {
+        let n = 1 + rng.below(1 << 16);
+        match rng.below(4) {
+            0 => out.extend_from_slice(&text(rng.next_u64(), n)),
+            1 => out.extend_from_slice(&repeats(rng.next_u64(), n)),
+            2 => out.extend_from_slice(&random(rng.next_u64(), n / 8)),
+            _ if !out.is_empty() => {
+                // A copy of something earlier, from anywhere in the input.
+                let from = rng.below(out.len());
+                let n = n.min(out.len() - from);
+                out.extend_from_within(from..from + n);
+            }
+            _ => {}
+        }
+    }
+    out.truncate(len);
+    out
+}
+
 /// The longest case the corpus hands out, from `LZMA_TURBO_CORPUS_MAX`.
 ///
 /// Unset — which is everywhere a developer and every ordinary CI lane runs —

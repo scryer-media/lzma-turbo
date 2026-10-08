@@ -49,6 +49,34 @@
 //! hash thread takes both before it moves, which is the only moment all three
 //! agree to stand still.
 //!
+//! The move does *not* write the bt and lz threads' window indices itself, as
+//! `HashThreadFunc` does with `mt->buffer -= offset` and
+//! `mt->pointerToCurPos -= offset`. The C can, because every one of its reads
+//! of `p->buffer` goes through `p` and the critical-section calls are opaque
+//! to the compiler. Here each owner works on its state through a `&mut`, which
+//! promises the compiler that nothing else writes it - and it is held across
+//! the very `get_next_block` call the move happens inside, so the optimizer is
+//! entitled to keep the old index in a register and write it back afterwards.
+//! It did: the bt thread carried on from its pre-move index, walked off the
+//! end of the window and panicked. So the move publishes how far it slid in
+//! [`MtShared::bt_shift`] and [`MtShared::lz_shift`], and each owner subtracts
+//! its pending shift the moment it re-enters the critical section, which is
+//! the first moment the C's own reasoning lets it look at the window again.
+//!
+//! # When a thread panics
+//!
+//! A panic on the hash or bt thread is caught at the block it happened in and
+//! turned into the C's own failure protocol instead of a dead thread: the bt
+//! thread marks `failure_BT` and hands the lz thread an empty block, which is
+//! what `C/LzFindMt.c` does with corrupted tables; the hash thread hands the
+//! bt thread a header no real block carries, which the bt thread turns into
+//! the same `failure_BT`. It must not end the stream instead: the bt blocks
+//! already published promise the lz thread every byte read so far, and a
+//! short end of stream would leave it reading past the last entry the bt
+//! thread wrote. Either way [`MtShared::thread_failed`] is raised and the encoder's
+//! `CheckErrors` returns an error. Before this, a panic left the surviving
+//! threads waiting on semaphores the dead one would never release.
+//!
 //! # Not ported
 //!
 //! `p->affinity` / `affinityGroup` (thread affinity, which `LzmaEnc` never
@@ -58,7 +86,7 @@
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::enc::consts::*;
@@ -698,6 +726,9 @@ struct HashState {
     stream_end_was_reached: bool,
     /// C: `mf->result`.
     result: Result<(), Error>,
+    /// A panic was caught on this thread: every block from here on is the
+    /// end-of-stream header. Not in the C, which has no unwinding.
+    failed: bool,
 }
 
 impl HashState {
@@ -757,6 +788,16 @@ pub(crate) struct MtShared {
     hash_sync: MtSync,
     /// C: `p->btSync`.
     bt_sync: MtSync,
+    /// How far the window has slid under the bt thread since it last held
+    /// `hash_sync.cs`. C: the `mt->buffer -= offset` in `HashThreadFunc`,
+    /// deferred to the owner; see the module docs.
+    bt_shift: AtomicUsize,
+    /// The same for the lz thread's `pointer_to_cur_pos` and `bt_sync.cs`.
+    /// C: `mt->pointerToCurPos -= offset`.
+    lz_shift: AtomicUsize,
+    /// Raised when the hash or bt thread caught a panic. The lz thread reads
+    /// it in `CheckErrors`, as the C reads `failure_LZ_BT`.
+    thread_failed: AtomicBool,
     /// The allocations `Common`'s pointers address. Never referenced through
     /// these fields; they are here so that the buffers outlive every thread.
     _win: Vec<u8>,
@@ -806,13 +847,26 @@ impl MtShared {
         let shift = h.buffer - keep_before;
         h.buffer = keep_before;
         // C: `mt->pointerToCurPos -= offset; mt->buffer -= offset;`, where the
-        // C's `offset` is the distance the window actually moved.
-        // SAFETY: as above - both sections are held, so the owners of these
-        // two cells are parked and no reference to either exists.
-        unsafe {
-            (*self.lz_state.get()).pointer_to_cur_pos -= shift;
-            (*self.bt_state.get()).buffer -= shift;
-        }
+        // C's `offset` is the distance the window actually moved. The owners
+        // apply it themselves when they next take their section
+        // (`apply_bt_shift`, `apply_lz_shift`): writing their cells from here
+        // races the `&mut` each of them holds across `get_next_block`.
+        self.bt_shift.fetch_add(shift, Ordering::SeqCst);
+        self.lz_shift.fetch_add(shift, Ordering::SeqCst);
+    }
+
+    /// The bt thread's half of `move_block`: called each time it has just
+    /// entered `hash_sync.cs`, before it looks at the window.
+    #[inline]
+    fn apply_bt_shift(&self, b: &mut BtState) {
+        b.buffer -= self.bt_shift.swap(0, Ordering::SeqCst);
+    }
+
+    /// The lz thread's half of `move_block`: called each time it has just
+    /// entered `bt_sync.cs`.
+    #[inline]
+    fn apply_lz_shift(&self, l: &mut LzState) {
+        l.pointer_to_cur_pos -= self.lz_shift.swap(0, Ordering::SeqCst);
     }
 
     /// C: `MatchFinder_ReadBlock`, against the window through its one raw
@@ -860,6 +914,14 @@ impl MtShared {
         if self.common.keep_size_after >= h.avail() {
             self.read_block(h, stream);
         }
+    }
+
+    /// The hash thread caught a panic: end the stream here and tell the lz
+    /// thread, whose `CheckErrors` turns it into an error.
+    fn fail_hash(&self, h: &mut HashState) {
+        h.failed = true;
+        h.stream_end_was_reached = true;
+        self.thread_failed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -924,63 +986,42 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
                 break;
             }
 
-            sh.read_if_required(h, stream);
-            {
-                let c = &sh.common;
-                let offset = hash_block_offset(block_index);
-                block_index = block_index.wrapping_add(1);
-                let mut num = h.avail();
-
-                // C: "heads[1] contains the number of avail bytes: if (avail <
-                // mf->numHashBytes) it means that stream was finished [...]
-                // HASH_THREAD fills only the header (2 numbers) for all next
-                // blocks: {2, NumHashBytes - 1}, {2,0}, {2,0}, ..."
-                // SAFETY: the `free` semaphore was just taken, so this block is
-                // this thread's until `filled` is released below.
-                let heads = unsafe { c.hash_block(offset) };
-                heads[0] = 2;
-                heads[1] = num;
-
-                if num >= c.num_hash_bytes {
-                    num = num - c.num_hash_bytes + 1;
-                    if num > HASH_BLOCK_SIZE - 2 {
-                        num = HASH_BLOCK_SIZE - 2;
-                    }
-
-                    if h.pos > MT_MAX_VAL_FOR_NORMALIZE - num {
-                        let sub_value = h.pos - c.history_size - 1;
-                        // C: `MatchFinder_REDUCE_OFFSETS`.
-                        h.pos -= sub_value;
-                        h.stream_pos -= sub_value;
-                        // SAFETY: the high hash is this thread's range.
-                        let hash = unsafe { c.high_hash() };
-                        crate::enc::lz_find::normalize3(
-                            sub_value,
-                            &mut hash[..=c.hash_mask as usize],
-                        );
-                    }
-
-                    heads[0] = 2 + num;
-                    // SAFETY: the window below `stream_pos` is stable here:
-                    // this thread is the only writer and is not writing, and
-                    // `move_block` cannot run while this block is held.
-                    let win = unsafe { c.win() };
-                    // SAFETY: the high hash is this thread's range.
-                    let hash = unsafe { c.high_hash() };
-                    get_heads(
-                        c.heads,
-                        &win[h.buffer..],
-                        h.pos,
-                        hash,
-                        c.hash_mask,
-                        &mut heads[2..2 + num as usize],
-                        &c.crc,
-                    );
+            if !h.failed {
+                // C: `MatchFinder_ReadIfRequired`. The stream is the caller's
+                // code; a panic in it must end this stream with an error, not
+                // leave the bt thread waiting for a block that never comes.
+                let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sh.read_if_required(h, stream);
+                }));
+                if read.is_err() {
+                    sh.fail_hash(h);
                 }
-
-                // C: "wrap over zero is allowed at the end of stream".
-                h.pos = h.pos.wrapping_add(num);
-                h.buffer += num as usize;
+            }
+            let offset = hash_block_offset(block_index);
+            block_index = block_index.wrapping_add(1);
+            if !h.failed {
+                let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hash_fill_block(sh, h, offset);
+                }));
+                if filled.is_err() {
+                    sh.fail_hash(h);
+                }
+            }
+            if h.failed {
+                // Not an end of stream: earlier blocks already promised the
+                // bt and lz threads every byte read so far, and an orderly
+                // `{2, 0}` here would take back the ones not hashed yet,
+                // leaving the lz thread to walk past the last entry the bt
+                // thread published. A count below the two-word header is one
+                // no real block carries; the bt thread turns it into
+                // `failure_BT`, whose empty blocks put the lz thread on the
+                // C's `failureBuf`, which is safe to read for any number of
+                // positions.
+                // SAFETY: the `free` semaphore was taken above, so this block
+                // is this thread's until `filled` is released below.
+                let heads = unsafe { sh.common.hash_block(offset) };
+                heads[0] = 0;
+                heads[1] = 0;
             }
 
             p.filled.release1();
@@ -988,6 +1029,61 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
 
         p.was_stopped.set();
     }
+}
+
+/// One `hash_buf` block of `HashThreadFunc`'s loop: the heads for the next
+/// run of positions, or the end-of-stream header once the bytes run out.
+fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
+    let c = &sh.common;
+    let mut num = h.avail();
+
+    // C: "heads[1] contains the number of avail bytes: if (avail <
+    // mf->numHashBytes) it means that stream was finished [...]
+    // HASH_THREAD fills only the header (2 numbers) for all next
+    // blocks: {2, NumHashBytes - 1}, {2,0}, {2,0}, ..."
+    // SAFETY: the caller has just taken the `free` semaphore for this
+    // block, so it is this thread's until the caller releases `filled`.
+    let heads = unsafe { c.hash_block(offset) };
+    heads[0] = 2;
+    heads[1] = num;
+
+    if num >= c.num_hash_bytes {
+        num = num - c.num_hash_bytes + 1;
+        if num > HASH_BLOCK_SIZE - 2 {
+            num = HASH_BLOCK_SIZE - 2;
+        }
+
+        if h.pos > MT_MAX_VAL_FOR_NORMALIZE - num {
+            let sub_value = h.pos - c.history_size - 1;
+            // C: `MatchFinder_REDUCE_OFFSETS`.
+            h.pos -= sub_value;
+            h.stream_pos -= sub_value;
+            // SAFETY: the high hash is this thread's range.
+            let hash = unsafe { c.high_hash() };
+            crate::enc::lz_find::normalize3(sub_value, &mut hash[..=c.hash_mask as usize]);
+        }
+
+        heads[0] = 2 + num;
+        // SAFETY: the window below `stream_pos` is stable here:
+        // this thread is the only writer and is not writing, and
+        // `move_block` cannot run while this block is held.
+        let win = unsafe { c.win() };
+        // SAFETY: the high hash is this thread's range.
+        let hash = unsafe { c.high_hash() };
+        get_heads(
+            c.heads,
+            &win[h.buffer..],
+            h.pos,
+            hash,
+            c.hash_mask,
+            &mut heads[2..2 + num as usize],
+            &c.crc,
+        );
+    }
+
+    // C: "wrap over zero is allowed at the end of stream".
+    h.pos = h.pos.wrapping_add(num);
+    h.buffer += num as usize;
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,14 +1111,27 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
         return;
     }
 
+    #[cfg(test)]
+    tests::maybe_panic_in_bt(c.cyclic_buffer_size);
+
     while cur_pos < limit {
         if b.hash_buf_pos == b.hash_buf_pos_limit {
             let avail;
             {
                 let bi = sh.hash_sync.get_next_block();
+                // The window may have slid while `hash_sync.cs` was open.
+                sh.apply_bt_shift(b);
                 let k = hash_block_offset(bi) as u32;
                 // SAFETY: `get_next_block` has just handed this block over.
                 let h = unsafe { c.hash_all() };
+                if h[k as usize] < 2 {
+                    // The hash thread failed (see `hash_thread_func`). Not in
+                    // the C, whose hash thread cannot fail: handled as its
+                    // "internal data failure" below.
+                    b.failure = true;
+                    d[0] = 0;
+                    return;
+                }
                 avail = h[k as usize + 1];
                 b.hash_buf_pos_limit = k + h[k as usize];
                 b.hash_num_avail = avail;
@@ -1139,12 +1248,31 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
 }
 
 /// C: `BtFillBlock`.
+///
+/// A panic inside `BtGetMatches` is caught here and becomes the C's
+/// `failure_BT`: this block and every later one is handed over empty, which
+/// the lz thread takes as `failure_LZ_BT`. The buffer is still locked at that
+/// point - nothing between `get_next_block`'s unlock and its relock can panic
+/// - so the unlock below stays balanced.
 fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     let sync = &sh.hash_sync;
     if !MtSync::get(&sync.need_start) {
         sync.lock_buffer();
+        // The window may have slid while `hash_sync.cs` was open.
+        sh.apply_bt_shift(b);
     }
-    bt_get_matches(sh, b, bt_block_offset(global_block_index));
+    let block_offset = bt_block_offset(global_block_index);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bt_get_matches(sh, b, block_offset);
+    }));
+    if run.is_err() {
+        b.failure = true;
+        sh.thread_failed.store(true, Ordering::SeqCst);
+        // SAFETY: this block of `bt_buf` is still the bt thread's; `filled`
+        // is released only after this returns.
+        let bt = unsafe { sh.common.bt_all() };
+        bt[block_offset] = 0;
+    }
     // C: "We suppose that we have called GetNextBlock() from start. So buffer
     // is LOCKED".
     sync.unlock_buffer();
@@ -1292,6 +1420,7 @@ impl MatchFinderMt {
                 stream_pos: 0,
                 stream_end_was_reached: false,
                 result: Ok(()),
+                failed: false,
             }),
             bt_state: UnsafeCell::new(BtState {
                 hash_buf_pos: 0,
@@ -1312,6 +1441,9 @@ impl MatchFinderMt {
             }),
             hash_sync: MtSync::new(),
             bt_sync: MtSync::new(),
+            bt_shift: AtomicUsize::new(0),
+            lz_shift: AtomicUsize::new(0),
+            thread_failed: AtomicBool::new(false),
             _win: win,
             _tab: tab,
             _bufs: bufs,
@@ -1343,6 +1475,7 @@ impl MatchFinderMt {
             h.stream_pos = 1;
             h.result = Ok(());
             h.stream_end_was_reached = false;
+            h.failed = false;
 
             // C: `MatchFinder_Init_LowHash`.
             c.low_hash().fill(K_EMPTY_HASH_VALUE);
@@ -1368,6 +1501,9 @@ impl MatchFinderMt {
             // C: "1; // optimal smallest value".
             l.lz_pos = 1;
         }
+        sh.bt_shift.store(0, Ordering::SeqCst);
+        sh.lz_shift.store(0, Ordering::SeqCst);
+        sh.thread_failed.store(false, Ordering::SeqCst);
     }
 
     /// The handle [`with_threads`] needs to start the two producer threads.
@@ -1402,6 +1538,16 @@ impl MatchFinderMt {
         unsafe { (*self.shared().hash_state.get()).result }
     }
 
+    /// C: `p->matchFinderMt.failure_LZ_BT`, which `CheckErrors` turns into
+    /// an error, or a panic one of the producer threads caught.
+    pub(crate) fn failed(&self) -> bool {
+        self.sh.as_deref().is_some_and(|sh| {
+            // SAFETY: the lz thread owns `lz_state`.
+            let lz_bt = unsafe { (*sh.lz_state.get()).failure_lz_bt };
+            lz_bt || sh.thread_failed.load(Ordering::SeqCst)
+        })
+    }
+
     /// C: `MatchFinderMt_GetNextBlock_Bt`.
     fn get_next_block_bt(&mut self) -> u32 {
         let sh = self.shared();
@@ -1412,6 +1558,8 @@ impl MatchFinderMt {
             l.bt_buf_pos = BT_BUFFER_SIZE;
         } else {
             let bi = sh.bt_sync.get_next_block();
+            // The window may have slid while `bt_sync.cs` was open.
+            sh.apply_lz_shift(l);
             let base = bt_block_offset(bi);
             // SAFETY: `get_next_block` has just handed this block over, and
             // the lz thread holds it until the next call.
@@ -1744,4 +1892,115 @@ pub(crate) fn with_threads<T>(
         drop(run);
         r
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{MatchFinderMt, with_threads};
+    use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
+    use crate::enc::lz_find::MatchFinderKind;
+    use crate::enc::stream::{SeqInStream, SliceStream};
+    use crate::enc::{Lzma2Encoder, LzmaEncProps};
+    use crate::error::Error;
+
+    /// The `cyclicBufferSize` whose bt thread panics on purpose. Zero, the
+    /// default, matches nothing: a cyclic buffer is never empty. Keyed on a
+    /// size no other test uses, so that tests running alongside are not hit.
+    static BT_PANIC_AT_CBS: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn maybe_panic_in_bt(cyclic_buffer_size: u32) {
+        let at = BT_PANIC_AT_CBS.load(Ordering::SeqCst);
+        if at != 0 && at == cyclic_buffer_size {
+            panic!("injected panic on the bt thread");
+        }
+    }
+
+    /// A panic on the bt thread must come back to the caller as an error.
+    /// Before the bt thread caught it, the lz thread waited for a block the
+    /// dead thread would never fill, and the encode never returned.
+    #[test]
+    fn a_panic_on_the_bt_thread_returns_an_error() {
+        // A dictionary size nothing else in the suite asks for.
+        const DICT: u32 = 0x0001_2345;
+        BT_PANIC_AT_CBS.store(DICT + 1, Ordering::SeqCst);
+
+        let src: alloc::vec::Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let props = LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(DICT)
+            .with_num_threads(2);
+        let mut enc = Lzma2Encoder::new(&props).expect("encoder");
+        let mut out = alloc::vec::Vec::new();
+        let r = enc.encode_send(&mut SliceStream::new(&src), &mut out);
+        BT_PANIC_AT_CBS.store(0, Ordering::SeqCst);
+        assert!(r.is_err(), "a bt-thread panic was reported as success");
+    }
+
+    /// Hands out `ok` bytes in one read, then panics on the next one.
+    struct PanicAfter<'a> {
+        data: &'a [u8],
+        given: bool,
+    }
+
+    impl SeqInStream for PanicAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+            if self.given {
+                panic!("injected panic in the input stream");
+            }
+            assert!(
+                buf.len() >= self.data.len(),
+                "window smaller than the test input"
+            );
+            buf[..self.data.len()].copy_from_slice(self.data);
+            self.given = true;
+            Ok(self.data.len())
+        }
+    }
+
+    /// A panic in the input stream must not take back bytes the lz thread
+    /// was already promised.
+    ///
+    /// The first bt block's header promises every byte the hash thread had
+    /// read, and the encoder is entitled to consume that many positions -
+    /// `GetOptimum` looks ahead and `Skip`s on that count. The stream panics
+    /// on its second read, when some of those bytes are not hashed yet. The
+    /// hash thread used to hand the bt thread an orderly end of stream with
+    /// no bytes left, so the bt blocks stopped short of the promise and the
+    /// lz thread walked past the last published entry into words no thread
+    /// wrote this run: an out-of-bounds index on the encoder's match array,
+    /// seen on a Windows runner. The ring is poisoned first, so any such read
+    /// fails here on every platform and at every interleaving: what the bt
+    /// thread publishes depends only on the input, and the lz side consumes
+    /// the whole promise whatever the threads' timing.
+    #[test]
+    fn a_stream_panic_never_strands_the_lz_thread_past_the_published_blocks() {
+        let src: alloc::vec::Vec<u8> = (0..600_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 % 17)
+            .collect();
+        let mut mt = MatchFinderMt::new();
+        mt.mfb.kind = MatchFinderKind::Bt4;
+        mt.mfb.num_hash_bytes = 4;
+        mt.mfb.cut_value = 32;
+        mt.create(1 << 16, K_NUM_OPTS as u32, 273, LZMA_MATCH_LEN_MAX + 1)
+            .expect("create");
+        mt.init_mt().expect("init_mt");
+        mt.init();
+        // SAFETY: neither producer thread has been started.
+        unsafe { mt.shared().common.bt_all() }.fill(u32::MAX);
+
+        let sh = alloc::sync::Arc::clone(mt.shared_handle().expect("created"));
+        let mut input = PanicAfter {
+            data: &src,
+            given: false,
+        };
+        let r = with_threads(&sh, &mut input, || {
+            let promised = mt.get_num_available_bytes();
+            assert_eq!(promised as usize, src.len(), "first block's promise");
+            mt.skip(promised);
+            Ok(mt.failed())
+        });
+        assert_eq!(r, Ok(true), "the stream panic was not reported");
+    }
 }

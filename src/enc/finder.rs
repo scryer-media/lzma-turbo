@@ -212,6 +212,17 @@ impl Finder {
         }
     }
 
+    /// C: `p->matchFinderMt.failure_LZ_BT`, which `CheckErrors` reads only in
+    /// `mtMode`; for this port also a panic one of the finder's threads
+    /// caught.
+    pub(crate) fn mt_failed(&self) -> bool {
+        match self {
+            Finder::St(_) => false,
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.failed(),
+        }
+    }
+
     /// C: `mf->result`, the read error the window buffering saw.
     pub(crate) fn result(&self) -> Result<(), Error> {
         match self {

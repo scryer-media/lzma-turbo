@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lzma_turbo::xz::CheckType;
-use lzma_turbo::{LzmaEncProps, auto_block_size, encode_xz, encode_xz_mt};
+use lzma_turbo::{LzmaEncProps, encode_xz, encode_xz_mt};
 
 use crate::{human, median};
 
@@ -53,11 +53,22 @@ fn time_xz(preset: u32, threads: usize, data: &[u8]) -> Option<(Duration, u64)> 
         .then_some((dt, out.stdout.len() as u64))
 }
 
-/// The crate's settings for `xz -N`: `LzmaEncProps` normalizes a level the
-/// same way `LzmaEncProps_Normalize` does, which is what `xz` presets 0-9
-/// were chosen to match.
+/// The crate's settings for `xz -N`. `with_level(N)` is 7-Zip's level N,
+/// whose dictionary and match-finder depth differ from liblzma's preset N
+/// (level 1 is a 256 KiB dictionary where `xz -1` uses 1 MiB), so a row
+/// built on it compares two different encodes. `xz_preset` is liblzma's own
+/// table, which is what the oracle column runs.
 fn props_for(preset: u32) -> LzmaEncProps {
-    LzmaEncProps::new().with_level(preset)
+    LzmaEncProps::xz_preset(preset, false)
+        .unwrap_or_else(|e| crate::fail(&format!("preset {preset}: {e}")))
+}
+
+/// The block size `xz -T<n>` cuts at: liblzma's `lzma2_block_size`, three
+/// dictionaries and at least 1 MiB. 7-Zip's `auto_block_size` is four
+/// dictionaries, which would leave this side with fewer, larger blocks than
+/// the `xz` it is compared with (8 against 11 on 256 MiB at preset 5).
+pub(crate) fn xz_mt_block_size(dict_size: u32) -> u64 {
+    (u64::from(dict_size) * 3).max(1 << 20)
 }
 
 /// Compresses `data` once and returns how long it took and how big it came
@@ -73,7 +84,7 @@ fn time_ours(preset: u32, threads: usize, mf_threads: u32, data: &[u8]) -> (Dura
     let out = if threads <= 1 {
         encode_xz(data, &props, CheckType::Crc64, 0).expect("encode")
     } else {
-        let block = auto_block_size(props.normalized().dict_size);
+        let block = xz_mt_block_size(props.normalized().dict_size);
         encode_xz_mt(data, &props, CheckType::Crc64, block, &[], threads).expect("encode")
     };
     (t0.elapsed(), out.len() as u64)

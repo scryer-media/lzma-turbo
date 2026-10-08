@@ -26,6 +26,7 @@
 
 mod encode;
 mod sevenz;
+mod shot;
 mod xz;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -78,7 +79,8 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
                  segments every 16 MiB, so the row also shows what splitting
                  costs. This is the measurement that matters for a consumer:
                  a checksum computed by the worker is parallel, one computed
-                 by the sink runs inside the ring's serialised write section.";
+                 by the sink runs inside the ring's serialised write section.
+";
 
 fn main() {
     let mut runs = 3usize;
@@ -92,6 +94,11 @@ fn main() {
     let mut presets: Vec<u32> = Vec::new();
     let mut mf_threads = 1u32;
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut shot_lane: Option<String> = None;
+    let mut shot_preset = 6u32;
+    let mut shot_filter: Option<String> = None;
+    let mut shot_encode = false;
+    let mut shot_verify = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -115,6 +122,27 @@ fn main() {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| fail("--mf-threads needs a number"));
             }
+            "--shot" => {
+                shot_lane = Some(args.next().unwrap_or_else(|| fail("--shot needs a lane")));
+            }
+            "--preset" => {
+                shot_preset = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|p| *p <= 9)
+                    .unwrap_or_else(|| fail("--preset needs 0-9"));
+            }
+            "--filter" => {
+                shot_filter = Some(args.next().unwrap_or_else(|| fail("--filter needs a name")));
+            }
+            "--direction" => {
+                shot_encode = match args.next().as_deref() {
+                    Some("encode") => true,
+                    Some("decode") => false,
+                    _ => fail("--direction takes encode or decode"),
+                };
+            }
+            "--verify" => shot_verify = true,
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -136,7 +164,7 @@ fn main() {
                 threads = parse_threads(&v);
             }
             "-h" | "--help" => {
-                println!("{HELP}");
+                println!("{HELP}{}", shot::HELP);
                 return;
             }
             other if other.starts_with('-') => fail(&format!("unknown option {other}")),
@@ -144,8 +172,22 @@ fn main() {
         }
     }
 
+    if let Some(lane) = shot_lane {
+        // One measurement, one JSON line, nothing else on stdout.
+        let shot = shot::Shot {
+            lane,
+            threads: threads.first().copied().unwrap_or(1),
+            preset: shot_preset,
+            mf_threads,
+            filter: shot_filter,
+            encode: shot_encode,
+            verify: shot_verify,
+        };
+        std::process::exit(shot::run(&shot, files.first().map(PathBuf::as_path)));
+    }
+
     if files.is_empty() {
-        println!("{HELP}");
+        println!("{HELP}{}", shot::HELP);
         std::process::exit(2);
     }
 
@@ -199,8 +241,14 @@ fn run_index(path: &Path) {
     while let Some(r) = scanner.next_run() {
         if n < 8 {
             println!(
-                "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {}",
-                r.in_offset, r.packed_len, r.out_offset, r.unpacked_len, r.has_dict_reset
+                "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {} chunks lzma {} copy {}",
+                r.in_offset,
+                r.packed_len,
+                r.out_offset,
+                r.unpacked_len,
+                r.has_dict_reset,
+                r.chunks.lzma_chunks,
+                r.chunks.copy_chunks
             );
         }
         n += 1;
@@ -840,17 +888,22 @@ fn dict_size_from_prop(p: u8) -> u32 {
 /// way to hand its output over without someone consuming it.
 struct CrcWriter {
     crc: Crc32,
+    written: u64,
 }
 
 impl CrcWriter {
     fn new() -> Self {
-        CrcWriter { crc: Crc32::new() }
+        CrcWriter {
+            crc: Crc32::new(),
+            written: 0,
+        }
     }
 }
 
 impl Write for CrcWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.crc.update(buf);
+        self.written += buf.len() as u64;
         Ok(buf.len())
     }
 

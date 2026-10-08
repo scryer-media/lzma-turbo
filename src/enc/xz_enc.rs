@@ -7,8 +7,12 @@
 //! below names the spec section it comes from; the compressed data itself is
 //! the port in [`super::lzma2_enc`].
 //!
-//! What it writes is one stream: a header, one or more blocks each declaring
-//! both of its sizes, an index over them, and a footer. The filter chain is a
+//! What it writes is one stream: a header, one or more blocks, an index over
+//! them, and a footer. A block written from a buffer declares both of its
+//! sizes in its header; the one solid block of an input too long to hold is
+//! compressed as it arrives instead, so its header is written before either
+//! size is known and leaves them out, as spec §3.1.2 allows and `xz` itself
+//! does — the index still records both. The filter chain is a
 //! bare LZMA2 filter unless the caller asks for more with
 //! [`XzEncoder::set_filters`], in which case the delta and BCJ converters run
 //! over each block before LZMA2 sees it and the block header lists them in
@@ -19,11 +23,12 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::xz::filter::{FILTER_LZMA2, FilterChain, FilterFlags, MAX_FILTERS};
+use crate::xz::filter::{Converters, FILTER_LZMA2, FilterChain, FilterFlags, MAX_FILTERS};
 use crate::xz::stream::{CheckType, XZ_FOOTER_MAGIC, XZ_MAGIC};
 use crate::xz::vli;
 
 use super::lzma2_enc::Lzma2Encoder;
+use super::pipe::Lzma2Pipe;
 use super::props::LzmaEncProps;
 
 /// The default block size: what one block may decode to before the writer
@@ -68,6 +73,83 @@ fn compute_check(check: CheckType, data: &[u8], out: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
+/// One block's check, computed as its uncompressed bytes go by.
+enum RunningCheck {
+    None,
+    Crc32(crate::crc::Crc32),
+    Crc64(crate::crc::Crc64Xz),
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+    Sha256(crate::crypto::Sha256),
+}
+
+impl RunningCheck {
+    fn new(check: CheckType) -> Result<Self, Error> {
+        Ok(match check {
+            CheckType::None => RunningCheck::None,
+            CheckType::Crc32 => RunningCheck::Crc32(crate::crc::Crc32::new()),
+            CheckType::Crc64 => RunningCheck::Crc64(crate::crc::Crc64Xz::new()),
+            #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+            CheckType::Sha256 => RunningCheck::Sha256(crate::crypto::Sha256::new()),
+            #[cfg(not(any(feature = "crypto", feature = "native-crypto")))]
+            CheckType::Sha256 => return Err(Error::Param),
+            CheckType::Reserved(_) => return Err(Error::Param),
+        })
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            RunningCheck::None => {}
+            RunningCheck::Crc32(h) => h.update(data),
+            RunningCheck::Crc64(h) => h.update(data),
+            #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+            RunningCheck::Sha256(h) => h.update(data),
+        }
+    }
+
+    /// Appends the finished check, as [`compute_check`] would have.
+    fn finish(self, out: &mut Vec<u8>) {
+        match self {
+            RunningCheck::None => {}
+            RunningCheck::Crc32(h) => out.extend_from_slice(&h.finalize().to_le_bytes()),
+            RunningCheck::Crc64(h) => out.extend_from_slice(&h.finalize().to_le_bytes()),
+            #[cfg(any(feature = "crypto", feature = "native-crypto"))]
+            RunningCheck::Sha256(h) => out.extend_from_slice(&h.finalize()),
+        }
+    }
+}
+
+/// The solid block while it is being compressed as it arrives.
+///
+/// The header has gone out already, without sizes; the input is checked and
+/// run through the filters here, on the caller's thread, and the LZMA2 encoder
+/// pulls it from a [`Lzma2Pipe`]. Nothing here grows with the input.
+struct SolidStream {
+    pipe: Lzma2Pipe,
+    check: RunningCheck,
+    /// Fresh converters for the block, `None` for a bare LZMA2 chain.
+    convs: Option<Converters>,
+    /// What the converters made of the last write.
+    converted: Vec<u8>,
+    header_len: usize,
+    uncompressed: u64,
+}
+
+impl SolidStream {
+    fn push(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+        // §3.4: the check covers what came in, before the filters.
+        self.check.update(data);
+        self.uncompressed += data.len() as u64;
+        match &mut self.convs {
+            Some(convs) => {
+                self.converted.clear();
+                convs.encode_push(data, &mut self.converted);
+                self.pipe.write(&self.converted, out)
+            }
+            None => self.pipe.write(data, out),
+        }
+    }
+}
+
 /// Whether this build can compute `check` at all.
 fn check_supported(check: CheckType) -> bool {
     match check {
@@ -87,7 +169,20 @@ fn check_supported(check: CheckType) -> bool {
 pub struct XzEncoder {
     check: CheckType,
     block_size: u64,
-    lzma2: Lzma2Encoder,
+    /// `None` only once the solid block's stream has taken it.
+    lzma2: Option<Lzma2Encoder>,
+    /// The LZMA2 filter's dictionary property byte.
+    dict_prop: u8,
+    /// The most input the solid block holds before it starts streaming: the
+    /// dictionary. Up to that size the encoder is told the data size, which
+    /// it uses to shrink its hash table; past it the data size makes no
+    /// difference to the bytes, so they are what the buffered path writes.
+    solid_threshold: u64,
+    /// The solid block, once it is streaming.
+    stream: Option<SolidStream>,
+    /// Whether the solid block may stream at all: cleared for a caller that
+    /// hands over the whole input at once, and when no thread can be started.
+    may_stream: bool,
     /// Kept so that the block threads can each build their own encoder.
     props: LzmaEncProps,
     /// The non-last filters, in the order they are applied and listed, empty
@@ -123,10 +218,16 @@ impl XzEncoder {
     /// could not be allocated.
     pub fn new(props: &LzmaEncProps) -> Result<Self, Error> {
         let lzma2 = Lzma2Encoder::new(props)?;
+        let dict_prop = lzma2.properties();
+        let solid_threshold = u64::from(lzma2.dict_size());
         let mut enc = XzEncoder {
             check: CheckType::Crc64,
             block_size: DEFAULT_BLOCK_SIZE,
-            lzma2,
+            lzma2: Some(lzma2),
+            dict_prop,
+            solid_threshold,
+            stream: None,
+            may_stream: true,
             props: *props,
             filters: Vec::new(),
             pending: Vec::new(),
@@ -155,7 +256,7 @@ impl XzEncoder {
         if !check_supported(check) {
             return Err(Error::Param);
         }
-        if !self.records.is_empty() || !self.pending.is_empty() {
+        if self.started() {
             // The check type lives in the stream header, which is already
             // written and is repeated in the footer; changing it after bytes
             // have gone in would contradict it.
@@ -181,7 +282,7 @@ impl XzEncoder {
     /// filter this crate does not implement, or a misaligned BCJ start offset
     /// — or if bytes have already gone in.
     pub fn set_filters(&mut self, filters: &[FilterFlags]) -> Result<(), Error> {
-        if !self.records.is_empty() || !self.pending.is_empty() {
+        if self.started() {
             return Err(Error::Param);
         }
         if filters.len() >= MAX_FILTERS {
@@ -206,11 +307,27 @@ impl XzEncoder {
     /// The whole chain — the given filters plus this encoder's LZMA2 filter —
     /// validated the way [`crate::xz`] validates one it has just parsed.
     fn chain_for(&self, filters: &[FilterFlags]) -> Result<FilterChain, Error> {
-        chain_for_props(filters, self.lzma2.properties())
+        chain_for_props(filters, self.dict_prop)
+    }
+
+    /// Whether any input has gone in.
+    fn started(&self) -> bool {
+        !self.records.is_empty() || !self.pending.is_empty() || self.stream.is_some()
     }
 
     /// How much a single block may decode to before the writer starts
     /// another. Zero means the default (one block for everything).
+    ///
+    /// With the default, an input longer than the dictionary is compressed
+    /// as it arrives and never held: what the writer keeps is about the
+    /// encoder's own dictionary and tables, whatever the input's length. A
+    /// block size of its own bounds what is held to one block per thread
+    /// instead, and every block's header then declares both of its sizes.
+    ///
+    /// Set it before the first push. Once the single block has started
+    /// streaming, a new size has no effect: the rest of the input still goes
+    /// into that block. Input held before then becomes a block of its own,
+    /// however large, and the new size applies to what follows it.
     pub fn set_block_size(&mut self, bytes: u64) {
         self.block_size = if bytes == 0 {
             DEFAULT_BLOCK_SIZE
@@ -257,8 +374,36 @@ impl XzEncoder {
         if self.finished {
             return Err(Error::Param);
         }
+        // A streaming block takes the rest of the input whatever the block
+        // size says now: a size set after it started cannot split it.
+        if let Some(stream) = &mut self.stream {
+            return stream.push(data, &mut self.out);
+        }
+        if self.block_size == DEFAULT_BLOCK_SIZE && self.may_stream {
+            if self.stream.is_none() {
+                // Hold the input up to the dictionary; one byte past it and
+                // the block starts streaming.
+                let room = self
+                    .solid_threshold
+                    .saturating_sub(self.pending.len() as u64);
+                let take = core::cmp::min(room, data.len() as u64) as usize;
+                self.pending.try_reserve(take).map_err(|_| Error::Alloc)?;
+                self.pending.extend_from_slice(&data[..take]);
+                data = &data[take..];
+                if data.is_empty() {
+                    return Ok(());
+                }
+                self.start_stream()?;
+            }
+            if let Some(stream) = &mut self.stream {
+                return stream.push(data, &mut self.out);
+            }
+            // No thread could be started: hold everything, as before.
+        }
         while !data.is_empty() {
-            let room = self.block_size - self.pending.len() as u64;
+            // Input held under the default size can already be past a size
+            // set since; it is then a whole block, and the take is zero.
+            let room = self.block_size.saturating_sub(self.pending.len() as u64);
             let take = core::cmp::min(room, data.len() as u64) as usize;
             self.pending.try_reserve(take).map_err(|_| Error::Alloc)?;
             self.pending.extend_from_slice(&data[..take]);
@@ -296,6 +441,7 @@ impl XzEncoder {
         if self.queue.is_empty() {
             return Ok(());
         }
+        let dict_prop = self.dict_prop;
         let want = self.queue.len();
         while self.pool.len() < want {
             self.pool.try_reserve(1).map_err(|_| Error::Alloc)?;
@@ -303,7 +449,7 @@ impl XzEncoder {
             self.pool.push(enc);
         }
 
-        let (check, filters, dict_prop) = (self.check, &self.filters, self.lzma2.properties());
+        let (check, filters) = (self.check, &self.filters);
         let queue = core::mem::take(&mut self.queue);
         let mut done: Vec<Result<Block, Error>> = Vec::new();
         done.try_reserve_exact(want).map_err(|_| Error::Alloc)?;
@@ -337,6 +483,11 @@ impl XzEncoder {
         if self.finished {
             return Err(Error::Param);
         }
+        if let Some(stream) = self.stream.take() {
+            self.finish_stream(stream)?;
+        }
+        // Empty once a stream has started, which takes everything held; never
+        // skipped on that account, so no input can be left out of the file.
         if !self.pending.is_empty() {
             self.block_ready()?;
         }
@@ -368,13 +519,90 @@ impl XzEncoder {
     /// the check.
     fn emit_block(&mut self) -> Result<(), Error> {
         let data = core::mem::take(&mut self.pending);
-        let dict_prop = self.lzma2.properties();
-        let block = compress_block(&mut self.lzma2, self.check, &self.filters, dict_prop, data)?;
+        let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
+        let block = compress_block(lzma2, self.check, &self.filters, self.dict_prop, data)?;
         // Keep the block's buffer for the next one; the filters worked in
         // place, so it is the right size already.
         self.pending = core::mem::take(&mut self.spare);
         self.pending.clear();
         self.append_block(block)
+    }
+
+    /// Starts compressing the solid block as it arrives: writes its header,
+    /// hands the encoder to a [`Lzma2Pipe`], and feeds it what has been held
+    /// so far.
+    ///
+    /// If no thread can be started the encoder comes back, nothing is
+    /// written, and the block is held and compressed at the end as before.
+    fn start_stream(&mut self) -> Result<(), Error> {
+        // Whole blocks queued under an earlier block size come first: the
+        // streaming block writes straight into the output from here on.
+        #[cfg(feature = "std")]
+        self.flush_queue()?;
+        let lzma2 = self.lzma2.take().ok_or(Error::InternalFailure)?;
+        let pipe = match Lzma2Pipe::start(lzma2) {
+            Ok(pipe) => pipe,
+            Err(lzma2) => {
+                self.lzma2 = Some(*lzma2);
+                self.may_stream = false;
+                return Ok(());
+            }
+        };
+        let convs = if self.filters.is_empty() {
+            None
+        } else {
+            let chain = self.chain_for(&self.filters)?;
+            Some(chain.build().map_err(|_| Error::Param)?)
+        };
+        let header = block_header(&self.filters, self.dict_prop, None)?;
+        self.out
+            .try_reserve(header.len())
+            .map_err(|_| Error::Alloc)?;
+        self.out.extend_from_slice(&header);
+        let mut stream = SolidStream {
+            pipe,
+            check: RunningCheck::new(self.check)?,
+            convs,
+            converted: Vec::new(),
+            header_len: header.len(),
+            uncompressed: 0,
+        };
+        let held = core::mem::take(&mut self.pending);
+        self.spare = Vec::new();
+        stream.check.update(&held);
+        stream.uncompressed = held.len() as u64;
+        let feed = match &mut stream.convs {
+            Some(convs) => {
+                let mut converted = Vec::new();
+                converted
+                    .try_reserve_exact(held.len())
+                    .map_err(|_| Error::Alloc)?;
+                convs.encode_push(&held, &mut converted);
+                converted
+            }
+            None => held,
+        };
+        stream.pipe.write_owned(feed, &mut self.out)?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    /// Ends the streaming solid block: flushes the filters, waits for the
+    /// encoder, then pads, appends the check, and records the block.
+    fn finish_stream(&mut self, mut stream: SolidStream) -> Result<(), Error> {
+        if let Some(convs) = &mut stream.convs {
+            stream.converted.clear();
+            convs.encode_finish(&[], &mut stream.converted);
+            stream.pipe.write(&stream.converted, &mut self.out)?;
+        }
+        let compressed = stream.pipe.finish(&mut self.out)?;
+        // §3.2 Block Padding, over the compressed size.
+        pad_to_four(&mut self.out, (compressed % 4) as usize);
+        stream.check.finish(&mut self.out);
+        let unpadded = stream.header_len as u64 + compressed + check_size(self.check) as u64;
+        self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
+        self.records.push((unpadded, stream.uncompressed));
+        Ok(())
     }
 
     /// Appends one already-compressed block and records it for the index.
@@ -498,7 +726,11 @@ fn compress_block(
     lzma2.set_data_size(uncompressed);
     let compressed = lzma2.encode_to_vec(&data)?;
 
-    let header = block_header(filters, dict_prop, compressed.len() as u64, uncompressed)?;
+    let header = block_header(
+        filters,
+        dict_prop,
+        Some((compressed.len() as u64, uncompressed)),
+    )?;
     let unpadded = header.len() + compressed.len() + check_size(check);
     Ok(Block {
         header,
@@ -518,24 +750,27 @@ fn pad_to_four(out: &mut Vec<u8>, written: usize) {
 
 /// Builds one block header. Spec §3.1.
 ///
-/// Both sizes are declared, which a decoder is required to check the block
-/// against, and the filter chain is the single LZMA2 filter with its one
-/// dictionary property byte (§5.3.1).
+/// `sizes` is `(compressed, uncompressed)` when they are known, which a
+/// decoder is then required to check the block against; a block compressed as
+/// it arrives has neither yet and leaves both out (§3.1.2), and the index
+/// carries them instead. The filter chain is the given filters and then the
+/// LZMA2 filter with its one dictionary property byte (§5.3.1).
 fn block_header(
     filters: &[FilterFlags],
     dict_prop: u8,
-    compressed: u64,
-    uncompressed: u64,
+    sizes: Option<(u64, u64)>,
 ) -> Result<Vec<u8>, Error> {
-    // §3.1.2 Block Flags: filter count minus one in bits 0-1, and the two
-    // size-present bits.
-    let flags = 0x40 | 0x80 | filters.len() as u8;
-
-    let mut body = 2
-        + vli::encoded_len(compressed)
-        + vli::encoded_len(uncompressed)
-        + 3 // the LZMA2 filter: id, property size, the property byte
-        ;
+    // §3.1.2 Block Flags: filter count in bits 0-1, and the two size-present
+    // bits. The filter count is stored less one, and `filters` leaves LZMA2
+    // out, so it is the stored value as it stands.
+    let mut flags = filters.len() as u8;
+    // The size and flags bytes, then the LZMA2 filter: its id, its property
+    // size, and the property byte.
+    let mut body = 2 + 3;
+    if let Some((compressed, uncompressed)) = sizes {
+        flags |= 0x40 | 0x80;
+        body += vli::encoded_len(compressed) + vli::encoded_len(uncompressed);
+    }
     for f in filters {
         body += vli::encoded_len(f.id) + vli::encoded_len(f.props_len as u64) + f.props_len;
     }
@@ -549,8 +784,10 @@ fn block_header(
     // §3.1.1: the stored size is the real size in four-byte units, less one.
     h.push((size / 4 - 1) as u8);
     h.push(flags);
-    vli::push(compressed, &mut h);
-    vli::push(uncompressed, &mut h);
+    if let Some((compressed, uncompressed)) = sizes {
+        vli::push(compressed, &mut h);
+        vli::push(uncompressed, &mut h);
+    }
     // §3.1.5: the filters in the order the encoder applied them, LZMA2 last.
     for f in filters {
         vli::push(f.id, &mut h);
@@ -628,6 +865,9 @@ pub fn encode_xz_mt(
     enc.set_filters(filters)?;
     enc.set_block_size(block_size);
     enc.set_threads(threads);
+    // The whole input is in memory already, so the solid block is compressed
+    // from it with its sizes known, and declares them, rather than streamed.
+    enc.may_stream = false;
     enc.push(src)?;
     enc.finish()?;
     Ok(enc.take_output())
@@ -702,7 +942,7 @@ mod tests {
 
     #[test]
     fn a_block_header_is_a_multiple_of_four_and_carries_its_crc() {
-        let h = block_header(&[], 20, 1234, 65536).expect("header");
+        let h = block_header(&[], 20, Some((1234, 65536))).expect("header");
         assert!(h.len().is_multiple_of(4));
         assert_eq!(h[0] as usize, h.len() / 4 - 1);
         // §3.1.2: one filter, so the count bits are zero.
@@ -715,7 +955,7 @@ mod tests {
     fn a_filtered_block_header_lists_its_filters_in_order() {
         let delta = FilterFlags::new(crate::xz::filter::FILTER_DELTA, &[3]).expect("props");
         let bcj = FilterFlags::new(crate::xz::bcj::BcjKind::X86.filter_id(), &[]).expect("props");
-        let h = block_header(&[delta, bcj], 20, 1234, 65536).expect("header");
+        let h = block_header(&[delta, bcj], 20, Some((1234, 65536))).expect("header");
         assert!(h.len().is_multiple_of(4));
         // §3.1.2: three filters in the chain, so the count bits hold two.
         assert_eq!(h[1], 0xC2);
