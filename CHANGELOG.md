@@ -38,6 +38,22 @@
   header carries the uncompressed size.
 - Where no thread can be started, both writers fall back to holding the input
   and compressing it on `finish`.
+- `LzmaPushEncoder` and `Lzma2PushEncoder`: raw LZMA and solid LZMA2 encoders
+  that are pushed their input in slices of any size and finished once, with
+  no thread, so a `wasm32` guest or any other single-threaded writer can
+  stream instead of holding its input. They run the encoder's own block loop
+  (`LzmaEnc_CodeOneBlock`, one LZMA2 chunk per `Lzma2EncInt_EncodeSubblock`)
+  only while a bounded queue holds more than that call can advance plus the
+  match finder's look-ahead, so the finder never runs dry mid-stream; a read
+  from an empty queue before `finish` is an internal failure, not the end of
+  the input. Memory is the encoder's window and tables plus a 192 KiB queue
+  for LZMA or one 2 MiB chunk and 64 KiB for LZMA2, whatever the input's
+  length. The bytes are exactly `LzmaEncoder::encode`'s and
+  `Lzma2Encoder::encode`'s over the whole input with the same settings and no
+  announced size; tests compare them across lengths that straddle the queue
+  depth, the look-ahead and several 2 MiB chunks, for empty input and for
+  slices of one to seven bytes. The match finder is always the
+  single-threaded one, which finds the same matches.
 - `XzEncoder::set_block_size` (and `XzWriter`'s) called after input has gone
   in no longer loses any of it. Once the single block was streaming, input
   pushed after a new size was set was held for a block of its own and then

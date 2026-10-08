@@ -19,6 +19,7 @@ mod mt_coder;
 mod pipe;
 mod price;
 mod props;
+mod push;
 mod range_enc;
 mod stream;
 #[cfg(feature = "std")]
@@ -37,6 +38,7 @@ pub use lzma2_enc::{
     BLOCK_SIZE_AUTO, BLOCK_SIZE_SOLID, Lzma2Encoder, auto_block_size, encode_lzma2, encode_lzma2_mt,
 };
 pub use props::{LzmaEncProps, NormalizedProps};
+pub use push::{Lzma2PushEncoder, LzmaPushEncoder};
 pub use stream::{SeqInStream, SeqOutStream, SliceStream};
 #[cfg(feature = "xz")]
 pub use write::XzWriter;

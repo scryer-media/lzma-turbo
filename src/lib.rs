@@ -65,9 +65,9 @@ pub mod xz;
 #[cfg(feature = "enc")]
 pub use enc::{
     BLOCK_SIZE_AUTO, BLOCK_SIZE_SOLID, LZMA_MATCH_LEN_MAX, LZMA_MATCH_LEN_MIN, Lzma2Encoder,
-    Lzma2Writer, LzmaEncProps, LzmaEncoder, LzmaWriter, MatchFinderKind, NormalizedProps,
-    SeqInStream, SeqOutStream, SliceStream, auto_block_size, encode_lzma_alone, encode_lzma2,
-    encode_lzma2_mt,
+    Lzma2PushEncoder, Lzma2Writer, LzmaEncProps, LzmaEncoder, LzmaPushEncoder, LzmaWriter,
+    MatchFinderKind, NormalizedProps, SeqInStream, SeqOutStream, SliceStream, auto_block_size,
+    encode_lzma_alone, encode_lzma2, encode_lzma2_mt,
 };
 /// The `.xz` writer, behind the `xz` feature.
 #[cfg(all(feature = "enc", feature = "xz"))]
