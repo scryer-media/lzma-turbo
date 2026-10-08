@@ -816,7 +816,7 @@ struct Flaky {
 impl Write for Flaky {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.calls += 1;
-        if self.armed.get() && self.calls % 3 == 0 {
+        if self.armed.get() && self.calls.is_multiple_of(3) {
             return Err(std::io::Error::other("refused"));
         }
         let n = buf.len().min(4000);
