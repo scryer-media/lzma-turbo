@@ -1738,6 +1738,17 @@ impl LzmaEnc {
     // Allocation and initialization.
     // -----------------------------------------------------------------------
 
+    /// Whether the threaded match finder is the one this configuration uses.
+    ///
+    /// C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`.
+    /// Never true without `std`, where there is no threaded finder.
+    fn mt_mode(&mut self) -> bool {
+        cfg!(feature = "std")
+            && self.multi_thread
+            && !self.fast_mode
+            && self.mf.cfg().kind.bt_mode()
+    }
+
     /// C: `LzmaEnc_Alloc`.
     fn alloc(&mut self, keep_window_size: u32) -> Result<(), Error> {
         {
@@ -1759,11 +1770,9 @@ impl LzmaEnc {
             }
         }
 
-        // C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`.
         #[cfg(feature = "std")]
         {
-            let bt = self.mf.cfg().kind.bt_mode();
-            if self.multi_thread && !self.fast_mode && bt {
+            if self.mt_mode() {
                 self.mf.make_mt();
             } else {
                 self.mf.make_st();
@@ -1795,8 +1804,9 @@ impl LzmaEnc {
     }
 
     /// What one encoder of this configuration is estimated to need, in bytes:
-    /// the match finder's window and reference tables plus the literal
-    /// probability arrays. Nothing is allocated.
+    /// the match finder's window and reference tables, the threaded finder's
+    /// `hashBuf` and `btBuf` when that is the finder `LzmaEnc_Alloc` will
+    /// pick, plus the literal probability arrays. Nothing is allocated.
     ///
     /// C: 7-Zip computes the same quantity outside `C/` to reduce the block
     /// thread count to a memory budget; the arithmetic here is this port's own
@@ -1815,9 +1825,11 @@ impl LzmaEnc {
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
+        let mt = self.mt_mode();
         let mf = self
             .mf
             .mem_usage(
+                mt,
                 dict_size,
                 before_size,
                 self.num_fast_bytes,
@@ -1825,6 +1837,14 @@ impl LzmaEnc {
             )
             .unwrap_or(0);
         mf.saturating_add(lit_probs)
+    }
+
+    /// What this encoder has allocated, in bytes: the match finder's buffers
+    /// and both literal probability arrays.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self) -> u64 {
+        let lit = self.lit_probs.len() + self.save_state.lit_probs.len();
+        self.mf.allocated() + (lit * core::mem::size_of::<u16>()) as u64
     }
 
     /// C: `LzmaEnc_Init`.

@@ -486,6 +486,12 @@ impl MatchFinder {
         Ok(u64::from(plan.block_size) + (plan.num_refs as u64) * 4)
     }
 
+    /// What this finder has allocated, in bytes: the window and the tables.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self) -> u64 {
+        self.buf_base.len() as u64 + self.hash.len() as u64 * 4
+    }
+
     /// C: `MatchFinder_Create`.
     pub(crate) fn create(
         &mut self,
