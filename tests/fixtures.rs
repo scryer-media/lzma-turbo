@@ -288,6 +288,7 @@ impl std::io::Write for CrcSink {
 #[cfg(feature = "std")]
 impl CrcSink {
     /// The CRC of everything written, consuming the sink.
+    #[cfg_attr(not(feature = "crc"), allow(unused_mut))]
     fn finish(mut self) -> u32 {
         #[cfg(feature = "crc")]
         {
@@ -324,6 +325,7 @@ struct RefSink {
     segments: Vec<(u64, u64, u32, u64)>,
     #[cfg(any(feature = "crypto", feature = "native-crypto"))]
     sha: Option<lzma_turbo::crypto::Sha256>,
+    #[cfg(any(feature = "crypto", feature = "native-crypto"))]
     digests: Vec<(u64, u64, [u8; 32])>,
     sha_start: u64,
 }
