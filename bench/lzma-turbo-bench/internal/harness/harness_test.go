@@ -381,3 +381,39 @@ func TestAMissingFixtureSkipsTheScenario(t *testing.T) {
 		t.Errorf("skipped = %+v, runs = %d", raw.Skipped, len(raw.Runs))
 	}
 }
+
+// A contender that fails its warmup never reaches a measured pass, so the
+// warmup's failure is the only one there is: it must fail the report rather
+// than drop the row.
+func TestAWarmupFailureFailsTheReport(t *testing.T) {
+	raw := syntheticRaw("host-a", 1, 2, 30<<20, 10<<20)
+	warmup := RunRecord{Scenario: "decode/xz/p256", Contender: "lzma-turbo", Role: RoleOurs, Repeat: -1, Warmup: true,
+		Status: StatusFailed, Failure: "crc-mismatch", Reason: "output CRC-32 00000000, want 12345678"}
+	var kept []RunRecord
+	for _, run := range raw.Runs {
+		if run.Contender != "lzma-turbo" {
+			kept = append(kept, run)
+		}
+	}
+	raw.Runs = append([]RunRecord{warmup}, kept...)
+	report := BuildReport(raw)
+	if report.OK() {
+		t.Fatal("a warmup failure did not fail the report")
+	}
+	if len(report.Rows) != 1 || report.Rows[0].Status != StatusFailed {
+		t.Fatalf("rows = %+v", report.Rows)
+	}
+	if len(report.Rows[0].Ratios) != 0 {
+		t.Errorf("a failed contender has ratios: %+v", report.Rows[0].Ratios)
+	}
+
+	// A passing warmup still counts for nothing in the figures.
+	raw = syntheticRaw("host-a", 1, 2, 30<<20, 10<<20)
+	fast := raw.Runs[0]
+	fast.Warmup, fast.Repeat, fast.WallSeconds = true, -1, 100
+	raw.Runs = append(raw.Runs, fast)
+	report = BuildReport(raw)
+	if !report.OK() || report.Rows[0].Contenders[0].Runs != 3 || *report.Rows[0].Ratios[0].Speedup != 2 {
+		t.Errorf("a passing warmup changed the figures: %+v", report.Rows[0])
+	}
+}
