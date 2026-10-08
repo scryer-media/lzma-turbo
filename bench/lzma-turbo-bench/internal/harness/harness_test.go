@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -480,5 +481,41 @@ func TestAStaleLzmaBenchIsRefused(t *testing.T) {
 		if got := stale(c.info, c.crate, c.built); (got == "") != c.ok {
 			t.Errorf("%s: stale = %q, want ok=%v", c.name, got, c.ok)
 		}
+	}
+}
+
+// An oracle named relative to the caller's directory must still be found
+// from the fixtures directory, where the measured commands run.
+func TestRelativeOracleOverridesBecomeAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "bin", "my-xz")
+	if err := os.MkdirAll(filepath.Dir(tool), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\necho 'xz (XZ Utils) 5.8.1'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	rel := filepath.Join(".", "bin", "my-xz")
+	for _, name := range []string{"LZMA_TURBO_XZ", "LZMA_TURBO_7ZZ", "LZMA_TURBO_7LZMA"} {
+		t.Setenv(name, rel)
+		got := envPath(name)
+		if !filepath.IsAbs(got) {
+			t.Errorf("%s=%s resolved to %q, not an absolute path", name, rel, got)
+		}
+		if _, err := os.Stat(got); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		if xz := resolveXZ(context.Background()); !filepath.IsAbs(xz.Path) || xz.Version != "xz (XZ Utils) 5.8.1" {
+			t.Errorf("resolveXZ = %+v", xz)
+		}
+	}
+	// A bare name is the shell's: looked up on PATH.
+	t.Setenv("PATH", filepath.Join(dir, "bin"))
+	t.Setenv("LZMA_TURBO_XZ", "my-xz")
+	if got := envPath("LZMA_TURBO_XZ"); filepath.Base(got) != "my-xz" || filepath.Dir(got) != filepath.Join(dir, "bin") {
+		t.Errorf("a bare name resolved to %q", got)
 	}
 }

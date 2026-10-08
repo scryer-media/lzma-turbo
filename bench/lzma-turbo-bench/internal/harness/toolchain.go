@@ -271,9 +271,30 @@ func lookPath(names ...string) (string, string) {
 	return "", ""
 }
 
+// envPath is an override from the environment as an absolute path: the
+// measured commands run in the fixtures directory, where a path relative to
+// the caller's would name nothing. A bare name is looked up on PATH, as the
+// shell would; one that is not there is made absolute all the same, so it
+// fails as missing rather than resolving somewhere else later.
+func envPath(name string) string {
+	path := os.Getenv(name)
+	if path == "" {
+		return ""
+	}
+	if !strings.ContainsRune(path, filepath.Separator) && !strings.ContainsRune(path, '/') {
+		if found, err := exec.LookPath(path); err == nil {
+			path = found
+		}
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return path
+}
+
 func resolveXZ(ctx context.Context) Tool {
 	tool := Tool{Name: "xz"}
-	path, provenance := os.Getenv("LZMA_TURBO_XZ"), "env LZMA_TURBO_XZ"
+	path, provenance := envPath("LZMA_TURBO_XZ"), "env LZMA_TURBO_XZ"
 	if path == "" {
 		path, _ = lookPath("xz")
 		provenance = "PATH"
@@ -300,7 +321,7 @@ func resolveXZ(ctx context.Context) Tool {
 // binaries are 7z.exe and 7za.exe, so those are accepted there; elsewhere a
 // `7z` on PATH is usually p7zip, a fork frozen at 16.02, and is not.
 func resolve7zz(ctx context.Context, paths Paths) Tool {
-	if path := os.Getenv("LZMA_TURBO_7ZZ"); path != "" {
+	if path := envPath("LZMA_TURBO_7ZZ"); path != "" {
 		return describe7zz(ctx, path, "env LZMA_TURBO_7ZZ")
 	}
 	pinned := filepath.Join(paths.Repo, "target", "sevenzip", "7zz")
@@ -339,7 +360,7 @@ func describe7zz(ctx context.Context, path, provenance string) Tool {
 
 func resolve7lzma(ctx context.Context) Tool {
 	tool := Tool{Name: "7lzma"}
-	path, provenance := os.Getenv("LZMA_TURBO_7LZMA"), "env LZMA_TURBO_7LZMA"
+	path, provenance := envPath("LZMA_TURBO_7LZMA"), "env LZMA_TURBO_7LZMA"
 	if path == "" {
 		path, _ = lookPath("7lzma")
 		provenance = "PATH"
