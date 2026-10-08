@@ -134,6 +134,10 @@ func BuildReport(raw *Raw) *Report {
 	for _, s := range raw.Skipped {
 		skipped[s.Scenario] = true
 	}
+	dropped := map[string]bool{}
+	for _, d := range raw.Dropped {
+		dropped[d.Scenario+"\x00"+d.Contender] = true
+	}
 	for _, scenario := range raw.Scenarios {
 		if skipped[scenario.ID] {
 			continue
@@ -166,7 +170,8 @@ func BuildReport(raw *Raw) *Report {
 			}
 			row.Contenders = append(row.Contenders, summary)
 		}
-		if len(row.Contenders) == 0 {
+		incomplete(report, &row, scenario, dropped, raw.Settings.Repeats)
+		if len(row.Contenders) == 0 && row.Status == StatusOK {
 			continue
 		}
 		row.Load = stat(loads)
@@ -213,15 +218,50 @@ func BuildReport(raw *Raw) *Report {
 	return report
 }
 
+// incomplete fails a row any of whose contenders has fewer measured runs
+// than the settings asked for and no failure to account for it: a run that
+// was interrupted, or a raw.json missing records. Without this such a row
+// would just be thinner, or absent, and the report would still pass. A
+// contender the host dropped, or one left unrun because lzma-turbo stopped,
+// is accounted for already.
+func incomplete(report *Report, row *Row, scenario Scenario, dropped map[string]bool, repeats int) {
+	measured := map[string]int{}
+	for _, c := range row.Contenders {
+		if c.Status != StatusOK {
+			if c.Role == RoleOurs {
+				return
+			}
+			// Its failure or DNF is the row's account of it.
+			measured[c.Name] = repeats
+			continue
+		}
+		measured[c.Name] = c.Runs
+	}
+	for _, contender := range scenario.Contenders {
+		runs := measured[contender.Name]
+		if dropped[scenario.ID+"\x00"+contender.Name] || runs >= repeats {
+			continue
+		}
+		reason := fmt.Sprintf("incomplete: %d of %d measured runs (the run was interrupted or its records are missing)", runs, repeats)
+		report.Failures = append(report.Failures, fmt.Sprintf("%s %s: %s", scenario.ID, contender.Name, reason))
+		if row.Status == StatusOK {
+			row.Status, row.Reason = StatusFailed, reason
+		}
+	}
+}
+
 func summarize(scenario Scenario, contender Contender, runs []RunRecord, payload int64) ContenderSummary {
 	summary := ContenderSummary{Name: contender.Name, Role: contender.Role, Status: StatusOK, Command: runs[0].Command}
 	var seconds, wall, cpu, rss []float64
 	var sources []string
-	var bytesOut []float64
+	var bytesOut, verifiedOut []float64
 	for _, run := range runs {
 		if run.Status != StatusOK {
 			summary.Status, summary.Reason = run.Status, run.Reason
 			continue
+		}
+		if run.Verify && run.BytesOut > 0 {
+			verifiedOut = append(verifiedOut, float64(run.BytesOut))
 		}
 		if run.Warmup || run.Verify {
 			continue
@@ -251,6 +291,11 @@ func summarize(scenario Scenario, contender Contender, runs []RunRecord, payload
 	summary.Seconds, summary.Wall, summary.CPU, summary.MaxRSS = stat(seconds), stat(wall), stat(cpu), stat(rss)
 	summary.MaxRSSBytes = int64(summary.MaxRSS.Median)
 	summary.RSSSource = procmeasure.JoinSources(sources)
+	// A reference whose output only an untimed size run counted (an xz
+	// encode, timed writing to the null device) has its size from there.
+	if len(bytesOut) == 0 {
+		bytesOut = verifiedOut
+	}
 	summary.BytesOut = int64(stat(bytesOut).Median)
 	if summary.Seconds.Median > 0 && payload > 0 {
 		summary.MiBPerSecond = float64(payload) / (1 << 20) / summary.Seconds.Median

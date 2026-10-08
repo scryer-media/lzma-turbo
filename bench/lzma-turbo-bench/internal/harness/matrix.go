@@ -25,7 +25,7 @@ const (
 // Stdout handling for a contender.
 const (
 	StdoutDiscard = ""      // os.DevNull, or nothing written (7zz t)
-	StdoutCount   = "count" // piped and counted: an encoder's output size
+	StdoutCount   = "count" // the null device when timed; piped and counted in one untimed size run
 	StdoutLine    = "line"  // captured: a shot's JSON line
 )
 
@@ -141,6 +141,13 @@ func DefaultMatrixOptions(quick bool) MatrixOptions {
 	return p.Matrix
 }
 
+// SetThreads makes threads the whole sweep, the multi-threaded encodes'
+// included: a profile's wider encode sweep must not outlive an explicit
+// --threads.
+func (o *MatrixOptions) SetThreads(threads []int) {
+	o.Threads, o.MTThreads = threads, nil
+}
+
 // PlanCounts are what a matrix will cost: scenarios that will run, the
 // report rows they produce (one per contender), and the processes launched
 // at the given repeats and warmups.
@@ -159,6 +166,13 @@ func Plan(scenarios []Scenario, repeats, warmups int) PlanCounts {
 		c.Scenarios++
 		c.Rows += len(s.Contenders)
 		c.Processes += len(s.Contenders) * (repeats + warmups)
+		// Execute's untimed runs: a decode's verify shots, and the size run
+		// of an output only a pipe can count.
+		for _, contender := range s.Contenders {
+			if (s.Direction == "decode" && s.Source != "" && contender.Kind == KindShot) || contender.Stdout == StdoutCount {
+				c.Processes++
+			}
+		}
 	}
 	return c
 }

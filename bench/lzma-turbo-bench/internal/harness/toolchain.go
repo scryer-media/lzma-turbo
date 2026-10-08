@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -292,6 +293,23 @@ func envPath(name string) string {
 	return path
 }
 
+// runnable says why path is not a program to run, or nil. An override is
+// taken as given, so without this a mistyped one would resolve as found and
+// fail only as each of its rows' DNFs.
+func runnable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return errors.New("a directory, not a program")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return errors.New("not executable")
+	}
+	return nil
+}
+
 func resolveXZ(ctx context.Context) Tool {
 	tool := Tool{Name: "xz"}
 	path, provenance := envPath("LZMA_TURBO_XZ"), "env LZMA_TURBO_XZ"
@@ -304,6 +322,10 @@ func resolveXZ(ctx context.Context) Tool {
 		return tool
 	}
 	tool.Path, tool.Provenance = path, provenance
+	if err := runnable(path); err != nil {
+		tool.Missing = fmt.Sprintf("%s (%s): %v", path, provenance, err)
+		return tool
+	}
 	tool.Version = firstLine(combined(ctx, path, "--version"))
 	tool.SHA256 = fileSHA256(path)
 	for _, f := range xzFilters {
@@ -370,6 +392,10 @@ func resolve7lzma(ctx context.Context) Tool {
 		return tool
 	}
 	tool.Path, tool.Provenance = path, provenance
+	if err := runnable(path); err != nil {
+		tool.Missing = fmt.Sprintf("%s (%s): %v", path, provenance, err)
+		return tool
+	}
 	tool.Version = firstLine(combined(ctx, path))
 	tool.SHA256 = fileSHA256(path)
 	return tool

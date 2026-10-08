@@ -227,10 +227,18 @@ func cmdRun(ctx context.Context, args []string) int {
 		return exitUsage
 	}
 	matrix := defaults.Matrix
+	if *threads != "" {
+		sweep, err := harness.ParseInts(*threads)
+		if err != nil {
+			logf("%v", err)
+			return exitUsage
+		}
+		matrix.SetThreads(sweep)
+	}
 	for _, f := range []struct {
 		text string
 		into *[]int
-	}{{*threads, &matrix.Threads}, {*presets, &matrix.Presets}, {*mtPresets, &matrix.MTPresets}} {
+	}{{*presets, &matrix.Presets}, {*mtPresets, &matrix.MTPresets}} {
 		if f.text != "" {
 			if *f.into, err = harness.ParseInts(f.text); err != nil {
 				logf("%v", err)

@@ -231,6 +231,16 @@ func Execute(ctx context.Context, options RunOptions) (*Raw, error) {
 				keep(record, contender, " (verify)")
 			}
 		}
+		// An output only a pipe can count is sized in a run of its own, so
+		// the timed runs write to the null device as lzma-turbo's count does.
+		for position, contender := range contenders {
+			if contender.Stdout != StdoutCount {
+				continue
+			}
+			record := runOne(ctx, options, scenario, contender, null, "", true)
+			record.Repeat, record.Verify, record.Position = -1, true, position
+			keep(record, contender, " (size)")
+		}
 		total := options.Settings.Warmups + options.Settings.Repeats
 		for pass := 0; pass < total && stopped[scenario.Ours().Name] == ""; pass++ {
 			warmup := pass < options.Settings.Warmups
@@ -372,7 +382,14 @@ func runOne(ctx context.Context, options RunOptions, scenario Scenario, contende
 	case StdoutDiscard:
 		cmd.Stdout = null
 	case StdoutCount:
-		cmd.Stdout = &counter
+		// Counted only in the untimed size run: through a pipe the timed
+		// runs would charge the reference a copy lzma-turbo's in-process
+		// count never makes.
+		if verify {
+			cmd.Stdout = &counter
+		} else {
+			cmd.Stdout = null
+		}
 	}
 	load, _ := hostinfo.LoadAverage()
 	record := RunRecord{Scenario: scenario.ID, Contender: contender.Name, Role: contender.Role, LoadBefore: load, Command: cmd.Describe()}
@@ -400,7 +417,7 @@ func runOne(ctx context.Context, options RunOptions, scenario Scenario, contende
 	if result.ExitCode != 0 {
 		return fail(StatusFailed, "exit", fmt.Sprintf("exit status %d: %s", result.ExitCode, firstLine(lastLine(result.Stderr))))
 	}
-	if contender.Stdout == StdoutCount {
+	if contender.Stdout == StdoutCount && verify {
 		record.BytesOut = counter.N
 	}
 	if contender.Kind == KindShot {

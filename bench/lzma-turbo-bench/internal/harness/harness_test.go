@@ -596,3 +596,159 @@ func TestAnOverriddenFixtureDirectoryIsPopulated(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// An override naming nothing runnable is missing, not a found tool whose
+// every row would only DNF.
+func TestAnOverrideNamingNoProgramIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, []byte("not a program"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []string{filepath.Join(dir, "absent"), dir}
+	if runtime.GOOS != "windows" {
+		cases = append(cases, plain)
+	}
+	for _, path := range cases {
+		t.Setenv("LZMA_TURBO_XZ", path)
+		t.Setenv("LZMA_TURBO_7LZMA", path)
+		for _, tool := range []Tool{resolveXZ(context.Background()), resolve7lzma(context.Background())} {
+			if tool.Found() || !strings.Contains(tool.Missing, path) {
+				t.Errorf("%s=%s resolved as %+v", tool.Name, path, tool)
+			}
+		}
+	}
+}
+
+// xz's encode output is counted through a pipe, which lzma-turbo's
+// in-process count never pays for, so only an untimed size run counts it
+// and the timed runs write to the null device.
+func TestTimedEncodesWriteToTheNullDevice(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.bin"), []byte(strings.Repeat("encode fixture ", 4096)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(fakeShotEnv, "1")
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scenario := Scenario{ID: "encode/sample", Group: "encode", Input: "sample.bin", Source: "sample.bin", Direction: "encode", Metric: "wall",
+		Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "xz-enc"),
+			{Name: "xz", Role: RoleReference, Kind: KindXZ, Args: []string{"{in}"}, Stdout: StdoutCount}}}
+	settings := RunSettings{Repeats: 2, Warmups: 1}
+	if got := Plan([]Scenario{scenario}, settings.Repeats, settings.Warmups).Processes; got != 7 {
+		t.Errorf("plan counts %d processes, want 2 x 3 passes + 1 size run", got)
+	}
+	raw, err := Execute(context.Background(), RunOptions{
+		Paths:     Paths{Fixtures: dir, LzmaBench: self},
+		Toolchain: Toolchain{LzmaBench: Tool{Name: "lzma-bench", Path: self}, XZ: Tool{Name: "xz", Path: self}},
+		Matrix:    []Scenario{scenario},
+		Settings:  settings,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Runs) != 7 {
+		t.Fatalf("%d runs, want 7", len(raw.Runs))
+	}
+	sized := 0
+	for _, run := range raw.Runs {
+		if run.Status != StatusOK {
+			t.Errorf("%s: %s %s", run.Contender, run.Status, run.Reason)
+		}
+		if run.Contender != "xz" {
+			continue
+		}
+		if run.Verify {
+			sized++
+			if run.BytesOut <= 0 {
+				t.Errorf("the size run counted %d bytes", run.BytesOut)
+			}
+		} else if run.BytesOut != 0 {
+			t.Errorf("a timed xz run went through the counting pipe (%d bytes)", run.BytesOut)
+		}
+	}
+	if sized != 1 {
+		t.Errorf("%d xz size runs, want 1", sized)
+	}
+	report := BuildReport(raw)
+	if !report.OK() || len(report.Rows) != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	for _, c := range report.Rows[0].Contenders {
+		if c.BytesOut <= 0 || c.Runs != 2 {
+			t.Errorf("%s: %d bytes out over %d runs", c.Name, c.BytesOut, c.Runs)
+		}
+	}
+	if r := report.Rows[0].Ratios; len(r) != 1 || r[0].Size == nil {
+		t.Errorf("no size ratio: %+v", r)
+	}
+}
+
+// The plan counts the decode verify shots Execute launches before timing.
+func TestThePlanCountsTheVerifyShots(t *testing.T) {
+	scenario := Scenario{ID: "decode/x", Direction: "decode", Input: "x.xz", Source: "x.bin",
+		Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "xz"), shot("lzma-rust2", RoleReference, "--shot", "rust2"), xzDecode()}}
+	if got := Plan([]Scenario{scenario}, 1, 0).Processes; got != 5 {
+		t.Errorf("plan counts %d processes, want 3 timed + 2 verify shots", got)
+	}
+}
+
+// A raw.json from an interrupted run lists every scenario but has runs for
+// some only; the report must not pass on what it lacks.
+func TestAnIncompleteRunFailsTheReport(t *testing.T) {
+	raw := syntheticRaw("host-a", 1, 2, 30<<20, 10<<20)
+	untouched := raw.Scenarios[0]
+	untouched.ID = "decode/xz/p256-next"
+	raw.Scenarios = append(raw.Scenarios, untouched)
+	report := BuildReport(raw)
+	if report.OK() || len(report.Rows) != 2 || report.Rows[1].Status != StatusFailed {
+		t.Fatalf("an unrun scenario passed: failures %v, rows %+v", report.Failures, report.Rows)
+	}
+
+	// A contender cut short is as incomplete as one never run.
+	raw = syntheticRaw("host-a", 1, 2, 30<<20, 10<<20)
+	raw.Runs = raw.Runs[:len(raw.Runs)-1]
+	if report := BuildReport(raw); report.OK() || !strings.Contains(strings.Join(report.Failures, "\n"), "2 of 3") {
+		t.Errorf("a short contender passed: %v", report.Failures)
+	}
+
+	// A dropped reference is accounted for; so is one left unrun because
+	// lzma-turbo stopped.
+	raw = syntheticRaw("host-a", 1, 2, 30<<20, 10<<20)
+	var ours []RunRecord
+	for _, run := range raw.Runs {
+		if run.Contender == "lzma-turbo" {
+			ours = append(ours, run)
+		}
+	}
+	raw.Runs = ours
+	raw.Dropped = []DroppedContender{{Scenario: "decode/xz/p256", Contender: "xz", Reason: "xz not found"}}
+	if report := BuildReport(raw); !report.OK() {
+		t.Errorf("a dropped reference failed the report: %v", report.Failures)
+	}
+	raw.Dropped = nil
+	raw.Runs = []RunRecord{{Scenario: "decode/xz/p256", Contender: "lzma-turbo", Role: RoleOurs, Repeat: -1, Verify: true,
+		Status: StatusFailed, Failure: "crc-mismatch", Reason: "bad"}}
+	if report := BuildReport(raw); len(report.Failures) != 1 {
+		t.Errorf("failures = %v, want only lzma-turbo's", report.Failures)
+	}
+}
+
+// An explicit --threads is the whole sweep: the fleet profile's wider
+// multi-threaded encode sweep does not survive it.
+func TestExplicitThreadsReplaceTheEncodeSweep(t *testing.T) {
+	defaults, err := ProfileOptions(ProfileFleet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matrix := defaults.Matrix
+	matrix.CPUs = 16
+	matrix.SetThreads([]int{1, 2})
+	for _, s := range BuildMatrix(matrix) {
+		if s.Group == "encode-mt" && s.Threads != 2 {
+			t.Errorf("--threads 1,2 still runs %s", s.ID)
+		}
+	}
+}
