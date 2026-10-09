@@ -80,13 +80,15 @@ impl Finder {
         }
     }
 
-    /// C: `MatchFinder_Create` or `MatchFinderMt_Create`.
+    /// C: `MatchFinder_Create` or `MatchFinderMt_Create`. `data_limit` is the
+    /// promise [`MatchFinder::create`] documents.
     pub(crate) fn create(
         &mut self,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        data_limit: u64,
     ) -> Result<(), Error> {
         match self {
             Finder::St(mf) => mf.create(
@@ -94,6 +96,7 @@ impl Finder {
                 keep_add_buffer_before,
                 match_max_len,
                 keep_add_buffer_after,
+                data_limit,
             ),
             #[cfg(feature = "std")]
             Finder::Mt(mt) => mt.create(
@@ -101,6 +104,7 @@ impl Finder {
                 keep_add_buffer_before,
                 match_max_len,
                 keep_add_buffer_after,
+                data_limit,
             ),
         }
     }

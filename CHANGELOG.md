@@ -2,6 +2,86 @@
 
 ## 0.8.0 - 2026-10-09
 
+- The threaded match finder's binary-tree walk tests the one byte at the
+  current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
+  Most nodes of a walk differ at that byte, so they now cost two byte loads
+  instead of a word scan over two slices, and the two bytes loaded are the
+  ones that order the node. No `unsafe` is involved and the output is
+  unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
+  with one thread and threaded.
+- `Lzma2Encoder` builds its encoder once. A block size or a thread split that
+  changes the settings in force used to build a second one in place of the
+  one `new` had made; the settings are now applied to that one, as
+  `LzmaEnc_SetProps` applies them in the SDK.
+- An LZMA2 encode that knows how long its input is allocates a window no
+  longer than that input needs. The SDK's window comes from the dictionary and
+  a 2 MiB keep window whatever the input, which is 3 MiB for a 100-byte input
+  with a 4 KiB dictionary; `encode_slice`, `encode_to_vec`, a block of the
+  block-parallel coder and a `Lzma2PushEncoder` whose input ends before its
+  queue has filled now take 64 KiB plus the input. Only a length that is
+  certain is used - a slice, a block limit, a finished queue - never the
+  `set_data_size` hint, and the output is unchanged: the window's length is
+  not something the match finder's results depend on. The match finder's
+  tables are still sized by the dictionary and the data-size hint, because
+  those are what the bytes depend on. `Lzma2PushEncoder` allocates its window
+  when it codes its first chunk rather than in `new`, which still refuses any
+  setting the allocation would refuse.
+- The match finder keeps a window that is already long enough instead of
+  allocating again whenever the size differs, so an encoder used for inputs of
+  different sizes allocates for the largest once.
+- The threaded match finder keeps its window, its tables and its two hand-off
+  buffers from one block to the next. It used to allocate and zero all of them
+  again for every block, about 100 MiB at level 5, while the buffers of the
+  block before were still held. A stream coded in blocks on one block thread
+  with a two-thread finder therefore held two encoders' worth of memory at
+  each block boundary; it now holds one.
+- The block-parallel LZMA2 coder keeps one coder per block thread for as long
+  as the `Lzma2Encoder` lives, the first of them being the coder the one-thread
+  path uses, and builds each of the others when its thread first has a block.
+  A request for more block threads than the input has blocks no longer builds
+  coders that never run, and a second stream allocates nothing the first
+  already allocated. Dropping the `Lzma2Encoder` releases them.
+- A block's output buffer is reserved once, at the most a block of that length
+  can come to (the SDK's `destBlockSize`), instead of being grown by doubling
+  as the block is written.
+- `SeqOutStream::write_vec`: the block-parallel coder hands each finished
+  block to the sink as the buffer it was written into. The default writes it
+  through `write` and keeps the buffer for the next block; a sink that queues
+  its input can take the buffer and skip the copy.
+- `Lzma2Encoder::set_total_threads` with no block-thread count named now
+  divides the total the way the SDK's `Lzma2EncProps_Normalize` does. The
+  divisor is the match finder's thread count, and where the settings name none
+  it is two for a binary-tree finder outside fast mode and one for a hash chain
+  or fast mode: a total of N is N / 2 block coders with threaded finders, or N
+  block coders whose finder cannot thread. It used to be N block coders with
+  one-thread finders whatever the finder, and with the automatic block size it
+  was one solid block on one thread whatever the total, because the automatic
+  size looked at the block-thread count the caller had not set. Output changes
+  only for that last combination - a total, no block threads named and
+  `BLOCK_SIZE_AUTO` - which is now coded in blocks when the split comes to more
+  than one block coder. A caller who names block threads, or no thread count
+  at all, is split as before, and the finder's default with no total is still
+  one thread. The total is not a count of operating-system
+  threads: a block coder with a threaded finder runs on three, so a total of N
+  over a binary tree starts about 1.5 N.
+- `Lzma2PushEncoder::reset` and `LzmaPushEncoder::reset` make a push encoder
+  ready for another stream with new settings. The encoder keeps its queue, and
+  its window and tables wherever the next stream needs no more than they
+  already hold, so a caller coding many streams one after another allocates
+  for the largest of them once. What is written after a reset is what a new
+  encoder with those settings writes; a stream that was under way is
+  abandoned.
+- The threaded match finder's binary-tree walk no longer bounds-checks the
+  accesses it makes once per node: the node's two sons, the two bytes at the
+  current match length and the store that relinks the tree. The walk tests
+  five conditions on its arguments before it starts and panics, which the bt
+  thread reports as a failed stream, on a call that breaks one; its own
+  distance and length tests carry them to every index. The argument is
+  written out on the walk and at each `unsafe` block, and a test compares the
+  walk against the checked one over tens of thousands of generated tables,
+  down to one-slot cyclic buffers and positions at the normalisation and wrap
+  boundaries. The accesses made once per position keep their checks, and the
+  output is unchanged.
 - `CrcFolder::range` folds a range from its first piece instead of from the
   empty checksum. Combining a piece with nothing gives the piece back, and it
   cost a whole fold to do it: a range that is exactly one piece, as each file
