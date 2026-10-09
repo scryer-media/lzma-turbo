@@ -256,6 +256,10 @@ impl LzmaPushEncoder {
 pub struct Lzma2PushEncoder {
     enc: Lzma2Encoder,
     src: PushSource,
+    /// Whether the block has been opened: the window and tables allocated and
+    /// the encoder initialised. Left until the first chunk is coded, so that
+    /// an input that ends before the queue ever fills is known whole by then.
+    begun: bool,
     done: bool,
 }
 
@@ -267,17 +271,35 @@ impl Lzma2PushEncoder {
     ///
     /// [`Error::Param`] if a setting is out of range - including `lc + lp`
     /// above 4, which LZMA2 does not allow - and [`Error::Alloc`] if the
-    /// encoder or its queue could not be allocated.
+    /// encoder or its queue could not be allocated. The window and the match
+    /// finder's tables are allocated when the first chunk is coded, so a
+    /// failure to allocate those is reported by the [`Lzma2PushEncoder::push`]
+    /// or [`Lzma2PushEncoder::finish`] that codes it.
     pub fn new(props: &LzmaEncProps) -> Result<Self, Error> {
         // Solid and one block thread are `Lzma2Encoder`'s defaults.
         let mut enc = Lzma2Encoder::new(&single_finder(props))?;
         enc.sync_coder()?;
-        enc.coder.begin_solid()?;
+        // What `LzmaEnc_Alloc` would refuse, refused here and not at the
+        // first chunk.
+        enc.coder.check_alloc()?;
         Ok(Lzma2PushEncoder {
             enc,
             src: PushSource::new(LZMA2_QUEUE)?,
+            begun: false,
             done: false,
         })
+    }
+
+    /// C: the head of `Lzma2Enc_EncodeMt1`'s block loop, run once before the
+    /// first chunk. `data_limit` is the whole input's length when it is
+    /// already known, which is when `finish` arrives before the queue has
+    /// filled once.
+    fn begin(&mut self, data_limit: u64) -> Result<(), Error> {
+        if !self.begun {
+            self.enc.coder.begin_solid(data_limit)?;
+            self.begun = true;
+        }
+        Ok(())
     }
 
     /// The single LZMA2 property byte a decoder needs.
@@ -320,6 +342,7 @@ impl Lzma2PushEncoder {
 
     /// One `Lzma2EncInt_EncodeSubblock` call mid-stream.
     fn step(&mut self, out: &mut dyn SeqOutStream) -> Result<(), Error> {
+        self.begin(u64::MAX)?;
         let written = self
             .enc
             .coder
@@ -344,6 +367,9 @@ impl Lzma2PushEncoder {
         }
         self.done = true;
         self.src.ended = true;
+        // Nothing coded yet: every byte of the input is in the queue, and the
+        // queue is now all the match finder can be given.
+        self.begin(self.src.total)?;
         loop {
             let written = self
                 .enc

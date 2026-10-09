@@ -849,6 +849,13 @@ impl MtShared {
     /// holds both critical sections, which is what stops them.
     fn move_block(&self, h: &mut HashState) {
         let c = &self.common;
+        if h.buffer < c.keep_size_before as usize {
+            // As `MatchFinder::move_block`: a window cut to a promised stream
+            // length, and a stream that broke the promise. Ending the stream
+            // with an error keeps the copy below inside the window.
+            h.result = Err(Error::InternalFailure);
+            return;
+        }
         let offset = h.buffer - c.keep_size_before as usize;
         let keep_before = (offset & (K_BLOCK_MOVE_ALIGN - 1)) + c.keep_size_before as usize;
         let from = offset & !(K_BLOCK_MOVE_ALIGN - 1);
@@ -1363,6 +1370,7 @@ impl MatchFinderMt {
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        data_limit: u64,
     ) -> Result<(), Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
@@ -1380,7 +1388,7 @@ impl MatchFinderMt {
             .checked_add(HASH_BLOCK_SIZE)
             .ok_or(Error::Param)?;
         self.mfb
-            .create(history_size, before, match_max_len, after)?;
+            .create(history_size, before, match_max_len, after, data_limit)?;
 
         // C: `MFB.bigHash = (MFB.hashMask >= 0xFFFFFF)`, set after
         // `MatchFinderMt_Create` and read by `MatchFinderMt_CreateVTable`.
@@ -1409,7 +1417,9 @@ impl MatchFinderMt {
         let son_base = self.mfb.son_base;
         let common = Common {
             win: win.as_mut_ptr(),
-            win_len: win.len(),
+            // `MatchFinder::create` keeps an allocation that is longer than
+            // this window needs; the window is `block_size` of it.
+            win_len: self.mfb.block_size as usize,
             tab: tab.as_mut_ptr(),
             bufs: bufs.as_mut_ptr(),
             hash_mask: self.mfb.hash_mask,
@@ -2033,8 +2043,14 @@ mod tests {
         mt.mfb.kind = MatchFinderKind::Bt4;
         mt.mfb.num_hash_bytes = 4;
         mt.mfb.cut_value = 32;
-        mt.create(1 << 16, K_NUM_OPTS as u32, 273, LZMA_MATCH_LEN_MAX + 1)
-            .expect("create");
+        mt.create(
+            1 << 16,
+            K_NUM_OPTS as u32,
+            273,
+            LZMA_MATCH_LEN_MAX + 1,
+            u64::MAX,
+        )
+        .expect("create");
         mt.init_mt().expect("init_mt");
         mt.init();
         // SAFETY: neither producer thread has been started.

@@ -9,6 +9,26 @@
   ones that order the node. No `unsafe` is involved and the output is
   unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
   with one thread and threaded.
+- `Lzma2Encoder` builds its encoder once. A block size or a thread split that
+  changes the settings in force used to build a second one in place of the
+  one `new` had made; the settings are now applied to that one, as
+  `LzmaEnc_SetProps` applies them in the SDK.
+- An LZMA2 encode that knows how long its input is allocates a window no
+  longer than that input needs. The SDK's window comes from the dictionary and
+  a 2 MiB keep window whatever the input, which is 3 MiB for a 100-byte input
+  with a 4 KiB dictionary; `encode_slice`, `encode_to_vec`, a block of the
+  block-parallel coder and a `Lzma2PushEncoder` whose input ends before its
+  queue has filled now take 64 KiB plus the input. Only a length that is
+  certain is used - a slice, a block limit, a finished queue - never the
+  `set_data_size` hint, and the output is unchanged: the window's length is
+  not something the match finder's results depend on. The match finder's
+  tables are still sized by the dictionary and the data-size hint, because
+  those are what the bytes depend on. `Lzma2PushEncoder` allocates its window
+  when it codes its first chunk rather than in `new`, which still refuses any
+  setting the allocation would refuse.
+- The match finder keeps a window that is already long enough instead of
+  allocating again whenever the size differs, so an encoder used for inputs of
+  different sizes allocates for the largest once.
 
 ## 0.7.0 - 2026-10-07
 

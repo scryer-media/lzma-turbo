@@ -260,6 +260,14 @@ impl MatchFinder {
 
     /// C: `MatchFinder_MoveBlock`.
     fn move_block(&mut self) {
+        if self.buffer < self.keep_size_before as usize {
+            // Only a window `plan` cut to a promised stream length is short
+            // enough to get here, and only if the stream then supplied more
+            // than was promised. That is a bug in the caller of `create`;
+            // make it an error instead of an index out of the window.
+            self.result = Err(Error::InternalFailure);
+            return;
+        }
         let offset = self.buffer - self.keep_size_before as usize;
         let keep_before = (offset & (K_BLOCK_MOVE_ALIGN - 1)) + self.keep_size_before as usize;
         self.buffer = keep_before;
@@ -365,6 +373,7 @@ impl MatchFinder {
         keep_add_buffer_before: u32,
         match_max_len: u32,
         mut keep_add_buffer_after: u32,
+        data_limit: u64,
     ) -> Result<Plan, Error> {
         // C: "we need one additional byte in (p->keepSizeBefore), since we use
         // MoveBlock() after (p->pos++) and before dictionary using"
@@ -380,9 +389,24 @@ impl MatchFinder {
         }
         self.keep_size_after = keep_add_buffer_after;
 
-        let block_size = self.get_block_size(history_size);
+        let mut block_size = self.get_block_size(history_size);
         if block_size == 0 {
             return Err(Error::Param);
+        }
+        // A stream that supplies at most `data_limit` bytes fits whole in a
+        // window of that many bytes, the look-ahead `ReadBlock` keeps beyond
+        // them and one byte more, so that the read which reports the end
+        // still has somewhere to go. Such a window is never moved: `NeedMove`
+        // asks for less than `keepSizeAfter` free bytes past `buffer`, and
+        // `buffer` cannot pass the last byte supplied. What is found in it is
+        // what is found in the C's window, which differs only in how much it
+        // can hold; see `crate::enc::stream` for why the read sizes do not
+        // matter.
+        let whole = data_limit
+            .saturating_add(u64::from(self.keep_size_after))
+            .saturating_add(u64::from(K_BLOCK_SIZE_ALIGN));
+        if whole < u64::from(block_size) {
+            block_size = (whole as u32) & !(K_BLOCK_SIZE_ALIGN - 1);
         }
 
         let hs;
@@ -482,6 +506,7 @@ impl MatchFinder {
             keep_add_buffer_before,
             match_max_len,
             keep_add_buffer_after,
+            u64::MAX,
         )?;
         Ok(u64::from(plan.block_size) + (plan.num_refs as u64) * 4)
     }
@@ -493,23 +518,34 @@ impl MatchFinder {
     }
 
     /// C: `MatchFinder_Create`.
+    ///
+    /// `data_limit` is a promise, not the C's `expectedDataSize` hint: the
+    /// stream this finder is about to be given supplies at most that many
+    /// bytes, `u64::MAX` when nobody can say. It only ever shortens the
+    /// window; see [`MatchFinder::plan`].
     pub(crate) fn create(
         &mut self,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        data_limit: u64,
     ) -> Result<(), Error> {
         let plan = self.plan(
             history_size,
             keep_add_buffer_before,
             match_max_len,
             keep_add_buffer_after,
+            data_limit,
         )?;
 
-        if self.buf_base.is_empty() || self.block_size != plan.block_size {
-            // C: `LzInWindow_Create2`.
-            self.block_size = plan.block_size;
+        // C: `LzInWindow_Create2`, which reallocates unless the size is the
+        // same. A window that is already long enough is kept here, as the
+        // tables below are: an encoder that is given one input after another
+        // then allocates for the largest of them once. `block_size` is the
+        // window's length from here on, whatever the allocation's.
+        self.block_size = plan.block_size;
+        if self.buf_base.len() < plan.block_size as usize {
             self.buf_base = Vec::new();
             self.buf_base
                 .try_reserve_exact(plan.block_size as usize)
@@ -1482,7 +1518,7 @@ mod tests {
         mf.kind = kind;
         mf.num_hash_bytes = kind.num_hash_bytes();
         mf.cut_value = 32;
-        mf.create(1 << 16, 1 << 11, 32, LZMA_MATCH_LEN_MAX + 1)
+        mf.create(1 << 16, 1 << 11, 32, LZMA_MATCH_LEN_MAX + 1, u64::MAX)
             .unwrap();
         let mut stream = SliceStream::new(src);
         mf.init(&mut stream);

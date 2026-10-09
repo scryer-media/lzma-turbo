@@ -131,6 +131,9 @@ pub(crate) struct LzmaEnc {
     dist_table_size: usize,
 
     pub(crate) dict_size: u32,
+    /// The most the stream of the next `prepare` will supply, `u64::MAX` when
+    /// that is not known for certain. See [`LzmaEnc::set_data_limit`].
+    data_limit: u64,
     result: Result<(), Error>,
 
     prob_prices: ProbPrices,
@@ -199,6 +202,7 @@ impl LzmaEnc {
             rep_len_enc_counter: 0,
             dist_table_size: 0,
             dict_size: 0,
+            data_limit: u64::MAX,
             result: Ok(()),
             prob_prices: init_price_tables(),
             matches: [0; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize],
@@ -299,6 +303,23 @@ impl LzmaEnc {
     /// C: `LzmaEnc_SetDataSize`.
     pub(crate) fn set_data_size(&mut self, expected: u64) {
         self.mf.cfg().expected_data_size = expected;
+    }
+
+    /// Promises that the stream the next `prepare` is for supplies at most
+    /// `limit` bytes, so that the window need be no longer than that.
+    ///
+    /// This is not `LzmaEnc_SetDataSize`. That one is a hint, which sizes the
+    /// hash table and so changes the bytes, and an input longer than the hint
+    /// is still encoded correctly. This one changes no byte of the output and
+    /// must be true: a caller that cannot be sure - anything read from a
+    /// stream of its own - leaves it unset. The promise covers one `prepare`,
+    /// which takes it.
+    ///
+    /// C: none. The C's window is sized from the dictionary and
+    /// `LZMA2_KEEP_WINDOW_SIZE` whatever the input, which is 3 MiB for a
+    /// 4 KiB dictionary and a 100-byte input.
+    pub(crate) fn set_data_limit(&mut self, limit: u64) {
+        self.data_limit = limit;
     }
 
     /// C: `LzmaEnc_WriteProperties`.
@@ -1749,8 +1770,9 @@ impl LzmaEnc {
             && self.mf.cfg().kind.bt_mode()
     }
 
-    /// C: `LzmaEnc_Alloc`.
-    fn alloc(&mut self, keep_window_size: u32) -> Result<(), Error> {
+    /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
+    /// promise for this stream.
+    fn alloc(&mut self, keep_window_size: u32, data_limit: u64) -> Result<(), Error> {
         {
             let lclp = self.lc + self.lp;
             if self.lit_probs.is_empty() || self.lclp != lclp {
@@ -1789,6 +1811,10 @@ impl LzmaEnc {
             dict_size -= 1;
         }
 
+        // The keep window is how far back `Lzma2Enc` may reach to store a
+        // chunk it could not compress, and a chunk is never longer than what
+        // the stream has supplied.
+        let keep_window_size = u64::from(keep_window_size).min(data_limit) as u32;
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
@@ -1800,7 +1826,33 @@ impl LzmaEnc {
             before_size,
             self.num_fast_bytes,
             LZMA_MATCH_LEN_MAX + 1,
+            data_limit,
         )
+    }
+
+    /// Whether `LzmaEnc_Alloc` would accept this configuration, without
+    /// allocating anything: the errors of `MatchFinder_Create`'s arithmetic,
+    /// for a caller that wants a bad setting refused before the first byte.
+    pub(crate) fn check_alloc(&mut self, keep_window_size: u32) -> Result<(), Error> {
+        self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
+        let mut before_size = K_NUM_OPTS as u32;
+        let mut dict_size = self.dict_size;
+        if dict_size == (2u32 << 30) || dict_size == (3u32 << 30) {
+            dict_size -= 1;
+        }
+        if before_size + dict_size < keep_window_size {
+            before_size = keep_window_size - dict_size;
+        }
+        let mt = self.mt_mode();
+        self.mf
+            .mem_usage(
+                mt,
+                dict_size,
+                before_size,
+                self.num_fast_bytes,
+                LZMA_MATCH_LEN_MAX + 1,
+            )
+            .map(|_| ())
     }
 
     /// What one encoder of this configuration is estimated to need, in bytes:
@@ -1921,7 +1973,9 @@ impl LzmaEnc {
         self.result = Ok(());
         self.now_pos64 = 0;
         self.need_init = true;
-        self.alloc(keep_window_size)?;
+        // The promise is for this stream alone.
+        let data_limit = core::mem::replace(&mut self.data_limit, u64::MAX);
+        self.alloc(keep_window_size, data_limit)?;
         self.init_state();
         self.init_prices();
         Ok(())
