@@ -491,6 +491,13 @@ impl Lzma2AdaptiveDecoder {
     /// decoder's dictionary and each worker's, which are a function of the
     /// stream's dictionary size and the thread count rather than of how much
     /// is in flight, and which the limit therefore does not govern.
+    ///
+    /// Nor does it include anything the caller is holding: input it has read
+    /// and not yet fed, a piece the decoder refused and handed back, output it
+    /// has been handed and not yet written. A caller that keeps a queue of its
+    /// own and wants one limit over both counts that queue itself, and tells
+    /// the decoder what is left with
+    /// [`set_memory_limit`](Lzma2AdaptiveDecoder::set_memory_limit).
     #[must_use]
     pub fn held_bytes(&self) -> u64 {
         self.segs.held_bytes() + self.outstanding_bytes + self.ready_cap + self.spare_cap
@@ -528,6 +535,39 @@ impl Lzma2AdaptiveDecoder {
     #[must_use]
     pub fn memory_limit(&self) -> u64 {
         self.memory_limit
+    }
+
+    /// Changes the limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under,
+    /// from the next feed or dispatch onwards.
+    ///
+    /// For a caller whose own queue shares one budget with the decoder: it
+    /// sets the decoder's limit to the budget less what its queue holds before
+    /// each [`feed`](Lzma2AdaptiveDecoder::feed) or
+    /// [`drain`](Lzma2AdaptiveDecoder::drain). Lowering it recalls nothing -
+    /// runs already out stay out and input already taken stays taken - so
+    /// [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes) can sit above a
+    /// lowered limit until those are done with. In the meantime input is
+    /// refused and no run is dispatched, except that a run that no longer
+    /// fits the limit at all is decoded on the calling thread rather than
+    /// waited on, as it would have been under that limit from the start.
+    pub fn set_memory_limit(&mut self, limit: u64) {
+        self.memory_limit = limit;
+    }
+
+    /// What dispatching a run of `unpacked_len` bytes to a worker would add to
+    /// [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes): the buffer the run is
+    /// decoded into, less the parked buffer the dispatch will reuse.
+    ///
+    /// The decoder dispatches the run at the cursor when `held_bytes()` plus
+    /// this is at most [`memory_limit`](Lzma2AdaptiveDecoder::memory_limit),
+    /// so a caller gating its own reads on the same arithmetic agrees with it
+    /// about when the next run can go. Before it refuses, the decoder also
+    /// gives back parked capacity this dispatch would not reuse, so it can
+    /// dispatch where this predicate alone says no; it never dispatches where
+    /// the predicate, reckoned after that, says no.
+    #[must_use]
+    pub fn dispatch_cost(&self, unpacked_len: u64) -> u64 {
+        unpacked_len.saturating_sub(self.spare_out.last().map_or(0, |b| b.capacity() as u64))
     }
 
     // -- input --------------------------------------------------------------
@@ -1443,13 +1483,6 @@ impl Lzma2AdaptiveDecoder {
         self.held_bytes() + self.dispatch_cost(run.unpacked_len) <= self.memory_limit
     }
 
-    /// What dispatching a run of `unpacked_len` bytes adds to
-    /// [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes): the buffer it is
-    /// decoded into, less the parked buffer it will reuse.
-    fn dispatch_cost(&self, unpacked_len: u64) -> u64 {
-        unpacked_len.saturating_sub(self.spare_out.last().map_or(0, |b| b.capacity() as u64))
-    }
-
     /// Gives back the parked capacity a dispatch of `run` would not reuse, if
     /// that is what stands between it and the limit. Returns whether anything
     /// was given back.
@@ -1791,7 +1824,7 @@ mod tests {
         let unused = d.spare_cap - reuse + d.segs.spare_bytes();
         let over = MIB as u64;
         assert!(over < unused);
-        d.memory_limit = d.held_bytes() + need - over;
+        d.set_memory_limit(d.held_bytes() + need - over);
         assert!(!d.room_for(next));
 
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
@@ -1799,5 +1832,48 @@ mod tests {
         assert!(d.spare_out.is_empty());
         assert_eq!(d.segs.spare_bytes(), 0);
         assert!(d.held_bytes() <= d.memory_limit);
+    }
+
+    #[test]
+    fn a_lowered_limit_governs_the_next_dispatch() {
+        let mut d = decoder(4, 100 * MIB as u64);
+        let mut stream = run(4 * MIB, 0);
+        stream.extend_from_slice(&run(4 * MIB, 1));
+        stream.extend_from_slice(&run(4 * MIB, 2));
+        stream.push(0);
+        hold(&mut d, &stream);
+        d.scan().expect("scan");
+        assert_eq!(d.pending.len(), 3);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+
+        // Nothing parked: the run costs its whole buffer.
+        let next = d.pending[0];
+        assert!(d.spare_out.is_empty());
+        assert_eq!(d.dispatch_cost(next.unpacked_len), next.unpacked_len);
+
+        // Mid-stream, the caller's own queue grows and it lowers the limit to
+        // what is left: one byte short of the next run, then exactly enough.
+        let cost = d.dispatch_cost(next.unpacked_len);
+        d.set_memory_limit(d.held_bytes() + cost - 1);
+        assert_eq!(d.memory_limit(), d.held_bytes() + cost - 1);
+        assert!(!d.room_for(next));
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+        d.set_memory_limit(d.held_bytes() + cost);
+        assert!(d.room_for(next));
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert!(d.held_bytes() <= d.memory_limit());
+
+        // A parked buffer is what the next dispatch reuses, and the cost is
+        // what it does not cover - the arithmetic `room_for` refuses on.
+        d.recycle(Vec::with_capacity(MIB));
+        let last = d.pending[0];
+        let reuse = d.spare_out.last().expect("parked").capacity() as u64;
+        let cost = d.dispatch_cost(last.unpacked_len);
+        assert_eq!(cost, last.unpacked_len - reuse);
+        d.set_memory_limit(d.held_bytes() + cost - 1);
+        assert!(!d.room_for(last));
+        d.set_memory_limit(d.held_bytes() + cost);
+        assert!(d.room_for(last));
+        assert_eq!(d.dispatch_cost(reuse / 2), 0);
     }
 }
