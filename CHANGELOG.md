@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-10-09
 
 - The threaded match finder's binary-tree walk tests the one byte at the
   current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
@@ -48,6 +48,40 @@
   block to the sink as the buffer it was written into. The default writes it
   through `write` and keeps the buffer for the next block; a sink that queues
   its input can take the buffer and skip the copy.
+- `Lzma2Encoder::set_total_threads` with no block-thread count named now
+  divides the total the way the SDK's `Lzma2EncProps_Normalize` does. The
+  divisor is the match finder's thread count, and where the settings name none
+  it is two for a binary-tree finder outside fast mode and one for a hash chain
+  or fast mode: a total of N is N / 2 block coders with threaded finders, or N
+  block coders whose finder cannot thread. It used to be N block coders with
+  one-thread finders whatever the finder, and with the automatic block size it
+  was one solid block on one thread whatever the total, because the automatic
+  size looked at the block-thread count the caller had not set. Output changes
+  only for that last combination - a total, no block threads named and
+  `BLOCK_SIZE_AUTO` - which is now coded in blocks when the split comes to more
+  than one block coder. A caller who names block threads, or no thread count
+  at all, is split as before, and the finder's default with no total is still
+  one thread. The total is not a count of operating-system
+  threads: a block coder with a threaded finder runs on three, so a total of N
+  over a binary tree starts about 1.5 N.
+- `Lzma2PushEncoder::reset` and `LzmaPushEncoder::reset` make a push encoder
+  ready for another stream with new settings. The encoder keeps its queue, and
+  its window and tables wherever the next stream needs no more than they
+  already hold, so a caller coding many streams one after another allocates
+  for the largest of them once. What is written after a reset is what a new
+  encoder with those settings writes; a stream that was under way is
+  abandoned.
+- The threaded match finder's binary-tree walk no longer bounds-checks the
+  accesses it makes once per node: the node's two sons, the two bytes at the
+  current match length and the store that relinks the tree. The walk tests
+  five conditions on its arguments before it starts and panics, which the bt
+  thread reports as a failed stream, on a call that breaks one; its own
+  distance and length tests carry them to every index. The argument is
+  written out on the walk and at each `unsafe` block, and a test compares the
+  walk against the checked one over tens of thousands of generated tables,
+  down to one-slot cyclic buffers and positions at the normalisation and wrap
+  boundaries. The accesses made once per position keep their checks, and the
+  output is unchanged.
 
 ## 0.7.0 - 2026-10-07
 
