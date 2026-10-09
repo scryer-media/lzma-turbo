@@ -117,7 +117,11 @@ fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     // valid `T` (`Zeroable`). The `Vec` takes ownership and frees it with the
     // same layout. CI checks this under Miri: the `unchecked-kernel-miri` job
     // runs `a_zeroed_vec_is_zeroes_of_every_zeroable_type`.
-    Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
+    let v = unsafe { Vec::from_raw_parts(ptr, len, len) };
+    // Before any page of it is touched, so the faults that fill it come in
+    // huge pages.
+    crate::enc::huge_pages::advise_vec(&v);
+    Ok(v)
 }
 
 /// C: `CMatchFinder`.

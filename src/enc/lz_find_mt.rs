@@ -1809,6 +1809,7 @@ impl MatchFinderMt {
             bufs = Vec::new();
             bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
                 .map_err(|_| Error::Alloc)?;
+            crate::enc::huge_pages::advise_vec(&bufs);
             bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
             #[cfg(test)]
             {

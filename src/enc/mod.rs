@@ -7,6 +7,7 @@
 
 mod consts;
 mod finder;
+mod huge_pages;
 mod lz_find;
 #[cfg(feature = "std")]
 mod lz_find_mt;

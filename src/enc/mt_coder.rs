@@ -324,6 +324,7 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                             if in_buf.try_reserve_exact(self.coder.block_size).is_err() {
                                 res = Err(Error::Alloc);
                             } else {
+                                crate::enc::huge_pages::advise_vec(&in_buf);
                                 in_buf.resize(self.coder.block_size, 0);
                             }
                         }
