@@ -35,6 +35,11 @@
   Buffers were judged against the last piece taken, so every full read after
   a tail paid a fresh allocation; they are now judged against the largest of
   the last eight pieces.
+- `Lzma2AdaptiveDecoder::feed_owned` admits a piece by its allocation's
+  capacity, which is what holding it costs, instead of by its length. A short
+  piece in a large buffer, such as a head cut from a full read, was taken
+  under a limit with room for its bytes but not its buffer, and
+  `held_bytes()` went past the limit; it is now refused.
 - `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
   split into input pieces, runs out, runs waiting and parked buffers; runs
   out, decoding and waiting; the peak held; and dispatch refusals by cause,

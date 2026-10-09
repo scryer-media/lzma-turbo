@@ -820,11 +820,26 @@ impl Lzma2AdaptiveDecoder {
     /// should drain and offer the same piece again. It is all or nothing, so
     /// that the path that accepts never copies.
     ///
+    /// The piece costs [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes) its
+    /// allocation's capacity, not its length, and is admitted by that: a short
+    /// piece in a large buffer is refused where its bytes alone would fit. A
+    /// caller cutting a read short should copy a small piece into a buffer its
+    /// size, or lend it with
+    /// [`feed_shared`](Lzma2AdaptiveDecoder::feed_shared).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Cancelled`] after [`Lzma2AdaptiveDecoder::cancel`].
     pub fn feed_owned(&mut self, seg: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
-        if self.room_to_take(seg.len(), true)? < seg.len() {
+        if seg.is_empty() {
+            return Ok(None);
+        }
+        // Admitted by what holding it costs, which is the allocation and not
+        // the bytes in it: that is what the queue charges, so a short piece in
+        // a large buffer checked by its length would be taken under a limit
+        // that has no room for it.
+        let charge = seg.capacity();
+        if self.room_to_take(charge, true)? < charge {
             return Ok(Some(seg));
         }
         self.segs.push_owned(seg);
@@ -2173,6 +2188,30 @@ mod tests {
         let l = sums(&d);
         assert_eq!((l.runs_waiting, l.runs_waiting_bytes), (0, 0));
         assert_eq!(l.peak_held_bytes, peak);
+    }
+
+    #[test]
+    fn an_owned_piece_is_admitted_by_what_it_will_cost() {
+        // A head of 2304 bytes cut from a 4 MiB read, still in the 4 MiB
+        // allocation. Holding it costs the allocation, and a limit with room
+        // for the bytes but not the allocation must refuse it.
+        let stream = run(64 << 10, 0);
+        let mut head = Vec::with_capacity(4 * MIB);
+        head.extend_from_slice(&stream[..2304]);
+        assert!(head.capacity() >= 4 * MIB);
+
+        let mut d = decoder(2, MIB as u64);
+        let back = d.feed_owned(head).expect("feed");
+        assert!(
+            back.is_some(),
+            "a 4 MiB allocation taken under a 1 MiB limit"
+        );
+        assert!(d.held_bytes() <= d.memory_limit());
+
+        // The same bytes in an allocation their size are taken.
+        let exact = exact(&stream[..2304]);
+        assert!(d.feed_owned(exact).expect("feed").is_none());
+        assert!(d.held_bytes() <= d.memory_limit());
     }
 
     #[test]
