@@ -305,9 +305,11 @@ pub struct Lzma2AdaptiveDecoder {
 
     /// The counters [`Lzma2AdaptiveDecoder::ledger`] reports.
     ledger: AdaptiveLedger,
-    /// The run last held back and why, so a run refused on every pass of a
-    /// drain is counted once per cause and not once per pass.
-    last_refusal: Option<(u64, Refusal)>,
+    /// The run last held back and every cause it has been held back for, one
+    /// bit per [`Refusal`], so a run refused on every pass of a drain is
+    /// counted once per cause and not once per pass - nor again when a cause
+    /// comes back after another, as it does when the limit changes mid-run.
+    last_refusal: Option<(u64, u8)>,
 
     /// A worker's error, held until everything before it has been delivered.
     failed: Option<(u64, Error)>,
@@ -571,11 +573,15 @@ impl Lzma2AdaptiveDecoder {
 
     /// Counts the run at the cursor as held back for `why`, once.
     fn refuse(&mut self, why: Refusal) {
-        let key = (self.next_index, why);
-        if self.last_refusal == Some(key) {
+        let bit = 1u8 << why as u8;
+        let seen = match self.last_refusal {
+            Some((run, causes)) if run == self.next_index => causes,
+            _ => 0,
+        };
+        if seen & bit != 0 {
             return;
         }
-        self.last_refusal = Some(key);
+        self.last_refusal = Some((self.next_index, seen | bit));
         let l = &mut self.ledger;
         match why {
             Refusal::Busy => l.refused_busy += 1,
@@ -859,6 +865,9 @@ impl Lzma2AdaptiveDecoder {
     ///
     /// Returns [`Error::Cancelled`] after [`Lzma2AdaptiveDecoder::cancel`].
     pub fn feed_owned(&mut self, seg: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        if self.cancelled {
+            return Err(Error::Cancelled);
+        }
         if seg.is_empty() {
             return Ok(None);
         }
@@ -2525,6 +2534,47 @@ mod tests {
 
         assert!(!d.st_in_run, "at the boundary the chase is in no run");
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::None);
+    }
+
+    #[test]
+    fn an_empty_owned_piece_after_cancel_is_refused_as_cancelled() {
+        let mut d = decoder(2, u64::MAX);
+        d.cancel();
+        assert!(matches!(d.feed_owned(Vec::new()), Err(Error::Cancelled)));
+        assert!(matches!(
+            d.feed_shared(&Arc::new(Vec::new()), 0..0),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(d.feed(&[]), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn a_run_refused_for_a_cause_again_is_not_counted_again() {
+        // One run, refused for want of a thread, then for want of room once
+        // the caller lowers the limit, then for want of a thread again once
+        // it raises it: two causes, each counted once.
+        let mut d = decoder(2, u64::MAX);
+        let mut stream = Vec::new();
+        for i in 0..4 {
+            stream.extend_from_slice(&run(MIB, i));
+        }
+        stream.push(0);
+        hold(&mut d, &stream);
+        d.scan().expect("scan");
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+        d.threads = 3;
+        d.set_memory_limit(d.held_bytes());
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+        d.threads = 2;
+        d.set_memory_limit(u64::MAX);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+
+        let l = d.ledger();
+        assert_eq!(l.refused_busy, 1, "{l:?}");
+        assert_eq!(l.refused_room, 1, "{l:?}");
     }
 
     #[test]
