@@ -40,7 +40,11 @@
   path uses, and builds each of the others when its thread first has a block.
   A request for more block threads than the input has blocks no longer builds
   coders that never run, and a second stream allocates nothing the first
-  already allocated. Dropping the `Lzma2Encoder` releases them.
+  already allocated. Dropping the `Lzma2Encoder` releases them. Under
+  `set_mem_limit`, a stream keeps only the coders it is allowed: those of
+  block threads it does not run are released, and a coder given other
+  settings than it was built with is built again rather than keeping the
+  window and tables of the larger ones.
 - A block's output buffer is reserved once, at the most a block of that length
   can come to (the SDK's `destBlockSize`), instead of being grown by doubling
   as the block is written.
