@@ -296,13 +296,15 @@ impl Lzma2EncInt {
         // C: `LzmaEnc_MemPrepare`, whose `MatchFinder_SET_DIRECT_INPUT_BUF`
         // also sets `expectedDataSize` from the block's length — which is what
         // makes this byte for byte what the stream path above produces for the
-        // same block. `SliceStream` stands in for `directInput`; see
-        // `crate::enc::stream`.
+        // same block. A threaded finder takes the `directInput` as well and
+        // reads the block in place; the single-threaded one reads it through
+        // its window, `SliceStream` standing in; see `crate::enc::stream`.
         self.enc.set_data_limit(src.len() as u64);
-        self.enc.mem_prepare(src.len() as u64, UNPACK_SIZE_MAX)?;
+        self.enc
+            .mem_prepare_direct(src.len() as u64, UNPACK_SIZE_MAX)?;
         match self.enc.mt_block_handle()? {
             // The finder's threads are kept from block to block, as the C
-            // keeps them; the hash thread reads the block itself.
+            // keeps them, and the block is their window: nothing is copied.
             Some(sh) => {
                 lz_find_mt::run_block(&sh, src, || self.subblock_loop(&mut NoStream, out))?;
             }
@@ -1773,6 +1775,46 @@ mod tests {
         fresh.set_block_size(block as u64);
         fresh.set_total_threads(4);
         assert!(out == fresh.encode_to_vec(&src).unwrap());
+    }
+
+    /// A block coder with the threaded finder reads its block in place, as
+    /// the C's `directInput` has it: it allocates no window, holds no pointer
+    /// to the block once the block is coded, and codes the bytes the
+    /// single-threaded finder codes through its window.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_threaded_block_coder_reads_its_block_in_place() {
+        let src = mixed(1 << 18);
+        let block = 1usize << 15;
+        let pieces: Vec<&[u8]> = src.chunks(block).collect();
+        let code = |threads: u32| {
+            let props = LzmaEncProps::new()
+                .with_level(5)
+                .with_dict_size(1 << 14)
+                .with_num_threads(threads);
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_block_size(block as u64);
+            enc.set_total_threads(threads as usize);
+            enc.sync_coder().unwrap();
+            let mut out = Vec::new();
+            let cb = enc.mt_callback(&mut out, 1).unwrap();
+            for (i, piece) in pieces.iter().enumerate() {
+                cb.code(0, 0, piece, i + 1 == pieces.len()).unwrap();
+                cb.write(0).unwrap();
+            }
+            drop(cb);
+            (enc, out)
+        };
+
+        let (direct, got) = code(2);
+        let crate::enc::finder::Finder::Mt(mt) = &direct.coder.enc.mf else {
+            panic!("two threads give the threaded finder");
+        };
+        assert_eq!(mt.windows(), (0, 0), "no window, and no block held");
+
+        let (windowed, want) = code(1);
+        assert!(!windowed.coder.enc.mf.is_mt());
+        assert!(got == want, "reading in place changed the output");
     }
 
     /// Under a memory limit, an encoder that was used with more block threads

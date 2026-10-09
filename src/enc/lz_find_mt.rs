@@ -981,10 +981,14 @@ enum Mix {
 /// C: the `CMatchFinderMt` fields that `MatchFinderMt_Init` copies out of the
 /// `CMatchFinder` once and no thread writes again, and the buffers themselves.
 struct Common {
-    /// C: `mf->bufBase`, the window.
+    /// C: `mf->bufBase`, the window. With `direct` set it is the block
+    /// [`run_block`] is coding, which nothing writes through.
     win: *mut u8,
-    /// C: `mf->blockSize`.
+    /// C: `mf->blockSize`, or the block's length with `direct` set.
     win_len: usize,
+    /// C: `mf->directInput`: the window is the input itself, all of it there
+    /// from the start, and is never moved or read into.
+    direct: bool,
     /// C: `mf->hash`: the low hash, then the high hash, then `son`.
     tab: *mut u32,
     /// C: `p->hashBuf`, with `p->btBuf` following it in the same allocation
@@ -1029,6 +1033,7 @@ impl Common {
         Common {
             win: core::ptr::NonNull::dangling().as_ptr(),
             win_len: 0,
+            direct: false,
             tab: core::ptr::NonNull::dangling().as_ptr(),
             bufs: core::ptr::NonNull::dangling().as_ptr(),
             hash_mask: 0,
@@ -1352,7 +1357,7 @@ impl SeqInStream for BlockSource<'_> {
 impl MtShared {
     /// C: `MatchFinder_NeedMove`.
     fn need_move(&self, h: &HashState) -> bool {
-        if h.stream_end_was_reached || h.result.is_err() {
+        if self.common().direct || h.stream_end_was_reached || h.result.is_err() {
             return false;
         }
         (self.common().win_len - h.buffer) <= self.common().keep_size_after as usize
@@ -1417,6 +1422,20 @@ impl MtShared {
             return;
         }
         let c = self.common();
+        if c.direct {
+            // C: the `directInput` branch: the bytes are already in the
+            // window, so reading them is only moving `streamPos` over them.
+            // SAFETY: this runs on the hash thread during a stream, when
+            // `block` is that thread's; see `BlockSource::read`.
+            let b = unsafe { &mut *self.block.get() };
+            let n = ((u32::MAX - h.avail()) as usize).min(b.len - b.pos);
+            h.stream_pos = h.stream_pos.wrapping_add(n as u32);
+            b.pos += n;
+            if b.pos == b.len {
+                h.stream_end_was_reached = true;
+            }
+            return;
+        }
         loop {
             let dest = h.buffer + h.avail() as usize;
             let size = c.win_len - dest;
@@ -1922,7 +1941,9 @@ impl MatchFinderMt {
         self.sh.as_deref().expect("match finder was not created")
     }
 
-    /// C: `MatchFinderMt_Create`.
+    /// C: `MatchFinderMt_Create`. `direct` is the C's `directInput`: the
+    /// stream is a block [`run_block`] will hand the finder in place, and no
+    /// window is allocated for it.
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -1930,6 +1951,7 @@ impl MatchFinderMt {
         match_max_len: u32,
         keep_add_buffer_after: u32,
         data_limit: u64,
+        direct: bool,
     ) -> Result<(), Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
@@ -1984,6 +2006,7 @@ impl MatchFinderMt {
         let after = keep_add_buffer_after
             .checked_add(HASH_BLOCK_SIZE)
             .ok_or(Error::Param)?;
+        self.mfb.direct_input = direct;
         self.mfb
             .create(history_size, before, match_max_len, after, data_limit)?;
 
@@ -2013,10 +2036,20 @@ impl MatchFinderMt {
         let mut tab = core::mem::take(&mut self.mfb.hash);
         let son_base = self.mfb.son_base;
         let common = Common {
-            win: win.as_mut_ptr(),
+            // With `direct` the window is the block, which `run_block` sets.
+            win: if direct {
+                core::ptr::NonNull::dangling().as_ptr()
+            } else {
+                win.as_mut_ptr()
+            },
             // `MatchFinder::create` keeps an allocation that is longer than
             // this window needs; the window is `block_size` of it.
-            win_len: self.mfb.block_size as usize,
+            win_len: if direct {
+                0
+            } else {
+                self.mfb.block_size as usize
+            },
+            direct,
             tab: tab.as_mut_ptr(),
             bufs: bufs.as_mut_ptr(),
             hash_mask: self.mfb.hash_mask,
@@ -2079,6 +2112,16 @@ impl MatchFinderMt {
             }
             None => self.mfb.allocated(),
         }
+    }
+
+    /// The window this finder has allocated, and the length of the one its
+    /// threads read now, in bytes.
+    #[cfg(test)]
+    pub(crate) fn windows(&self) -> (usize, usize) {
+        let sh = self.shared();
+        // SAFETY: the lz thread, outside a stream; see `create`.
+        let own = unsafe { &*sh.own.get() };
+        (own.win.len(), sh.common().win_len)
     }
 
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
@@ -2567,26 +2610,42 @@ pub(crate) fn run_block<T>(
             // C: `MatchFinderMt_ReleaseStream`. Waits for the bt thread to
             // stop, and the bt thread stops the hash thread first.
             self.0.bt_sync.stop_writing();
-            // SAFETY: both producer threads are stopped, so `block` is the
-            // lz thread's again.
+            // SAFETY: both producer threads are stopped, so `block` and
+            // `common` are the lz thread's again, and the lz thread holds no
+            // borrow of either here.
             unsafe {
                 *self.0.block.get() = BlockInput {
                     ptr: core::ptr::null(),
                     len: 0,
                     pos: 0,
                 };
+                let c = &mut *self.0.common.get();
+                if c.direct {
+                    c.win = core::ptr::NonNull::dangling().as_ptr();
+                    c.win_len = 0;
+                }
             }
         }
     }
-    // SAFETY: between streams `block` is the lz thread's: the pair is waiting
-    // on `can_start`, which only this thread's first `get_next_block` in
-    // `body` sets.
+    // SAFETY: between streams `block` and `common` are the lz thread's: the
+    // pair is waiting on `can_start`, which only this thread's first
+    // `get_next_block` in `body` sets, and the caller holds no borrow of
+    // `common` across this call.
     unsafe {
         *sh.block.get() = BlockInput {
             ptr: src.as_ptr(),
             len: src.len(),
             pos: 0,
         };
+        // C: `MatchFinder_SET_DIRECT_INPUT_BUF`, then `MatchFinder_Init`'s
+        // `p->buffer = p->bufBase`: the block is the window. The pointer is
+        // only ever read through: `read_block` and `move_block`, the two
+        // writers, never touch a direct window.
+        let c = &mut *sh.common.get();
+        if c.direct {
+            c.win = src.as_ptr().cast_mut();
+            c.win_len = src.len();
+        }
     }
     let stop = Stop(sh);
     let r = body();
@@ -2733,6 +2792,7 @@ mod tests {
             273,
             LZMA_MATCH_LEN_MAX + 1,
             u64::MAX,
+            false,
         )
         .expect("create");
         mt.init_mt().expect("init_mt");

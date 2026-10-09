@@ -1772,7 +1772,7 @@ impl LzmaEnc {
 
     /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
     /// promise for this stream.
-    fn alloc(&mut self, keep_window_size: u32, data_limit: u64) -> Result<(), Error> {
+    fn alloc(&mut self, keep_window_size: u32, data_limit: u64, direct: bool) -> Result<(), Error> {
         {
             let lclp = self.lc + self.lp;
             if self.lit_probs.is_empty() || self.lclp != lclp {
@@ -1827,6 +1827,7 @@ impl LzmaEnc {
             self.num_fast_bytes,
             LZMA_MATCH_LEN_MAX + 1,
             data_limit,
+            direct,
         )
     }
 
@@ -1959,7 +1960,7 @@ impl LzmaEnc {
     }
 
     /// C: `LzmaEnc_AllocAndInit`.
-    fn alloc_and_init(&mut self, keep_window_size: u32) -> Result<(), Error> {
+    fn alloc_and_init(&mut self, keep_window_size: u32, direct: bool) -> Result<(), Error> {
         let mut i = (K_END_POS_MODEL_INDEX / 2) as usize;
         while (i as u32) < K_DIC_LOG_SIZE_MAX {
             if self.dict_size <= (1u32 << i) {
@@ -1975,7 +1976,7 @@ impl LzmaEnc {
         self.need_init = true;
         // The promise is for this stream alone.
         let data_limit = core::mem::replace(&mut self.data_limit, u64::MAX);
-        self.alloc(keep_window_size, data_limit)?;
+        self.alloc(keep_window_size, data_limit, direct)?;
         self.init_state();
         self.init_prices();
         Ok(())
@@ -1984,14 +1985,29 @@ impl LzmaEnc {
     /// C: `LzmaEnc_Prepare` / `LzmaEnc_PrepareForLzma2`. The stream itself is
     /// passed to [`Self::code_one_block`] rather than stored.
     pub(crate) fn prepare(&mut self, keep_window_size: u32) -> Result<(), Error> {
-        self.alloc_and_init(keep_window_size)
+        self.alloc_and_init(keep_window_size, false)
     }
 
     /// C: `LzmaEnc_MemPrepare`, whose `MatchFinder_SET_DIRECT_INPUT_BUF` also
     /// sets `expectedDataSize` from the source length.
     pub(crate) fn mem_prepare(&mut self, src_len: u64, keep_window_size: u32) -> Result<(), Error> {
         self.set_data_size(src_len);
-        self.alloc_and_init(keep_window_size)
+        self.alloc_and_init(keep_window_size, false)
+    }
+
+    /// [`Self::mem_prepare`] with the C's `directInput` as well: a threaded
+    /// finder allocates no window, and reads the block in place once
+    /// [`crate::enc::lz_find_mt::run_block`] hands it over. The caller must
+    /// code the block through `run_block` whenever
+    /// [`Self::mt_block_handle`] gives it a handle.
+    #[cfg(feature = "std")]
+    pub(crate) fn mem_prepare_direct(
+        &mut self,
+        src_len: u64,
+        keep_window_size: u32,
+    ) -> Result<(), Error> {
+        self.set_data_size(src_len);
+        self.alloc_and_init(keep_window_size, true)
     }
 
     /// The threaded match finder's handle, when one is in use.

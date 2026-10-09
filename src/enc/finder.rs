@@ -81,7 +81,10 @@ impl Finder {
     }
 
     /// C: `MatchFinder_Create` or `MatchFinderMt_Create`. `data_limit` is the
-    /// promise [`MatchFinder::create`] documents.
+    /// promise [`MatchFinder::create`] documents. `direct` asks the threaded
+    /// finder for no window, the input being a block it will read in place
+    /// (`MatchFinderMt::create`); the single-threaded finder always reads
+    /// through its window and ignores it.
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -89,15 +92,21 @@ impl Finder {
         match_max_len: u32,
         keep_add_buffer_after: u32,
         data_limit: u64,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
     ) -> Result<(), Error> {
         match self {
-            Finder::St(mf) => mf.create(
-                history_size,
-                keep_add_buffer_before,
-                match_max_len,
-                keep_add_buffer_after,
-                data_limit,
-            ),
+            Finder::St(mf) => {
+                // A finder switched back from the threaded one keeps the
+                // flag that one was last created with.
+                mf.direct_input = false;
+                mf.create(
+                    history_size,
+                    keep_add_buffer_before,
+                    match_max_len,
+                    keep_add_buffer_after,
+                    data_limit,
+                )
+            }
             #[cfg(feature = "std")]
             Finder::Mt(mt) => mt.create(
                 history_size,
@@ -105,6 +114,7 @@ impl Finder {
                 match_max_len,
                 keep_add_buffer_after,
                 data_limit,
+                direct,
             ),
         }
     }
