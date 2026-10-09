@@ -137,6 +137,11 @@
   `Finished`, so `held_bytes()` is zero after the stream ends.
 - `Lzma2AdaptiveDecoder::feed_owned` returns `Error::Cancelled` after
   `cancel`, including for an empty piece.
+- `Lzma2AdaptiveDecoder::feed_owned` and `feed_shared` no longer take
+  `held_bytes()` past `memory_limit()` by a parked input buffer. Input is
+  admitted without counting what is parked, since a copy goes into a parked
+  buffer; a piece handed over does not, so the parked buffer was held on top
+  of it. Parked input is now dropped when keeping it would exceed the limit.
 - `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
   split into input pieces, runs out, runs waiting and parked buffers; runs
   out, decoding and waiting; the peak held; and dispatch refusals by cause,

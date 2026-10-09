@@ -821,6 +821,7 @@ impl Lzma2AdaptiveDecoder {
         buf.try_reserve_exact(take).map_err(|_| Error::Alloc)?;
         buf.extend_from_slice(&data[..take]);
         self.segs.push_owned(buf);
+        self.fit_parked_input();
         self.mark_peak();
         Ok(take)
     }
@@ -880,6 +881,7 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Some(seg));
         }
         self.segs.push_owned(seg);
+        self.fit_parked_input();
         self.mark_peak();
         Ok(None)
     }
@@ -912,6 +914,7 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Some(range));
         }
         self.segs.push_shared(seg, range);
+        self.fit_parked_input();
         self.mark_peak();
         Ok(None)
     }
@@ -1022,12 +1025,6 @@ impl Lzma2AdaptiveDecoder {
             let len = len as u64;
             let free = self.input_free();
             if held.saturating_add(len) <= free {
-                // Parked input is not the next piece here - the caller's own
-                // buffer is - so it gives way rather than push the decoder
-                // over the limit.
-                if self.segs.held_bytes().saturating_add(len) > free {
-                    self.segs.shed_spare();
-                }
                 take = usize::try_from(len).unwrap_or(usize::MAX);
             }
         }
@@ -1041,6 +1038,20 @@ impl Lzma2AdaptiveDecoder {
             return Ok(0);
         }
         Ok(take)
+    }
+
+    /// Lets go of parked input if keeping it would hold more than the limit.
+    ///
+    /// The room a piece is admitted into does not count parked input, because
+    /// a copy goes into a parked buffer rather than a new one. A piece handed
+    /// over whole does not - it is the caller's own buffer - and a copy takes
+    /// one parked buffer of however many there are, so once the piece is in,
+    /// what is still parked is held on top of it. It is spare capacity and
+    /// nothing else, and it goes rather than take the decoder past the limit.
+    fn fit_parked_input(&mut self) {
+        if self.segs.spare_bytes() > 0 && self.held_bytes() > self.limit() {
+            self.segs.shed_spare();
+        }
     }
 
     /// Whether the decoder has something to do that does not need more input.
@@ -2505,6 +2516,75 @@ mod tests {
             d.chase_decoded_bytes(),
             0,
             "the calling thread decoded a run it was only waiting to be fed"
+        );
+    }
+
+    #[test]
+    fn a_piece_handed_over_does_not_take_held_past_the_limit_by_what_is_parked() {
+        // The piece the last run came in is parked for the next copy, and the
+        // limit has room for the next piece only if the parked one is not
+        // counted. A piece handed over is not copied into the parked one, so
+        // taking it and keeping the parked one would hold both.
+        let mut d = decoder(2, u64::MAX);
+        d.set_chase(false);
+        assert_eq!(one_run_through_a_worker(&mut d), MIB as u64);
+        let parked = d.segs.spare_bytes();
+        assert!(parked > 0, "the first run's piece is parked");
+
+        let next = run(MIB, 1);
+        let piece = exact(&next[MIB / 2..]);
+        let limit = d.held_bytes() - parked + piece.capacity() as u64;
+        d.set_memory_limit(limit);
+        assert!(
+            d.feed_owned(piece).expect("feed").is_none(),
+            "{:?}",
+            d.ledger()
+        );
+        assert!(
+            d.held_bytes() <= d.memory_limit(),
+            "held {} over the limit {}: {:?}",
+            d.held_bytes(),
+            d.memory_limit(),
+            d.ledger()
+        );
+    }
+
+    #[test]
+    fn a_piece_handed_over_with_runs_out_does_not_take_held_past_the_limit() {
+        // The same with work in hand, which is the ordinary budget's path: a
+        // run out on a worker, a piece parked, and a limit with room for the
+        // next piece only beside the parked one's capacity.
+        let mut d = decoder(2, u64::MAX);
+        d.set_chase(false);
+        assert_eq!(one_run_through_a_worker(&mut d), MIB as u64);
+        let parked = d.segs.spare_bytes();
+        assert!(parked > 0, "the first run's piece is parked");
+        let next = run(MIB, 1);
+        let third = run(MIB, 2);
+        let mut rest = next[MIB / 2..].to_vec();
+        rest.extend_from_slice(&third[..1]);
+        assert!(d.feed_owned(exact(&rest)).expect("feed").is_none());
+        d.scan().expect("scan");
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert!(d.has_work_in_hand());
+        let parked = d.segs.spare_bytes();
+        assert!(parked > 0, "a piece is parked: {:?}", d.ledger());
+
+        let piece = exact(&third[1..third.len() / 2]);
+        let limit = d.held_bytes() - parked + piece.capacity() as u64;
+        d.set_memory_limit(limit);
+        assert_eq!(d.memory_limit(), limit, "the pair bound is not the limit");
+        assert!(
+            d.feed_owned(piece).expect("feed").is_none(),
+            "{:?}",
+            d.ledger()
+        );
+        assert!(
+            d.held_bytes() <= d.memory_limit(),
+            "held {} over the limit {}: {:?}",
+            d.held_bytes(),
+            d.memory_limit(),
+            d.ledger()
         );
     }
 
