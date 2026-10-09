@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-10-09
 
 - `CrcFolder::range` folds a range from its first piece instead of from the
   empty checksum. Combining a piece with nothing gives the piece back, and it
