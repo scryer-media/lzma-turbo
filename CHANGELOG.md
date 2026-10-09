@@ -9,6 +9,25 @@
   fold, and a range of `n` pieces costs `n - 1`. On Apple M5 Max, 8192
   one-piece `u32` ranges took 61 ms at 4 KiB a piece and 131 to 138 ms at
   16 MiB a piece; they now take under 0.3 ms at either size.
+- `Lzma2AdaptiveDecoder` no longer settles on one run out under a memory
+  limit that pays for several. Three rules held it there. The input budget
+  set aside a run for every thread, including the ones already out with a
+  run and already charged for it; it now sets aside a run for the idle
+  threads only (worked through at 4 threads, a 1538 MiB limit, 128 MiB runs and 3 out, the
+  input ceiling goes from 513 to 577 MiB and the room for the next piece from
+  1 to 65 MiB). A whole piece that completes the run in hand is now taken
+  whenever the limit has room for it, where the floor used to refuse any
+  piece that ran more than a megabyte past the run's end. And a run that
+  would be refused for want of room first gets the parked capacity its
+  dispatch will not reuse - every spare output buffer but the last, every
+  parked input piece - when that is enough to let it through.
+- `Lzma2AdaptiveDecoder::dispatch_cost(unpacked_len)`: what dispatching a run
+  adds to `held_bytes()`, the arithmetic the decoder's own dispatch rule uses,
+  for a caller that gates its reads on the same predicate.
+- `Lzma2AdaptiveDecoder::set_memory_limit(limit)`: changes the limit
+  mid-stream, so a caller with a queue of its own can give the decoder the
+  budget less that queue before each feed or drain. `held_bytes()` is
+  documented as excluding anything the caller holds.
 
 ## 0.7.0 - 2026-10-07
 
