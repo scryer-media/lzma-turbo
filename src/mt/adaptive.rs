@@ -244,6 +244,9 @@ pub struct Lzma2AdaptiveDecoder {
     /// True while the single-threaded decoder is part way through a run. The
     /// threaded path must not claim a run it has started.
     st_in_run: bool,
+    /// Where the last run the chase finished ends: the start of the next run,
+    /// which the chase is not in when it stops there.
+    st_retired_end: u64,
 
     // The worker pool, spawned on first dispatch.
     pool: Option<Pool>,
@@ -373,6 +376,7 @@ impl Lzma2AdaptiveDecoder {
             st: None,
             st_wr: 0,
             st_in_run: false,
+            st_retired_end: 0,
             part: None,
             pool: None,
             outstanding: 0,
@@ -1311,10 +1315,15 @@ impl Lzma2AdaptiveDecoder {
                     // is refused piece by piece until its end is seen, which
                     // with nothing out is never; the chase decodes what is
                     // held so the rest can come in.
+                    //
+                    // Parked input is not in the way: the next piece is
+                    // copied into it, and `room_to_take` leaves it out for
+                    // that reason. Counting it here would call a decoder full
+                    // that has a whole piece's room waiting for the input.
                     let waiting_for_input = !self.chase
                         && !self.input_done
                         && !self.input_refused
-                        && self.held_bytes() < self.limit();
+                        && self.held_bytes() - self.segs.spare_bytes() < self.limit();
                     if !busy && !waiting_for_input {
                         stat!(self.stats.chase_steps_none_arm += 1;);
                         if self.st_step(&mut sink, &mut left)? {
@@ -1331,6 +1340,12 @@ impl Lzma2AdaptiveDecoder {
                 && self.ready.is_empty()
                 && self.part.is_none()
             {
+                // Nothing more can be fed and no run is left to decode, so
+                // what is parked for the next piece or the next run never
+                // will be used.
+                self.segs.shed_spare();
+                self.spare_out.clear();
+                self.spare_cap = 0;
                 return Ok(DrainStatus::Finished);
             }
             if left == 0 {
@@ -1913,6 +1928,7 @@ impl Lzma2AdaptiveDecoder {
     fn retire_runs(&mut self) {
         while let Some(front) = self.pending.front().copied() {
             if front.in_offset + front.packed_len <= self.cursor_in {
+                self.st_retired_end = front.in_offset + front.packed_len;
                 self.pending.pop_front();
                 self.runs_claimed += 1;
                 self.next_index += 1;
@@ -1922,9 +1938,17 @@ impl Lzma2AdaptiveDecoder {
         }
         self.st_in_run = match self.pending.front() {
             Some(front) => self.cursor_in > front.in_offset,
-            // Past every complete run: either inside the run still arriving,
-            // or exactly at the end marker.
-            None => self.stream_end.is_none_or(|e| self.cursor_in + 1 < e),
+            // Past every complete run: inside the run still arriving, at its
+            // start, or exactly at the end marker. At its start - the end of
+            // the run the chase has just finished - the chase is in no run,
+            // and the next one is a worker's once it is complete; holding on
+            // there would decode it here a step at a time, chasing off or
+            // not.
+            None => {
+                let at_start = self.cursor_in == self.st_retired_end
+                    && self.st.as_ref().is_none_or(Lzma2Decoder::at_chunk_boundary);
+                !at_start && self.stream_end.is_none_or(|e| self.cursor_in + 1 < e)
+            }
         };
     }
 
@@ -2430,5 +2454,101 @@ mod tests {
         d.set_memory_limit(d.held_bytes() + cost);
         assert!(d.room_for(last));
         assert_eq!(d.dispatch_cost(reuse / 2), 0);
+    }
+
+    /// Decodes a whole run on a worker and hands it over, leaving the piece
+    /// it came in parked and the start of the next run in hand.
+    fn one_run_through_a_worker(d: &mut Lzma2AdaptiveDecoder) -> u64 {
+        let first = run(MIB, 0);
+        let next = run(MIB, 1);
+        let mut out = 0u64;
+        assert!(d.feed_owned(exact(&first)).expect("feed").is_none());
+        assert!(
+            d.feed_owned(exact(&next[..MIB / 2]))
+                .expect("feed")
+                .is_none()
+        );
+        while d.runs_claimed() == 0 || d.outstanding != 0 || out < MIB as u64 {
+            d.drain(|_, b| out += b.len() as u64).expect("drain");
+            d.wait_for_worker();
+        }
+        out
+    }
+
+    #[test]
+    fn parked_input_does_not_make_a_decoder_short_of_input_chase() {
+        // A decoder with chasing off, the run at the cursor half fed, nothing
+        // out: it waits for the rest of the run. The piece the last run came
+        // in is parked for the next copy, and the limit is exactly what is
+        // held. Without the parked piece there is a piece's room, so this is
+        // a decoder short of input and not one at its limit.
+        let mut d = decoder(2, u64::MAX);
+        d.set_chase(false);
+        assert_eq!(one_run_through_a_worker(&mut d), MIB as u64);
+        assert!(d.segs.spare_bytes() > 0, "the first run's piece is parked");
+        assert_eq!(d.outstanding, 0);
+        assert_eq!(d.chase_decoded_bytes(), 0);
+
+        d.set_memory_limit(d.held_bytes());
+        let status = d.drain(|_, _| {}).expect("drain");
+        assert_eq!(status, DrainStatus::NeedsMoreInput);
+        assert_eq!(
+            d.chase_decoded_bytes(),
+            0,
+            "the calling thread decoded a run it was only waiting to be fed"
+        );
+    }
+
+    #[test]
+    fn the_chase_lets_go_at_the_end_of_a_run() {
+        // A run too large for the limit is chased; the next run has only
+        // begun to arrive. Once the chase has finished the first run it is
+        // between runs, not inside one, and the next run is the workers' as
+        // soon as it is complete.
+        let mut d = decoder(2, u64::MAX);
+        d.set_chase(false);
+        let first = run(256 << 10, 0);
+        let next = run(256 << 10, 1);
+        hold(&mut d, &first);
+        hold(&mut d, &next[..next.len() / 2]);
+        d.scan().expect("scan");
+        assert_eq!(d.pending.len(), 1);
+
+        d.set_memory_limit(1 << 10);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Chase);
+        let mut left = usize::MAX;
+        while !d.pending.is_empty() {
+            assert!(d.st_step(&mut |_, _| {}, &mut left).expect("step"));
+        }
+        assert_eq!(d.cursor_in, first.len() as u64);
+        d.set_memory_limit(u64::MAX);
+
+        assert!(!d.st_in_run, "at the boundary the chase is in no run");
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::None);
+    }
+
+    #[test]
+    fn a_finished_decoder_keeps_nothing_parked() {
+        // Nothing can be fed to a finished decoder, so nothing it parked for
+        // the next piece or the next run will ever be used.
+        let mut d = decoder(2, u64::MAX);
+        let mut stream = run(MIB, 0);
+        stream.extend_from_slice(&run(MIB, 1));
+        stream.push(0);
+        let mut pos = 0;
+        loop {
+            if pos < stream.len() {
+                let end = (pos + (256 << 10)).min(stream.len());
+                pos += d.feed(&stream[pos..end]).expect("feed");
+                if pos == stream.len() {
+                    d.end_of_input();
+                }
+            }
+            if d.drain(|_, _| {}).expect("drain") == DrainStatus::Finished {
+                break;
+            }
+            d.wait_for_worker();
+        }
+        assert_eq!(d.held_bytes(), 0, "{:?}", d.ledger());
     }
 }
