@@ -93,6 +93,15 @@ impl PushSource {
         self.buf.len() - self.start
     }
 
+    /// Back to what `new` returns, with the queue's allocation kept.
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.start = 0;
+        self.ended = false;
+        self.starved = false;
+        self.total = 0;
+    }
+
     /// Queues as much of `data` as fits under `cap`, returning how much.
     fn fill(&mut self, data: &[u8], cap: usize) -> usize {
         if self.start != 0 {
@@ -172,6 +181,27 @@ impl LzmaPushEncoder {
             src: PushSource::new(LZMA_QUEUE)?,
             done: false,
         })
+    }
+
+    /// Makes this encoder ready for another stream, coded with `props`: what
+    /// [`LzmaPushEncoder::new`] would return, but with the queue, the window
+    /// and the tables this one already has, wherever the new settings need no
+    /// more than they hold. A stream in progress is abandoned where it stands.
+    ///
+    /// C: `LzmaEnc_SetProps` and `LzmaEnc_Prepare` on an encoder that has been
+    /// used. The bytes written from here on are a new encoder's.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaPushEncoder::new`]. After an error the encoder takes no input
+    /// until a later call succeeds.
+    pub fn reset(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
+        self.done = true;
+        self.enc.set_props(&single_finder(props))?;
+        self.enc.prepare(0)?;
+        self.src.reset();
+        self.done = false;
+        Ok(())
     }
 
     /// The five LZMA property bytes a decoder needs for this setting.
@@ -288,6 +318,30 @@ impl Lzma2PushEncoder {
             begun: false,
             done: false,
         })
+    }
+
+    /// Makes this encoder ready for another stream, coded with `props`: what
+    /// [`Lzma2PushEncoder::new`] would return, but with the queue, the window
+    /// and the tables this one already has, wherever the new settings need no
+    /// more than they hold. A stream in progress is abandoned where it stands.
+    ///
+    /// C: `Lzma2Enc_SetProps` on a handle that has been used; the block loop's
+    /// `LzmaEnc_Alloc` and `LzmaEnc_Init` then open the next stream as they
+    /// open every block. The bytes written from here on are a new encoder's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2PushEncoder::new`]. After an error the encoder takes no input
+    /// until a later call succeeds.
+    pub fn reset(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
+        self.done = true;
+        self.enc.set_props(&single_finder(props))?;
+        // What `LzmaEnc_Alloc` would refuse, refused here as `new` refuses it.
+        self.enc.coder.check_alloc()?;
+        self.src.reset();
+        self.begun = false;
+        self.done = false;
+        Ok(())
     }
 
     /// C: the head of `Lzma2Enc_EncodeMt1`'s block loop, run once before the
@@ -588,5 +642,138 @@ mod tests {
     fn lzma2_refuses_lc_plus_lp_above_four() {
         let p = LzmaEncProps::new().with_lclppb(4, 4, 2);
         assert!(matches!(Lzma2PushEncoder::new(&p), Err(Error::Param)));
+    }
+
+    /// Settings that differ in the dictionary, the parser, the finder, the
+    /// literal coder and the match length, over inputs that end before the
+    /// queue has filled, after it, and not at all.
+    fn reset_steps() -> Vec<(LzmaEncProps, Vec<u8>)> {
+        let big = LzmaEncProps::new().with_level(5).with_dict_size(1 << 20);
+        alloc::vec![
+            (big, text(LZMA2_QUEUE + 200_003)),
+            (props(), noise(70_000)),
+            (
+                LzmaEncProps::new().with_level(5).with_dict_size(1 << 12),
+                text(100)
+            ),
+            (props().with_lclppb(0, 2, 2), text(LZMA_QUEUE + 5)),
+            (big, Vec::new()),
+            (
+                LzmaEncProps::new()
+                    .with_level(9)
+                    .with_dict_size(1 << 16)
+                    .with_fast_bytes(273),
+                text(300_000)
+            ),
+        ]
+    }
+
+    /// One encoder, reset from stream to stream, writes for each what an
+    /// encoder built for it writes, and once it has coded the largest of them
+    /// it allocates nothing more.
+    #[test]
+    fn a_reset_lzma2_encoder_writes_what_a_new_one_writes() {
+        let steps = reset_steps();
+        let mut enc = Lzma2PushEncoder::new(&steps[0].0).unwrap();
+        let mut allocs = 0;
+        for pass in 0..2 {
+            for (i, (p, src)) in steps.iter().enumerate() {
+                if pass + i > 0 {
+                    enc.reset(p).unwrap();
+                }
+                let mut out = Vec::new();
+                for piece in src.chunks(300_001) {
+                    enc.push(piece, &mut out).unwrap();
+                }
+                enc.finish(&mut out).unwrap();
+                let fresh = Lzma2PushEncoder::new(p).unwrap();
+                assert_eq!(enc.properties(), fresh.properties(), "step {i}");
+                assert_eq!(enc.dict_size(), fresh.dict_size(), "step {i}");
+                assert!(out == pull_lzma2(p, src), "pass {pass}, step {i}");
+                if pass == 1 {
+                    assert_eq!(enc.enc.coder.finder_allocs(), allocs, "step {i}");
+                }
+            }
+            allocs = enc.enc.coder.finder_allocs();
+        }
+        assert!(allocs > 0);
+    }
+
+    #[test]
+    fn a_reset_lzma_encoder_writes_what_a_new_one_writes() {
+        let steps = reset_steps();
+        let mut enc = LzmaPushEncoder::new(&steps[0].0).unwrap();
+        let mut allocs = 0;
+        for pass in 0..2 {
+            for (i, (p, src)) in steps.iter().enumerate() {
+                if pass + i > 0 {
+                    enc.reset(p).unwrap();
+                }
+                let mut out = Vec::new();
+                for piece in src.chunks(65_537) {
+                    enc.push(piece, &mut out).unwrap();
+                }
+                enc.finish(&mut out).unwrap();
+                let fresh = LzmaPushEncoder::new(p).unwrap();
+                assert_eq!(enc.properties(), fresh.properties(), "step {i}");
+                assert!(out == pull_lzma(p, src), "pass {pass}, step {i}");
+                if pass == 1 {
+                    assert_eq!(enc.enc.mf.cfg().allocs, allocs, "step {i}");
+                }
+            }
+            allocs = enc.enc.mf.cfg().allocs;
+        }
+        assert!(allocs > 0);
+    }
+
+    /// A reset abandons a stream that is under way, reopens an encoder that
+    /// has finished, and after a setting it refuses leaves the encoder closed
+    /// until one it accepts.
+    #[test]
+    fn a_reset_abandons_the_stream_under_way() {
+        let p = props();
+        let long = text(LZMA2_QUEUE + 300_007);
+        let short = &long[..70_000];
+
+        let mut enc = Lzma2PushEncoder::new(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(&long, &mut out).unwrap();
+        assert!(!out.is_empty(), "chunks were written and more are queued");
+        enc.reset(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(short, &mut out).unwrap();
+        enc.finish(&mut out).unwrap();
+        assert!(out == pull_lzma2(&p, short));
+        assert_eq!(enc.push(b"x", &mut out), Err(Error::Param));
+        let refused = LzmaEncProps::new().with_lclppb(4, 4, 2);
+        assert_eq!(enc.reset(&refused), Err(Error::Param));
+        assert_eq!(enc.push(b"x", &mut out), Err(Error::Param));
+        assert_eq!(enc.finish(&mut out), Err(Error::Param));
+        enc.reset(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(short, &mut out).unwrap();
+        enc.finish(&mut out).unwrap();
+        assert!(out == pull_lzma2(&p, short));
+
+        // Incompressible, so the range coder's buffer has been written out.
+        let long = noise(LZMA_QUEUE * 3);
+        let mut enc = LzmaPushEncoder::new(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(&long, &mut out).unwrap();
+        assert!(!out.is_empty(), "blocks were written and more are queued");
+        enc.reset(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(short, &mut out).unwrap();
+        enc.finish(&mut out).unwrap();
+        assert!(out == pull_lzma(&p, short));
+        assert_eq!(enc.push(b"x", &mut out), Err(Error::Param));
+        let refused = LzmaEncProps::new().with_lclppb(9, 0, 2);
+        assert_eq!(enc.reset(&refused), Err(Error::Param));
+        assert_eq!(enc.push(b"x", &mut out), Err(Error::Param));
+        enc.reset(&p).unwrap();
+        let mut out = Vec::new();
+        enc.push(short, &mut out).unwrap();
+        enc.finish(&mut out).unwrap();
+        assert!(out == pull_lzma(&p, short));
     }
 }

@@ -150,6 +150,12 @@ impl Lzma2EncInt {
     pub(crate) fn check_alloc(&mut self) -> Result<(), Error> {
         self.enc.check_alloc(UNPACK_SIZE_MAX)
     }
+
+    /// How many times the match finder has allocated a window or its tables.
+    #[cfg(test)]
+    pub(crate) fn finder_allocs(&mut self) -> u32 {
+        self.enc.mf.cfg().allocs
+    }
 }
 
 /// How one LZMA2 block's subblock loop is run.
@@ -485,14 +491,19 @@ impl Lzma2Encoder {
     /// C: the `t1` / `t2` / `t3` arithmetic at the head of
     /// `Lzma2EncProps_Normalize`, as `(match finder threads, block threads)`.
     ///
-    /// `t1n` is the normalized default for `lzmaProps.numThreads`, which this
-    /// port keeps at 1 (see [`LzmaEncProps::with_num_threads`]), so `t3` and
-    /// `t2` coincide unless the caller asked for a second finder thread.
+    /// A caller who names block threads, or no thread count at all, gets one
+    /// finder thread unless the settings ask for two: this port's default for
+    /// `lzmaProps.numThreads` is 1 (see [`LzmaEncProps::with_num_threads`]).
+    ///
+    /// A caller who gives only a total has left the split to the encoder, and
+    /// gets the C's: `t1n`, the finder's thread count, is the one the settings
+    /// name, or 2 where they name none and the finder can take a thread of its
+    /// own, and the total is divided by it. So a total of N over a binary tree
+    /// in normal mode is N / 2 block coders, each with a threaded finder, and
+    /// a total of N over a hash chain, or in fast mode, is N block coders.
     fn split_threads(&self) -> (usize, usize) {
-        // C: `t1n` is `lzmaProps.numThreads` after a normalize of its own,
-        // which this port leaves at 1; `t1` is the raw setting, still -1 when
-        // the caller never named one.
-        let t1n: i32 = LzmaEncProps::new().normalized().num_threads.max(1) as i32;
+        // C: `t1` is the raw setting, still -1 when the caller never named
+        // one.
         let mut t1 = self.props.num_threads;
         let mut t2 = self.threads;
         let t3 = self.total_threads;
@@ -500,16 +511,35 @@ impl Lzma2Encoder {
         if t3 == 0 {
             t2 = t2.max(1);
         } else if t2 == 0 {
+            // C: `t1n`, `lzmaProps.numThreads` after a normalize of its own:
+            // `(btMode && algo) ? 2 : 1` where the caller named none. The C
+            // also divides by a count named for a finder that cannot thread;
+            // here that finder counts as the one thread it runs on, and a
+            // count above two as the two a finder can use.
+            let mut normal = self.props;
+            normal.normalize();
+            let threaded_finder = normal.bt_mode != 0 && normal.algo != 0;
+            let t1n: i32 = if !threaded_finder {
+                1
+            } else if t1 <= 0 {
+                2
+            } else {
+                t1.min(2)
+            };
             t2 = t3 / t1n as usize;
             if t2 == 0 {
                 t1 = 1;
                 t2 = t3;
+            } else {
+                t1 = t1n;
             }
             t2 = t2.min(THREADS_LIMIT);
         } else if t1 <= 0 {
             t1 = (t3 / t2).max(1) as i32;
         }
-        let mf = if t1 <= 0 { t1n } else { t1 };
+        // No total, or block threads named and the total spent on them: the
+        // port's default of one finder thread.
+        let mf = if t1 <= 0 { 1 } else { t1 };
         (mf.clamp(1, 2) as usize, t2.clamp(1, THREADS_LIMIT))
     }
 
@@ -542,6 +572,27 @@ impl Lzma2Encoder {
         self.coder.set_props(&want)?;
         self.dict_size = self.coder.dict_size;
         self.coder_props = want;
+        Ok(())
+    }
+
+    /// C: `Lzma2Enc_SetProps` on a handle that has been used: `props` in place
+    /// of the settings [`Lzma2Encoder::new`] was given. The block size, the
+    /// thread counts, the memory limit and the data size stay as they are, and
+    /// so does everything the encoder has allocated; the next stream is
+    /// written as a new encoder with these settings would write it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2Encoder::new`], with the encoder left as it was.
+    pub(crate) fn set_props(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
+        props.check_lclp_for_lzma2()?;
+        let old = core::mem::replace(&mut self.props, *props);
+        // `LzmaEnc_SetProps` checks every setting before it takes any, so a
+        // refusal has changed nothing in the coder either.
+        if let Err(err) = self.sync_coder() {
+            self.props = old;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -590,7 +641,10 @@ impl Lzma2Encoder {
     pub fn block_size(&self) -> u64 {
         match self.block_size {
             BLOCK_SIZE_AUTO => {
-                if self.threads <= 1 {
+                // C: `t2 <= 1`, the block threads the split above arrives at,
+                // which for a caller who gave only a total is not a number
+                // they set.
+                if self.split_threads().1 <= 1 {
                     // C: "if there is no block multi-threading, we use SOLID
                     // block".
                     BLOCK_SIZE_SOLID
@@ -617,6 +671,21 @@ impl Lzma2Encoder {
     /// divides the budget: `numBlockThreads_Max = numTotalThreads /
     /// numThreads`. Setting it to zero goes back to "derive it from the block
     /// thread count".
+    ///
+    /// The divisor is the match finder's thread count: the one
+    /// [`LzmaEncProps::with_num_threads`] named, or, where none was named, two
+    /// for a binary-tree finder outside fast mode and one for a hash chain or
+    /// for fast mode, whose finder cannot take a thread of its own. A total of
+    /// `N` is therefore `N / 2` block coders with threaded finders in the
+    /// first case and `N` block coders in the second. Blocks are only coded in
+    /// parallel when a block size is set ([`Lzma2Encoder::set_block_size`]);
+    /// under the default, one solid block, the total buys the threaded finder
+    /// and nothing more.
+    ///
+    /// The total is not a count of operating-system threads. The C counts a
+    /// threaded finder as two, and it runs on three - the coder, the hash
+    /// thread and the tree thread - so a total of `N` over a binary tree
+    /// starts about `1.5 N` threads.
     pub fn set_total_threads(&mut self, threads: usize) {
         self.total_threads = threads;
         if threads != 0 {
@@ -1217,6 +1286,131 @@ mod tests {
         enc.set_threads(16);
         enc.set_data_size(3 * (1 << 16));
         assert_eq!(enc.threads_reduced(), 3);
+    }
+
+    /// A total and nothing else leaves the split to the encoder: half the
+    /// total in block coders where the finder takes a thread of its own, the
+    /// whole total where it cannot. Naming block threads, or no thread count
+    /// at all, still gets the one finder thread this port defaults to.
+    #[test]
+    fn a_total_alone_is_split_by_what_the_finder_can_use() {
+        use crate::enc::MatchFinderKind;
+
+        let blocks = |n: usize| n.min(THREADS_LIMIT);
+        let tree = LzmaEncProps::new().with_level(5);
+        let chain = tree.with_match_finder(MatchFinderKind::Hc4);
+        let fast = LzmaEncProps::new().with_level(1);
+        // Fast mode defaults to a hash chain; this names the tree back.
+        let fast_tree = tree
+            .with_fast_mode(true)
+            .with_match_finder(MatchFinderKind::Bt4);
+
+        // (settings, total) -> (match finder threads, block threads)
+        let by_total: [(&str, LzmaEncProps, usize, (usize, usize)); 21] = [
+            ("tree", tree, 1, (1, 1)),
+            ("tree", tree, 2, (2, 1)),
+            ("tree", tree, 3, (2, 1)),
+            ("tree", tree, 4, (2, 2)),
+            ("tree", tree, 8, (2, 4)),
+            ("tree", tree, 18, (2, 9)),
+            ("tree, two named", tree.with_num_threads(2), 1, (1, 1)),
+            ("tree, two named", tree.with_num_threads(2), 8, (2, 4)),
+            ("tree, eight named", tree.with_num_threads(8), 8, (2, 4)),
+            ("tree, one named", tree.with_num_threads(1), 1, (1, 1)),
+            ("tree, one named", tree.with_num_threads(1), 8, (1, 8)),
+            ("chain", chain, 1, (1, 1)),
+            ("chain", chain, 2, (1, 2)),
+            ("chain", chain, 8, (1, 8)),
+            ("chain, two named", chain.with_num_threads(2), 8, (1, 8)),
+            ("fast", fast, 1, (1, 1)),
+            ("fast", fast, 4, (1, 4)),
+            ("fast", fast, 18, (1, 18)),
+            ("fast tree", fast_tree, 2, (1, 2)),
+            ("fast tree", fast_tree, 8, (1, 8)),
+            (
+                "fast tree, two named",
+                fast_tree.with_num_threads(2),
+                8,
+                (1, 8),
+            ),
+        ];
+        for (name, props, total, (finder, block)) in by_total {
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_total_threads(total);
+            assert_eq!(
+                enc.split_threads(),
+                (finder, blocks(block)),
+                "{name}, a total of {total}"
+            );
+            // The coder is given the finder's share.
+            assert_eq!(enc.effective_props().num_threads, finder as i32, "{name}");
+            // C: "if there is no block multi-threading, we use SOLID block".
+            enc.set_block_size(BLOCK_SIZE_AUTO);
+            assert_eq!(
+                enc.block_size() == BLOCK_SIZE_SOLID,
+                blocks(block) <= 1,
+                "{name}, a total of {total}"
+            );
+        }
+
+        // No total: the finder's default is one thread, whatever the kind.
+        for (props, finder) in [
+            (tree, 1),
+            (tree.with_num_threads(2), 2),
+            (chain, 1),
+            (fast, 1),
+        ] {
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            assert_eq!(enc.split_threads(), (finder, 1));
+            enc.set_threads(6);
+            assert_eq!(enc.split_threads(), (finder, blocks(6)));
+        }
+
+        // A total with the block threads named: what is left over goes to the
+        // finder, as it always did.
+        for (total, threads, finder) in [(4usize, 2usize, 2usize), (4, 4, 1), (2, 4, 1)] {
+            let mut enc = Lzma2Encoder::new(&tree).unwrap();
+            enc.set_total_threads(total);
+            enc.set_threads(threads);
+            assert_eq!(enc.split_threads(), (finder, blocks(threads)));
+        }
+    }
+
+    /// A total alone writes what its split writes when the caller names it:
+    /// one solid block where one block coder is all it comes to, the automatic
+    /// block size where it comes to more.
+    #[test]
+    #[cfg(feature = "std")]
+    fn a_total_alone_writes_what_its_split_writes_when_named() {
+        use std::io::Read as _;
+
+        // Three blocks at the automatic size for this dictionary.
+        let src = mixed((2 << 20) + 5);
+        let tree = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+        let fast = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+        for (props, total) in [(tree, 1usize), (tree, 2), (tree, 4), (fast, 1), (fast, 2)] {
+            let mut by_total = Lzma2Encoder::new(&props).unwrap();
+            by_total.set_block_size(BLOCK_SIZE_AUTO);
+            by_total.set_total_threads(total);
+            let (finder, block) = by_total.split_threads();
+
+            let mut named = Lzma2Encoder::new(&props.with_num_threads(finder as u32)).unwrap();
+            named.set_block_size(BLOCK_SIZE_AUTO);
+            named.set_threads(block);
+
+            assert_eq!(by_total.block_size(), named.block_size(), "{total}");
+            assert_eq!(by_total.block_size() == BLOCK_SIZE_SOLID, block == 1);
+            let got = by_total.encode_to_vec(&src).unwrap();
+            assert_eq!(by_total.properties(), named.properties(), "{total}");
+            assert!(got == named.encode_to_vec(&src).unwrap(), "{total}");
+
+            let mut back = Vec::new();
+            crate::Lzma2Reader::new(&got[..], by_total.properties())
+                .unwrap()
+                .read_to_end(&mut back)
+                .unwrap();
+            assert!(back == src, "{total}");
+        }
     }
 
     /// `sync_coder` gives the encoder `new` built its new settings; it does
