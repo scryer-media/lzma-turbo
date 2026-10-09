@@ -2,6 +2,16 @@
 
 ## 0.8.0 - 2026-10-09
 
+- The BCJ2 decoder copies each run of the main stream as one slice. It used
+  to store a byte at a time through the call's streams, which kept the output
+  position in memory and spent most of the conversion storing it; it now finds
+  the byte that ends the run and copies up to it. The output is unchanged
+  (`bcj2_parity` against the SDK, and a test that cuts the output and the main
+  stream at, just before and just after a branch byte). Verified, median of
+  five on an x86-64 Linux host: converting a 64 MiB x86 payload takes 68.6 ms,
+  down from 82.8 ms. Verified, median of seven on an x86-64 Windows host: a
+  one-thread 7z BCJ2 decode goes from 0.97 to 0.99 of 7-Zip's time with its
+  filter thread off.
 - The threaded match finder's binary-tree walk tests the one byte at the
   current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
   Most nodes of a walk differ at that byte, so they now cost two byte loads
