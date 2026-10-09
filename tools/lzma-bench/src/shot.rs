@@ -263,6 +263,8 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
 /// The size of a piece the adaptive lane hands over: what a reader pulling
 /// its own input in pieces it gives away would read at a time.
 const ADAPTIVE_PIECE: usize = 4 << 20;
+/// The smallest read the adaptive shot makes under a tight limit.
+const ADAPTIVE_PIECE_MIN: usize = 64 << 10;
 
 /// `Lzma2AdaptiveDecoder` the way a consumer pulling its own input drives it:
 /// read a piece, hand it over whole, drain, and when the decoder refuses the
@@ -283,6 +285,12 @@ fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     let t0 = Instant::now();
     let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts).map_err(|e| e.to_string())?;
     dec.set_chase(false);
+    // The decoder charges a piece its allocation and admits it by that, so a
+    // read sized past the limit would never be taken. Under a tight limit the
+    // reads come down to a quarter of it, and never below a small floor.
+    let piece_len = usize::try_from(shot.memory_limit / 4)
+        .unwrap_or(usize::MAX)
+        .clamp(ADAPTIVE_PIECE_MIN, ADAPTIVE_PIECE);
     let mut hand: Option<Vec<u8>> = None;
     let mut eof = false;
     let mut write_err = None;
@@ -290,8 +298,8 @@ fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
         if hand.is_none() && !eof {
             let mut piece = dec.reclaim_piece().unwrap_or_default();
             piece.clear();
-            piece.reserve_exact(ADAPTIVE_PIECE);
-            piece.resize(ADAPTIVE_PIECE, 0);
+            piece.reserve_exact(piece_len);
+            piece.resize(piece_len, 0);
             let mut filled = 0;
             while filled < piece.len() {
                 match stream
@@ -303,7 +311,7 @@ fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
                 }
             }
             piece.truncate(filled);
-            if filled < ADAPTIVE_PIECE {
+            if filled < piece_len {
                 eof = true;
             }
             if filled != 0 {
