@@ -220,17 +220,45 @@ impl Finder {
         }
     }
 
-    /// The handle the threaded finder's producer threads are started from.
+    /// The handle a stream's pair of producer threads is started from, by
+    /// [`crate::enc::lz_find_mt::with_threads`].
     ///
     /// C: there is no analogue - the C's threads are created once in
-    /// `MatchFinderMt_Create` and live until the encoder is destroyed. Here
-    /// they are scoped to one block, so the caller that owns the input for
-    /// that block is the one that starts them.
+    /// `MatchFinderMt_Create` and live until the encoder is destroyed. On the
+    /// stream path they are scoped to the stream, so the caller that owns the
+    /// input is the one that starts them.
     #[cfg(feature = "std")]
-    pub(crate) fn mt_handle(&self) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
+    pub(crate) fn mt_handle(
+        &mut self,
+    ) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
         match self {
             Finder::St(_) => None,
-            Finder::Mt(mt) => mt.shared_handle().cloned(),
+            Finder::Mt(mt) => mt.stream_handle(),
+        }
+    }
+
+    /// The handle [`crate::enc::lz_find_mt::run_block`] runs a block with,
+    /// the finder's pair of producer threads running and kept for the next.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if a thread cannot be started.
+    #[cfg(feature = "std")]
+    pub(crate) fn mt_block_handle(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>>, Error> {
+        match self {
+            Finder::St(_) => Ok(None),
+            Finder::Mt(mt) => mt.block_handle(),
+        }
+    }
+
+    /// How many pairs of producer threads the finder has started for blocks.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn mt_spawns(&self) -> u32 {
+        match self {
+            Finder::St(_) => 0,
+            Finder::Mt(mt) => mt.spawns,
         }
     }
 

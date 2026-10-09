@@ -1023,6 +1023,31 @@ struct Common {
 }
 
 impl Common {
+    /// No buffers: every length zero and every pointer dangling, so that a
+    /// slice formed from them is empty rather than invalid.
+    fn empty() -> Self {
+        Common {
+            win: core::ptr::NonNull::dangling().as_ptr(),
+            win_len: 0,
+            tab: core::ptr::NonNull::dangling().as_ptr(),
+            bufs: core::ptr::NonNull::dangling().as_ptr(),
+            hash_mask: 0,
+            fixed_hash_size: 0,
+            son_base: 0,
+            son_len: 0,
+            history_size: 0,
+            num_hash_bytes: 0,
+            match_max_len: 0,
+            cut_value: 0,
+            cyclic_buffer_size: 0,
+            keep_size_before: 0,
+            keep_size_after: 0,
+            crc: [0; 256],
+            heads: Heads::H4,
+            mix: Mix::Three,
+        }
+    }
+
     /// The window.
     ///
     /// # Safety
@@ -1179,7 +1204,14 @@ struct LzState {
 /// `move_block`, which is the one operation that touches all three and takes
 /// both critical sections first.
 pub(crate) struct MtShared {
-    common: Common,
+    /// Written only by the lz thread in [`MatchFinderMt::create`], between
+    /// streams, when neither producer thread is past `can_start`; read by
+    /// every thread through [`MtShared::common`] during a stream.
+    common: UnsafeCell<Common>,
+    /// The block a pair of threads kept across blocks reads its input from;
+    /// see [`run_block`]. The hash thread's during a stream, the lz thread's
+    /// between streams.
+    block: UnsafeCell<BlockInput>,
     hash_state: UnsafeCell<HashState>,
     bt_state: UnsafeCell<BtState>,
     lz_state: UnsafeCell<LzState>,
@@ -1198,24 +1230,124 @@ pub(crate) struct MtShared {
     /// it in `CheckErrors`, as the C reads `failure_LZ_BT`.
     thread_failed: AtomicBool,
     /// The allocations `Common`'s pointers address. Nothing reads or writes
-    /// through these fields while a thread can reach the pointers; they are
-    /// here so that the buffers outlive every thread, and so that
-    /// [`MatchFinderMt::create`] can take them back for the next block.
-    own_win: Vec<u8>,
-    own_tab: Vec<u32>,
-    own_bufs: Vec<u32>,
+    /// through this cell while a thread can reach the pointers; it is here so
+    /// that the buffers outlive every thread, and so that
+    /// [`MatchFinderMt::create`] can take them back for the next block. It is
+    /// entered only where `common` is written.
+    own: UnsafeCell<Owned>,
+}
+
+/// The allocations behind [`Common`]'s pointers.
+#[derive(Default)]
+struct Owned {
+    win: Vec<u8>,
+    tab: Vec<u32>,
+    bufs: Vec<u32>,
+}
+
+/// The block [`run_block`] hands the hash thread, as the C's
+/// `MatchFinder_SET_DIRECT_INPUT_BUF` hands it `src`: what it reads into the
+/// window in place of a stream.
+struct BlockInput {
+    ptr: *const u8,
+    len: usize,
+    /// How much of it the hash thread has read.
+    pos: usize,
 }
 
 // SAFETY: `Common`'s three raw pointers address allocations owned by this same
-// struct, so they are valid for as long as any thread can reach them. Every
-// other field is either immutable after construction or an `UnsafeCell` whose
-// contents are partitioned between the threads by the block protocol described
-// at the top of this module; the partition, not a lock, is what makes the
-// concurrent access disjoint, which is exactly the argument `C/LzFindMt.c`
-// makes for the same struct.
+// struct, so they are valid for as long as any thread can reach them, and
+// `BlockInput`'s addresses a block that `run_block` keeps borrowed until both
+// producer threads have stopped. Every other field is either an atomic or an
+// `UnsafeCell` whose contents are partitioned between the threads by the block
+// protocol described at the top of this module - `common`, `own` and `block`
+// by the start and stop of a stream - the partition, not a lock, is what makes
+// the concurrent access disjoint, which is exactly the argument
+// `C/LzFindMt.c` makes for the same struct.
 unsafe impl Send for MtShared {}
 // SAFETY: as above.
 unsafe impl Sync for MtShared {}
+
+impl MtShared {
+    /// The settings and buffers every thread reads during a stream.
+    #[inline]
+    fn common(&self) -> &Common {
+        // SAFETY: `common` is written only in `MatchFinderMt::create`, on the
+        // lz thread, between streams: the producer threads are either joined
+        // or waiting on `can_start`, which orders the write before their next
+        // read. The lz thread itself never holds this borrow across `create`,
+        // which takes `&mut MatchFinderMt`.
+        unsafe { &*self.common.get() }
+    }
+
+    /// An empty shared state: no buffers, and both threads' sync objects
+    /// fresh. [`MatchFinderMt::create`] fills it in.
+    fn empty() -> Self {
+        MtShared {
+            common: UnsafeCell::new(Common::empty()),
+            block: UnsafeCell::new(BlockInput {
+                ptr: core::ptr::null(),
+                len: 0,
+                pos: 0,
+            }),
+            hash_state: UnsafeCell::new(HashState {
+                pos: 0,
+                buffer: 0,
+                stream_pos: 0,
+                stream_end_was_reached: false,
+                result: Ok(()),
+                failed: false,
+            }),
+            bt_state: UnsafeCell::new(BtState {
+                hash_buf_pos: 0,
+                hash_buf_pos_limit: 0,
+                hash_num_avail: 0,
+                failure: false,
+                pos: 0,
+                buffer: 0,
+                cyclic_buffer_pos: 0,
+            }),
+            lz_state: UnsafeCell::new(LzState {
+                pointer_to_cur_pos: 0,
+                bt_buf_pos: 0,
+                bt_buf_pos_limit: 0,
+                lz_pos: 0,
+                bt_num_avail_bytes: 0,
+                failure_lz_bt: false,
+            }),
+            hash_sync: MtSync::new(),
+            bt_sync: MtSync::new(),
+            bt_shift: AtomicUsize::new(0),
+            lz_shift: AtomicUsize::new(0),
+            thread_failed: AtomicBool::new(false),
+            own: UnsafeCell::new(Owned::default()),
+        }
+    }
+}
+
+/// What the hash thread of a pair kept across blocks reads: the block
+/// [`run_block`] set, a slice at a time.
+struct BlockSource<'a> {
+    sh: &'a MtShared,
+}
+
+impl SeqInStream for BlockSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        // SAFETY: this runs on the hash thread during a stream, when `block`
+        // is that thread's: `run_block` wrote it before the stream started and
+        // does not touch it again until both producer threads have stopped.
+        let b = unsafe { &mut *self.sh.block.get() };
+        let n = buf.len().min(b.len - b.pos);
+        if n != 0 {
+            // SAFETY: `ptr..ptr + len` is the block `run_block` borrows for
+            // the whole stream, and `pos + n <= len`.
+            let src = unsafe { core::slice::from_raw_parts(b.ptr.add(b.pos), n) };
+            buf[..n].copy_from_slice(src);
+            b.pos += n;
+        }
+        Ok(n)
+    }
+}
 
 impl MtShared {
     /// C: `MatchFinder_NeedMove`.
@@ -1223,7 +1355,7 @@ impl MtShared {
         if h.stream_end_was_reached || h.result.is_err() {
             return false;
         }
-        (self.common.win_len - h.buffer) <= self.common.keep_size_after as usize
+        (self.common().win_len - h.buffer) <= self.common().keep_size_after as usize
     }
 
     /// C: `MatchFinder_MoveBlock`, with the two extra index fixups
@@ -1233,7 +1365,7 @@ impl MtShared {
     /// down, so the bt and lz threads' indices into it move too. The caller
     /// holds both critical sections, which is what stops them.
     fn move_block(&self, h: &mut HashState) {
-        let c = &self.common;
+        let c = self.common();
         if h.buffer < c.keep_size_before as usize {
             // As `MatchFinder::move_block`: a window cut to a promised stream
             // length, and a stream that broke the promise. Ending the stream
@@ -1284,7 +1416,7 @@ impl MtShared {
         if h.stream_end_was_reached || h.result.is_err() {
             return;
         }
-        let c = &self.common;
+        let c = self.common();
         loop {
             let dest = h.buffer + h.avail() as usize;
             let size = c.win_len - dest;
@@ -1319,7 +1451,7 @@ impl MtShared {
 
     /// C: `MatchFinder_ReadIfRequired`.
     fn read_if_required(&self, h: &mut HashState, stream: &mut dyn SeqInStream) {
-        if self.common.keep_size_after >= h.avail() {
+        if self.common().keep_size_after >= h.avail() {
             self.read_block(h, stream);
         }
     }
@@ -1366,8 +1498,8 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
         let h = unsafe { &mut *sh.hash_state.get() };
         // C: `MatchFinder_Init_HighHash`.
         // SAFETY: the high hash is the hash thread's exclusive range.
-        let high = unsafe { sh.common.high_hash() };
-        high[..=sh.common.hash_mask as usize].fill(K_EMPTY_HASH_VALUE);
+        let high = unsafe { sh.common().high_hash() };
+        high[..=sh.common().hash_mask as usize].fill(K_EMPTY_HASH_VALUE);
 
         loop {
             if sh.need_move(h) {
@@ -1427,7 +1559,7 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
                 // positions.
                 // SAFETY: the `free` semaphore was taken above, so this block
                 // is this thread's until `filled` is released below.
-                let heads = unsafe { sh.common.hash_block(offset) };
+                let heads = unsafe { sh.common().hash_block(offset) };
                 heads[0] = 0;
                 heads[1] = 0;
             }
@@ -1442,7 +1574,7 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
 /// One `hash_buf` block of `HashThreadFunc`'s loop: the heads for the next
 /// run of positions, or the end-of-stream header once the bytes run out.
 fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
-    let c = &sh.common;
+    let c = sh.common();
     let mut num = h.avail();
 
     // C: "heads[1] contains the number of avail bytes: if (avail <
@@ -1501,7 +1633,7 @@ fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
 /// C: `BtGetMatches`. Fills one `bt_buf` block from the head distances the
 /// hash thread produced, pulling more `hash_buf` blocks as it needs them.
 fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
-    let c = &sh.common;
+    let c = sh.common();
     let mut num_processed: u32 = 0;
     let mut cur_pos: u32 = 2;
 
@@ -1702,7 +1834,7 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
         sh.thread_failed.store(true, Ordering::SeqCst);
         // SAFETY: this block of `bt_buf` is still the bt thread's; `filled`
         // is released only after this returns.
-        let bt = unsafe { sh.common.bt_all() };
+        let bt = unsafe { sh.common().bt_all() };
         bt[block_offset] = 0;
     }
     // C: "We suppose that we have called GetNextBlock() from start. So buffer
@@ -1757,6 +1889,21 @@ pub(crate) struct MatchFinderMt {
     /// settings between calls; its allocations move into `sh` on `create`.
     pub(crate) mfb: MatchFinder,
     sh: Option<Arc<MtShared>>,
+    /// C: `hashSync.thread` and `btSync.thread`. The pair [`Self::block_handle`]
+    /// starts and keeps for every block after, as the C keeps its threads
+    /// from `MatchFinderMt_Create` to `MatchFinderMt_Destruct`; `None` while
+    /// none runs. The stream path starts a pair of its own per stream in
+    /// [`with_threads`], and retires this one first.
+    threads: Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>,
+    /// How many pairs this finder has started for blocks.
+    #[cfg(test)]
+    pub(crate) spawns: u32,
+}
+
+impl Drop for MatchFinderMt {
+    fn drop(&mut self) {
+        self.retire_threads();
+    }
 }
 
 impl MatchFinderMt {
@@ -1765,6 +1912,9 @@ impl MatchFinderMt {
         MatchFinderMt {
             mfb: MatchFinder::new(),
             sh: None,
+            threads: None,
+            #[cfg(test)]
+            spawns: 0,
         }
     }
 
@@ -1788,17 +1938,28 @@ impl MatchFinderMt {
         // C: `MatchFinderMt_Create` keeps `hashBuf` once it has it, and
         // `MatchFinder_Create` keeps a window and tables that are long enough.
         // The block before left all three in `sh`; they go back to where the
-        // C keeps them, so that a second block allocates nothing. Both
-        // producer threads were joined when that block's `with_threads`
-        // returned, which is what makes this handle the last one. If it is
-        // not, the buffers stay with whoever still holds them and this block
-        // allocates its own.
-        let mut bufs: Vec<u32> = Vec::new();
-        if let Some(old) = self.sh.take().and_then(Arc::into_inner) {
-            self.mfb.buf_base = old.own_win;
-            self.mfb.hash = old.own_tab;
-            bufs = old.own_bufs;
-        }
+        // C keeps them, so that a second block allocates nothing, and come
+        // back to `sh` below. `sh` itself is kept: a pair of threads kept
+        // across blocks waits on its sync objects.
+        let sh = self
+            .sh
+            .take()
+            .unwrap_or_else(|| Arc::new(MtShared::empty()));
+        // SAFETY: `create` runs on the lz thread between streams. The
+        // producer threads of a stream path have been joined, and a pair kept
+        // across blocks is waiting on `can_start`, which only the lz thread's
+        // next `get_next_block` sets; neither reads `common` or `own` until
+        // then.
+        let own = unsafe {
+            // The buffers leave `sh` here, so nothing may point into them
+            // from it until they come back.
+            *sh.common.get() = Common::empty();
+            &mut *sh.own.get()
+        };
+        self.mfb.buf_base = core::mem::take(&mut own.win);
+        self.mfb.hash = core::mem::take(&mut own.tab);
+        let mut bufs = core::mem::take(&mut own.bufs);
+        self.sh = Some(Arc::clone(&sh));
         if bufs.len() == HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2 {
             // Every word of a hash block and of a bt block is written by the
             // thread that fills it before the thread it is handed to reads it.
@@ -1874,42 +2035,11 @@ impl MatchFinderMt {
             mix,
         };
 
-        self.sh = Some(Arc::new(MtShared {
-            common,
-            hash_state: UnsafeCell::new(HashState {
-                pos: 0,
-                buffer: 0,
-                stream_pos: 0,
-                stream_end_was_reached: false,
-                result: Ok(()),
-                failed: false,
-            }),
-            bt_state: UnsafeCell::new(BtState {
-                hash_buf_pos: 0,
-                hash_buf_pos_limit: 0,
-                hash_num_avail: 0,
-                failure: false,
-                pos: 0,
-                buffer: 0,
-                cyclic_buffer_pos: 0,
-            }),
-            lz_state: UnsafeCell::new(LzState {
-                pointer_to_cur_pos: 0,
-                bt_buf_pos: 0,
-                bt_buf_pos_limit: 0,
-                lz_pos: 0,
-                bt_num_avail_bytes: 0,
-                failure_lz_bt: false,
-            }),
-            hash_sync: MtSync::new(),
-            bt_sync: MtSync::new(),
-            bt_shift: AtomicUsize::new(0),
-            lz_shift: AtomicUsize::new(0),
-            thread_failed: AtomicBool::new(false),
-            own_win: win,
-            own_tab: tab,
-            own_bufs: bufs,
-        }));
+        // SAFETY: as for `own` above.
+        unsafe {
+            *sh.common.get() = common;
+            *sh.own.get() = Owned { win, tab, bufs };
+        }
         Ok(())
     }
 
@@ -1943,7 +2073,9 @@ impl MatchFinderMt {
     pub(crate) fn allocated(&self) -> u64 {
         match &self.sh {
             Some(sh) => {
-                sh.own_win.len() as u64 + (sh.own_tab.len() as u64 + sh.own_bufs.len() as u64) * 4
+                // SAFETY: the lz thread, outside a stream; see `create`.
+                let own = unsafe { &*sh.own.get() };
+                own.win.len() as u64 + (own.tab.len() as u64 + own.bufs.len() as u64) * 4
             }
             None => self.mfb.allocated(),
         }
@@ -1960,7 +2092,7 @@ impl MatchFinderMt {
     /// reading. We don't want to read data in this thread."
     pub(crate) fn init(&mut self) {
         let sh = self.shared();
-        let c = &sh.common;
+        let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`; the other two cells are only
         // reachable here because both producer threads are stopped - `init` is
         // called between `init_mt` and the first `get_next_block`, and neither
@@ -2004,9 +2136,68 @@ impl MatchFinderMt {
         sh.thread_failed.store(false, Ordering::SeqCst);
     }
 
-    /// The handle [`with_threads`] needs to start the two producer threads.
-    pub(crate) fn shared_handle(&self) -> Option<&Arc<MtShared>> {
-        self.sh.as_ref()
+    /// The handle [`with_threads`] needs to start a pair of producer threads
+    /// for one stream. A pair kept for blocks is retired first: two pairs
+    /// must never wait on the same sync objects.
+    pub(crate) fn stream_handle(&mut self) -> Option<Arc<MtShared>> {
+        self.retire_threads();
+        self.sh.clone()
+    }
+
+    /// The handle [`run_block`] needs, with this finder's pair of producer
+    /// threads running: started on the first block and kept for every block
+    /// after, as the C keeps the threads `MatchFinderMt_Create` started.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if a thread cannot be started.
+    pub(crate) fn block_handle(&mut self) -> Result<Option<Arc<MtShared>>, Error> {
+        let Some(sh) = self.sh.clone() else {
+            return Ok(None);
+        };
+        if self.threads.is_none() {
+            // Set before the spawns: the bt thread calls
+            // `hash_sync.stop_writing()`, which does nothing unless the flag
+            // is already up.
+            MtSync::set(&sh.hash_sync.was_created, true);
+            MtSync::set(&sh.bt_sync.was_created, true);
+            let hash_sh = Arc::clone(&sh);
+            let hash = std::thread::Builder::new()
+                .spawn(move || hash_thread_func(&hash_sh, &mut BlockSource { sh: &hash_sh }))
+                .map_err(|_| Error::Alloc)?;
+            let bt_sh = Arc::clone(&sh);
+            let bt = match std::thread::Builder::new().spawn(move || bt_thread_func(&bt_sh)) {
+                Ok(bt) => bt,
+                Err(_) => {
+                    sh.hash_sync.send_exit();
+                    let _ = hash.join();
+                    return Err(Error::Alloc);
+                }
+            };
+            self.threads = Some((hash, bt));
+            #[cfg(test)]
+            {
+                self.spawns += 1;
+            }
+        }
+        Ok(Some(sh))
+    }
+
+    /// C: `MatchFinderMt_Destruct`'s half that ends the threads: tell the
+    /// stopped pair to return and wait for both.
+    fn retire_threads(&mut self) {
+        if let Some((hash, bt)) = self.threads.take() {
+            let sh = self.shared();
+            // C: "we want thread to be in Stopped state before sending EXIT
+            // command. note: stop(btSync) will stop (htSync) also." Between
+            // blocks both already are, and these return at once.
+            sh.bt_sync.stop_writing();
+            sh.bt_sync.send_exit();
+            let _ = bt.join();
+            sh.hash_sync.stop_writing();
+            sh.hash_sync.send_exit();
+            let _ = hash.join();
+        }
     }
 
     /// C: `MatchFinder_GetPointerToCurrentPos`, as an index into
@@ -2024,7 +2215,7 @@ impl MatchFinderMt {
     pub(crate) fn window(&self) -> &[u8] {
         // SAFETY: the lz thread may always read the window; see
         // `Common::win`.
-        unsafe { self.shared().common.win() }
+        unsafe { self.shared().common().win() }
     }
 
     /// C: `mf->result`, which the bt and lz threads only ever read after the
@@ -2049,7 +2240,7 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt_GetNextBlock_Bt`.
     fn get_next_block_bt(&mut self) -> u32 {
         let sh = self.shared();
-        let c = &sh.common;
+        let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &mut *sh.lz_state.get() };
         if l.failure_lz_bt {
@@ -2116,7 +2307,7 @@ impl MatchFinderMt {
     /// thread's nearest match already is: anything further back is redundant.
     fn mix_matches(&self, match_min_pos: u32, d: &mut [u32], mut di: usize) -> usize {
         let sh = self.shared();
-        let c = &sh.common;
+        let c = sh.common();
         // SAFETY: the lz thread owns `lz_state` and the low hash, and may read
         // the window.
         let (l, hash, win) = unsafe { (&*sh.lz_state.get(), c.low_hash(), c.win()) };
@@ -2212,7 +2403,7 @@ impl MatchFinderMt {
     /// there is no low hash to mix in.
     pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
         let sh = self.shared();
-        let c = &sh.common;
+        let c = sh.common();
         // SAFETY: the lz thread owns `lz_state` and holds the current `bt_buf`
         // block until its next `get_next_block`.
         let (l, bt) = unsafe { (&mut *sh.lz_state.get(), c.bt_all()) };
@@ -2276,7 +2467,7 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt0_Skip` / `MatchFinderMt2_Skip` / `MatchFinderMt3_Skip`
     /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair.
     pub(crate) fn skip(&mut self, mut num: u32) {
-        let min_len = match self.shared().common.mix {
+        let min_len = match self.shared().common().mix {
             Mix::None => 0,
             Mix::Two => 2,
             // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
@@ -2287,7 +2478,7 @@ impl MatchFinderMt {
         loop {
             self.next_block_if_required();
             let sh = self.shared();
-            let c = &sh.common;
+            let c = sh.common();
             // SAFETY: the lz thread owns `lz_state` and the low hash, and may
             // read the window and the block it holds.
             let (l, hash, win, bt) =
@@ -2349,6 +2540,58 @@ impl Drop for MtRun<'_> {
             let _ = h.join();
         }
     }
+}
+
+/// Runs `body` over one block with the pair [`MatchFinderMt::block_handle`]
+/// keeps: the hash thread reads `src` as its input, and the pair is stopped,
+/// not ended, when `body` returns.
+///
+/// C: the window between `MatchFinderMt_Init` and
+/// `MatchFinderMt_ReleaseStream`, with the input set by
+/// `MatchFinder_SET_DIRECT_INPUT_BUF`. `src` stays borrowed until both
+/// producer threads have stopped, on every path out, a panic in `body`
+/// included: that is what lets the hash thread hold its address.
+///
+/// # Errors
+///
+/// Propagates whatever `body` returns.
+pub(crate) fn run_block<T>(
+    sh: &MtShared,
+    src: &[u8],
+    body: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    /// Stops the pair, then forgets the block, when the block ends.
+    struct Stop<'a>(&'a MtShared);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            // C: `MatchFinderMt_ReleaseStream`. Waits for the bt thread to
+            // stop, and the bt thread stops the hash thread first.
+            self.0.bt_sync.stop_writing();
+            // SAFETY: both producer threads are stopped, so `block` is the
+            // lz thread's again.
+            unsafe {
+                *self.0.block.get() = BlockInput {
+                    ptr: core::ptr::null(),
+                    len: 0,
+                    pos: 0,
+                };
+            }
+        }
+    }
+    // SAFETY: between streams `block` is the lz thread's: the pair is waiting
+    // on `can_start`, which only this thread's first `get_next_block` in
+    // `body` sets.
+    unsafe {
+        *sh.block.get() = BlockInput {
+            ptr: src.as_ptr(),
+            len: src.len(),
+            pos: 0,
+        };
+    }
+    let stop = Stop(sh);
+    let r = body();
+    drop(stop);
+    r
 }
 
 /// Runs `body` with the hash and bt threads live.
@@ -2495,9 +2738,9 @@ mod tests {
         mt.init_mt().expect("init_mt");
         mt.init();
         // SAFETY: neither producer thread has been started.
-        unsafe { mt.shared().common.bt_all() }.fill(u32::MAX);
+        unsafe { mt.shared().common().bt_all() }.fill(u32::MAX);
 
-        let sh = alloc::sync::Arc::clone(mt.shared_handle().expect("created"));
+        let sh = mt.stream_handle().expect("created");
         let mut input = PanicAfter {
             data: &src,
             given: false,

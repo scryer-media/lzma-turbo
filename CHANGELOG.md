@@ -57,6 +57,14 @@
   pages in `madvise` mode, a 256 MiB level-5 two-block-thread encode (four
   threads): 13.51 s, down from 14.70 s (1.09x), user CPU 51.1 s from 55.0 s;
   the output is byte-identical.
+- A block thread's threaded match finder starts its hash and tree threads for
+  its first block and keeps them for every block after, as the SDK keeps the
+  threads `MatchFinderMt_Create` starts, where it started and joined a pair
+  for each block. The block is handed to the kept pair rather than to a
+  fresh one. Verified, median of three on the same host and encode: 13.74 s
+  against 13.55 s before (0.99x, inside the run-to-run spread of the before
+  arm, 13.26-14.20 s), so it is not a speed change at eight blocks a stream;
+  the output is byte-identical.
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.

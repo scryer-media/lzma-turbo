@@ -1996,8 +1996,28 @@ impl LzmaEnc {
 
     /// The threaded match finder's handle, when one is in use.
     #[cfg(feature = "std")]
-    pub(crate) fn mt_handle(&self) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
+    pub(crate) fn mt_handle(
+        &mut self,
+    ) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
         self.mf.mt_handle()
+    }
+
+    /// The threaded match finder's handle for one block, its threads running.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if a thread cannot be started.
+    #[cfg(feature = "std")]
+    pub(crate) fn mt_block_handle(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>>, Error> {
+        self.mf.mt_block_handle()
+    }
+
+    /// How many pairs of producer threads the finder has started for blocks.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn mt_spawns(&self) -> u32 {
+        self.mf.mt_spawns()
     }
 
     /// C: `LzmaEnc_GetCurBuf`, as an offset into the match finder's window.

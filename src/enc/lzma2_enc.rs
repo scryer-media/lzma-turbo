@@ -298,14 +298,15 @@ impl Lzma2EncInt {
         // makes this byte for byte what the stream path above produces for the
         // same block. `SliceStream` stands in for `directInput`; see
         // `crate::enc::stream`.
-        let mut input = SliceStream::new(src);
         self.enc.set_data_limit(src.len() as u64);
         self.enc.mem_prepare(src.len() as u64, UNPACK_SIZE_MAX)?;
-        match self.enc.mt_handle() {
-            Some(sh) => lz_find_mt::with_threads(&sh, &mut input, || {
-                self.subblock_loop(&mut NoStream, out)
-            })?,
-            None => self.subblock_loop(&mut input, out)?,
+        match self.enc.mt_block_handle()? {
+            // The finder's threads are kept from block to block, as the C
+            // keeps them; the hash thread reads the block itself.
+            Some(sh) => {
+                lz_find_mt::run_block(&sh, src, || self.subblock_loop(&mut NoStream, out))?;
+            }
+            None => self.subblock_loop(&mut SliceStream::new(src), out)?,
         }
         if self.src_pos != src.len() as u64 {
             return Err(Error::InternalFailure);
@@ -1701,6 +1702,77 @@ mod tests {
                 assert!(got == want, "{mf_threads} finder threads, block {block}");
             }
         }
+    }
+
+    /// A block coder starts its finder's hash and bt threads for its first
+    /// block and keeps them for every block after, as the C keeps the threads
+    /// `MatchFinderMt_Create` started - and a block it codes with the threads
+    /// it kept is byte for byte the block a coder with fresh threads codes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_block_coder_keeps_its_finder_threads_from_block_to_block() {
+        let src = mixed(1 << 18);
+        let props = LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(1 << 14)
+            .with_num_threads(2);
+        let block = 1usize << 15;
+        let pieces: Vec<&[u8]> = src.chunks(block).collect();
+        assert!(pieces.len() >= 8);
+
+        // One coder, every block, and a second stream after the first.
+        let mut kept = Lzma2Encoder::new(&props).unwrap();
+        kept.set_block_size(block as u64);
+        kept.set_total_threads(2);
+        kept.sync_coder().unwrap();
+        let mut got = Vec::new();
+        for _stream in 0..2 {
+            let cb = kept.mt_callback(&mut got, 1).unwrap();
+            for (i, piece) in pieces.iter().enumerate() {
+                cb.code(0, 0, piece, i + 1 == pieces.len()).unwrap();
+                cb.write(0).unwrap();
+            }
+        }
+        assert!(kept.coder.enc.mf.is_mt());
+        assert_eq!(kept.coder.enc.mt_spawns(), 1, "one pair for every block");
+
+        // A fresh coder, so fresh threads, for each block.
+        let mut want = Vec::new();
+        for _stream in 0..2 {
+            for (i, piece) in pieces.iter().enumerate() {
+                let mut fresh = Lzma2Encoder::new(&props).unwrap();
+                fresh.set_block_size(block as u64);
+                fresh.set_total_threads(2);
+                fresh.sync_coder().unwrap();
+                let cb = fresh.mt_callback(&mut want, 1).unwrap();
+                cb.code(0, 0, piece, i + 1 == pieces.len()).unwrap();
+                cb.write(0).unwrap();
+                drop(cb);
+                assert_eq!(fresh.coder.enc.mt_spawns(), 1);
+            }
+        }
+        assert!(got == want, "the kept threads changed the output");
+
+        // And the block threads' coders keep theirs the same way.
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        enc.set_block_size(block as u64);
+        enc.set_total_threads(4);
+        let out = enc.encode_to_vec(&src).unwrap();
+        let mut spawns = enc.coder.enc.mt_spawns();
+        for slot in &mut enc.block_coders {
+            if let Some(coder) = slot.get_mut().unwrap().as_ref() {
+                spawns += coder.enc.mt_spawns();
+            }
+        }
+        assert!(
+            (1..=2).contains(&spawns),
+            "{spawns} pairs for {} blocks",
+            pieces.len()
+        );
+        let mut fresh = Lzma2Encoder::new(&props).unwrap();
+        fresh.set_block_size(block as u64);
+        fresh.set_total_threads(4);
+        assert!(out == fresh.encode_to_vec(&src).unwrap());
     }
 
     /// Under a memory limit, an encoder that was used with more block threads
