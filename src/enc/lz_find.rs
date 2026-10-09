@@ -81,6 +81,45 @@ impl MatchFinderKind {
     }
 }
 
+/// A type whose every value may be the all-zero bit pattern.
+///
+/// # Safety
+///
+/// Implement only for types for which all-zero bytes are a valid value.
+unsafe trait Zeroable: Copy {}
+// SAFETY: integers are valid for every bit pattern, zero included.
+unsafe impl Zeroable for u8 {}
+// SAFETY: as above.
+unsafe impl Zeroable for u32 {}
+
+/// `len` zeroes, allocated zeroed rather than allocated and then filled.
+///
+/// A fresh finder's window, hash and son tables are this. None of them needs
+/// a fill of its own: the window is read into before it is read, `init`
+/// writes the hash heads every stream, and the son links are written before
+/// they are followed. Asking the allocator for zeroed memory lets it hand
+/// back pages it knows are zero (fresh pages of a large allocation are)
+/// without touching them, so a stream smaller than the dictionary never makes
+/// the rest of the tables resident, and a finder built per small stream
+/// skips a fill the size of its tables. `resize(len, 0)` wrote every byte.
+fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
+    if len == 0 || core::mem::size_of::<T>() == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = core::alloc::Layout::array::<T>(len).map_err(|_| Error::Alloc)?;
+    // SAFETY: `layout` has a non-zero size (len > 0, T is not zero-sized).
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut T;
+    if ptr.is_null() {
+        return Err(Error::Alloc);
+    }
+    // SAFETY: `ptr` came from the global allocator with `T`'s alignment and
+    // room for exactly `len` values, all of which are initialised: zero is a
+    // valid `T` (`Zeroable`). The `Vec` takes ownership and frees it with the
+    // same layout. CI checks this under Miri: the `unchecked-kernel-miri` job
+    // runs `a_zeroed_vec_is_zeroes_of_every_zeroable_type`.
+    Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
+}
+
 /// C: `CMatchFinder`.
 pub(crate) struct MatchFinder {
     /// C: `p->buffer`, as an offset into `buf_base`.
@@ -555,10 +594,7 @@ impl MatchFinder {
         self.block_size = plan.block_size;
         if self.buf_base.len() < plan.block_size as usize {
             self.buf_base = Vec::new();
-            self.buf_base
-                .try_reserve_exact(plan.block_size as usize)
-                .map_err(|_| Error::Alloc)?;
-            self.buf_base.resize(plan.block_size as usize, 0);
+            self.buf_base = zeroed_vec(plan.block_size as usize)?;
             #[cfg(test)]
             {
                 self.allocs += 1;
@@ -573,10 +609,7 @@ impl MatchFinder {
 
         self.hash = Vec::new();
         self.num_refs = plan.num_refs;
-        self.hash
-            .try_reserve_exact(plan.num_refs)
-            .map_err(|_| Error::Alloc)?;
-        self.hash.resize(plan.num_refs, 0);
+        self.hash = zeroed_vec(plan.num_refs)?;
         self.son_base = plan.hash_size_sum;
         #[cfg(test)]
         {
@@ -1501,6 +1534,34 @@ pub(crate) fn normalize3(sub_value: u32, items: &mut [u32]) {
 
 #[cfg(test)]
 mod tests {
+    /// A zeroed allocation of every [`super::Zeroable`] type is the length
+    /// asked for, all zero and writable to its last element, at odd lengths
+    /// and across a page; an empty one is empty, and one the allocator
+    /// cannot describe is refused. CI runs this under Miri too, which checks
+    /// the allocation, the initialisation and the free against the layout.
+    #[test]
+    fn a_zeroed_vec_is_zeroes_of_every_zeroable_type() {
+        fn check<T: super::Zeroable + PartialEq + core::fmt::Debug>(one: T, zero: T) {
+            for len in [1usize, 3, 7, 61, 4_097, 70_001] {
+                let mut v = super::zeroed_vec::<T>(len).unwrap();
+                assert_eq!((v.len(), v.capacity()), (len, len));
+                assert!(v.iter().all(|&x| x == zero), "{len}");
+                v[len - 1] = one;
+                v[0] = one;
+                assert_eq!((v[0], v[len - 1]), (one, one));
+                v.push(one);
+                assert_eq!(v.len(), len + 1);
+            }
+            assert!(super::zeroed_vec::<T>(0).unwrap().is_empty());
+            assert!(matches!(
+                super::zeroed_vec::<T>(usize::MAX),
+                Err(crate::error::Error::Alloc)
+            ));
+        }
+        check::<u8>(0xA5, 0);
+        check::<u32>(0xDEAD_BEEF, 0);
+    }
+
     /// The table [`crc_table`] derives is the one `MatchFinder_Construct`
     /// builds with its own loop over `kCrcPoly`.
     #[test]

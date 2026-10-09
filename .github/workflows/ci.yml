@@ -554,7 +554,7 @@ jobs:
             --no-default-features --features std,crc,xz,enc,native-crypto \
             -p lzma-turbo --test mt_match_finder --test lzma2_mt_parity --test mt
 
-  # The encoder's one `unsafe` kernel outside the SDK's margin invariant: the
+  # The encoder's `unsafe` outside the SDK's margin invariant. First, the
   # threaded finder's tree walk (`get_matches_spec_n_2` in
   # `src/enc/lz_find_mt.rs`), whose per-node accesses are unchecked. The
   # differential test walks it against the checked walk over generated
@@ -566,7 +566,11 @@ jobs:
   # agrees. Miri runs a thousand of the tables; the ordinary `test` job runs
   # all sixty thousand natively. The release run is the entry assertions in
   # the build that ships: they must panic there too, not only under debug
-  # assertions.
+  # assertions. Second, `zeroed_vec` in `src/enc/lz_find.rs`, which hands
+  # the match finder's window and tables over from `alloc_zeroed` through
+  # `Vec::from_raw_parts`; its test allocates every `Zeroable` type at odd
+  # lengths, reads, writes, grows and frees each, and Miri checks the layout,
+  # the initialisation and the free.
   unchecked-kernel-miri:
     name: unchecked-kernel-miri
     runs-on: ubuntu-24.04
@@ -584,16 +588,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: The tree walk's differential and refusal tests under Miri
+      - name: The tree walk's tests and the zeroed allocation's test under Miri
         run: |
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
             --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_
-      - name: The refusal test in the release build
+            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_
+      - name: The same tests in the release build
         run: |
           cargo test --locked --release --lib \
             --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_
+            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.

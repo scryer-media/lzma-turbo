@@ -26,6 +26,15 @@
   those are what the bytes depend on. `Lzma2PushEncoder` allocates its window
   when it codes its first chunk rather than in `new`, which still refuses any
   setting the allocation would refuse.
+- A fresh match finder asks the allocator for its window, hash and son
+  tables already zeroed, where it allocated them and then wrote a zero to
+  every byte. None of them needs that fill: the window is read into before
+  it is read, the hash heads are cleared for every stream, and the son links
+  are written before they are followed. Large fresh allocations come back as
+  untouched zero pages, so a stream much smaller than the dictionary no
+  longer makes the whole window and son table resident, and an encoder built
+  for each small stream skips a fill the size of its tables. Output is
+  unchanged. CI checks the allocation under Miri.
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.
