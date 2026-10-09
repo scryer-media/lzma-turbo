@@ -103,11 +103,26 @@ pub(crate) struct SegQueue {
     /// decoder, which is what knows the memory limit.
     park_room: u64,
     park_slots: usize,
-    /// The length of the last piece taken: what the next one is expected to
-    /// ask for, and so the size a parked buffer has to be near to be worth
-    /// keeping.
-    last_piece: u64,
+    /// The lengths of the last [`RECENT_PIECES`] pieces taken, oldest
+    /// overwritten first. The largest of them is the size the caller reads
+    /// in: what the next piece is expected to ask for, and so the size a
+    /// parked buffer has to be near to be worth keeping.
+    recent: [u64; RECENT_PIECES],
+    /// Where the next length goes in `recent`.
+    recent_at: usize,
 }
+
+/// How many of the latest pieces say what size the caller reads in.
+///
+/// More than one, because the last piece alone says too little: a caller
+/// that cuts a read short at a run boundary hands over a tail of a few hundred
+/// kilobytes between its full reads, and the stream ends on whatever was left
+/// over. Judged by the last piece, the full read's buffer that comes back
+/// after a tail looks far too large for what is arriving and is dropped, so
+/// every read pays for a fresh allocation and its page faults. A handful,
+/// because a caller that really has moved to smaller reads should stop
+/// having its large buffers kept soon after.
+const RECENT_PIECES: usize = 8;
 
 impl SegQueue {
     /// Takes a piece of input, owned outright.
@@ -140,7 +155,8 @@ impl SegQueue {
         });
         self.end += len;
         self.held += charge;
-        self.last_piece = len;
+        self.recent[self.recent_at] = len;
+        self.recent_at = (self.recent_at + 1) % RECENT_PIECES;
     }
 
     /// Says how much may sit parked: at most `room` bytes in at most `slots`
@@ -176,9 +192,10 @@ impl SegQueue {
         shed
     }
 
-    /// The length of the last piece taken.
-    pub(crate) fn last_piece(&self) -> u64 {
-        self.last_piece
+    /// The size the caller reads in: the largest of the last few pieces
+    /// taken, or zero before any. See [`RECENT_PIECES`].
+    pub(crate) fn piece_size(&self) -> u64 {
+        self.recent.iter().copied().max().unwrap_or(0)
     }
 
     /// One past the last stream offset held.
@@ -340,7 +357,8 @@ impl SegQueue {
             return;
         };
         let cap = buf.capacity() as u64;
-        if self.last_piece != 0 && cap > self.last_piece.saturating_mul(2) {
+        let size = self.piece_size();
+        if size != 0 && cap > size.saturating_mul(2) {
             return;
         }
         // One is always worth keeping - it is what recycling needs, and it is
@@ -439,13 +457,44 @@ mod tests {
         assert_eq!(q.held_bytes(), 200);
 
         // A buffer far larger than the pieces now arriving is not worth
-        // keeping, whatever the allowance says.
+        // keeping, whatever the allowance says: once the recent pieces are
+        // all small, the large one goes back to the allocator.
         let mut q = SegQueue::default();
         q.set_park_budget(1 << 20, 4);
         q.push_owned(piece(4096, 1));
-        q.push_owned(piece(100, 2));
-        q.retain_from(4096 + 100);
-        assert_eq!(q.spare_bytes(), 100);
+        for i in 0..RECENT_PIECES {
+            q.push_owned(piece(100, 2 + i as u8));
+        }
+        q.retain_from(4096 + 100 * RECENT_PIECES as u64);
+        assert_eq!(q.spare_bytes(), 400);
+    }
+
+    #[test]
+    fn a_full_read_after_a_cut_tail_is_parked() {
+        // A caller reading in 4 MiB pieces that cuts each one short at a run
+        // boundary: a full read, then the tail up to the boundary, over and
+        // over. The tail says nothing about the size of the next read, so the
+        // full read's buffer is the one worth keeping.
+        const READ: usize = 4 << 20;
+        const TAIL: usize = 256 << 10;
+        let mut q = SegQueue::default();
+        q.set_park_budget(4 * READ as u64, 4);
+        let mut end = 0;
+        for i in 0..2u8 {
+            q.push_owned(piece(READ, i));
+            q.push_owned(piece(TAIL, i));
+            end += READ + TAIL;
+        }
+        q.retain_from(end as u64);
+        assert_eq!(q.spare_bytes(), 2 * (READ + TAIL) as u64);
+
+        let mut full = 0;
+        while let Some(buf) = q.take_spare() {
+            if buf.capacity() >= READ {
+                full += 1;
+            }
+        }
+        assert_eq!(full, 2, "both full-read buffers come back to be filled");
     }
 
     #[test]

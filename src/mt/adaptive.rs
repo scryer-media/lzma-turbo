@@ -1272,7 +1272,7 @@ impl Lzma2AdaptiveDecoder {
         // buffers: the same allowance the output pool works to, so that
         // recycling never sits on a large part of the limit it would otherwise
         // be dispatching with.
-        let piece = self.segs.last_piece().max(MIN_BUF_BUDGET);
+        let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
         let room = (self.memory_limit / 8).min(piece.saturating_mul(self.threads as u64 + 2));
         self.segs.set_park_budget(room, self.threads + 2);
         self.segs.retain_from(self.cursor_in);
