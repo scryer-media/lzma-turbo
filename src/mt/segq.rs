@@ -163,6 +163,19 @@ impl SegQueue {
         Some(buf)
     }
 
+    /// Gives every parked allocation back to the allocator, and returns what
+    /// that took off the charge.
+    ///
+    /// For a decoder that would otherwise refuse work for want of room: what
+    /// is parked is only worth keeping while there is room to keep it.
+    pub(crate) fn shed_spare(&mut self) -> u64 {
+        let shed = self.spare_bytes;
+        self.spare.clear();
+        self.held -= shed;
+        self.spare_bytes = 0;
+        shed
+    }
+
     /// The length of the last piece taken.
     pub(crate) fn last_piece(&self) -> u64 {
         self.last_piece
@@ -433,6 +446,26 @@ mod tests {
         q.push_owned(piece(100, 2));
         q.retain_from(4096 + 100);
         assert_eq!(q.spare_bytes(), 100);
+    }
+
+    #[test]
+    fn shedding_gives_back_what_is_parked_and_nothing_else() {
+        let mut q = SegQueue::default();
+        q.set_park_budget(1 << 20, 4);
+        q.push_owned(piece(100, 1));
+        q.push_owned(piece(100, 2));
+        q.push_owned(piece(100, 3));
+        q.retain_from(200);
+        assert_eq!(q.spare_bytes(), 200);
+        assert_eq!(q.held_bytes(), 300);
+
+        assert_eq!(q.shed_spare(), 200);
+        assert_eq!(q.spare_bytes(), 0);
+        // The piece still to be read is charged as it was.
+        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.dead_bytes(), 0);
+        assert!(q.take_spare().is_none());
+        assert_eq!(q.shed_spare(), 0);
     }
 
     #[test]
