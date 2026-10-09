@@ -428,6 +428,10 @@ pub struct Lzma2Encoder {
     block_size: u64,
     /// C: `props.numBlockThreads_Max`.
     threads: usize,
+    /// The block thread count [`Lzma2Encoder::set_threads`] was last given,
+    /// 1 if it never was: what `threads` goes back to when the total is
+    /// cleared.
+    named_threads: usize,
     /// C: `props.numTotalThreads`, or 0 when the caller has not set one.
     total_threads: usize,
     /// The memory the block threads may take together, `u64::MAX` for no
@@ -438,6 +442,10 @@ pub struct Lzma2Encoder {
     /// What [`Lzma2Encoder::coder`] was built with, so that a change of block
     /// size can be noticed.
     coder_props: LzmaEncProps,
+    /// Whether [`Lzma2Encoder::coder`] has been given other settings since it
+    /// was built, and so may hold a window and tables larger than its
+    /// settings need.
+    coder_reconfigured: bool,
     /// C: `me->coders[1..]`, the coders of the block threads after the first;
     /// [`Lzma2Encoder::coder`] is the first thread's, as `me->coders[0]` is.
     /// Each is built when its thread first takes a block, and is kept from
@@ -447,6 +455,10 @@ pub struct Lzma2Encoder {
     /// The settings every coder in `block_coders` has.
     #[cfg(feature = "std")]
     block_coder_props: LzmaEncProps,
+    /// Whether a coder in `block_coders` has been given other settings since
+    /// it was built, as `coder_reconfigured` is for the first.
+    #[cfg(feature = "std")]
+    block_coders_reconfigured: bool,
 }
 
 impl Lzma2Encoder {
@@ -469,14 +481,18 @@ impl Lzma2Encoder {
             dict_size,
             block_size: BLOCK_SIZE_SOLID,
             threads: 1,
+            named_threads: 1,
             total_threads: 0,
             mem_limit: u64::MAX,
             expected_data_size: u64::MAX,
             coder_props: *props,
+            coder_reconfigured: false,
             #[cfg(feature = "std")]
             block_coders: Vec::new(),
             #[cfg(feature = "std")]
             block_coder_props: *props,
+            #[cfg(feature = "std")]
+            block_coders_reconfigured: false,
         })
     }
 
@@ -564,14 +580,23 @@ impl Lzma2Encoder {
     /// C: `Lzma2Enc_SetProps` followed by `Lzma2EncInt_InitStream`, which
     /// calls `LzmaEnc_SetProps` on the encoder `Lzma2Enc_Create` made. The
     /// encoder is not built again: [`Lzma2Encoder::new`] built the only one.
+    ///
+    /// Under a memory limit it is, when it has been given other settings: a
+    /// coder keeps the window and tables of the largest settings it has
+    /// streamed with, and the limit pays for what these settings need, not
+    /// for that.
     pub(crate) fn sync_coder(&mut self) -> Result<(), Error> {
         let want = self.effective_props();
-        if want == self.coder_props {
-            return Ok(());
+        if want != self.coder_props {
+            self.coder.set_props(&want)?;
+            self.dict_size = self.coder.dict_size;
+            self.coder_props = want;
+            self.coder_reconfigured = true;
         }
-        self.coder.set_props(&want)?;
-        self.dict_size = self.coder.dict_size;
-        self.coder_props = want;
+        if self.coder_reconfigured && self.mem_limit != u64::MAX {
+            self.coder = Lzma2EncInt::new(&want)?;
+            self.coder_reconfigured = false;
+        }
         Ok(())
     }
 
@@ -662,6 +687,7 @@ impl Lzma2Encoder {
     /// single-threaded path, byte for byte as before block threads existed.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads.clamp(1, THREADS_LIMIT);
+        self.named_threads = self.threads;
     }
 
     /// The total thread budget, block threads times match-finder threads.
@@ -670,7 +696,7 @@ impl Lzma2Encoder {
     /// [`Lzma2Encoder::set_threads`] left alone, `Lzma2EncProps_Normalize`
     /// divides the budget: `numBlockThreads_Max = numTotalThreads /
     /// numThreads`. Setting it to zero goes back to "derive it from the block
-    /// thread count".
+    /// thread count", the one [`Lzma2Encoder::set_threads`] was last given.
     ///
     /// The divisor is the match finder's thread count: the one
     /// [`LzmaEncProps::with_num_threads`] named, or, where none was named, two
@@ -688,9 +714,7 @@ impl Lzma2Encoder {
     /// starts about `1.5 N` threads.
     pub fn set_total_threads(&mut self, threads: usize) {
         self.total_threads = threads;
-        if threads != 0 {
-            self.threads = 0;
-        }
+        self.threads = if threads != 0 { 0 } else { self.named_threads };
     }
 
     /// A ceiling on the memory the block threads may take together.
@@ -946,9 +970,24 @@ impl Lzma2Encoder {
             for slot in &mut self.block_coders {
                 if let Some(coder) = slot.get_mut().unwrap_or_else(|e| e.into_inner()) {
                     coder.set_props(&props)?;
+                    self.block_coders_reconfigured = true;
                 }
             }
             self.block_coder_props = props;
+        }
+        // Under a memory limit, what the coders hold has to be what the limit
+        // paid for: `threads` coders of these settings. The coders of threads
+        // this stream does not run are released, and so is every coder that
+        // was given other settings, which may hold the window and tables of
+        // larger ones; their threads build them again.
+        if self.mem_limit != u64::MAX {
+            self.block_coders.truncate(threads.saturating_sub(1));
+            if self.block_coders_reconfigured {
+                for slot in &mut self.block_coders {
+                    *slot.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                self.block_coders_reconfigured = false;
+            }
         }
         let more = threads
             .saturating_sub(1)
@@ -1374,6 +1413,21 @@ mod tests {
             enc.set_threads(threads);
             assert_eq!(enc.split_threads(), (finder, blocks(threads)));
         }
+
+        // Clearing a total goes back to the block threads named before it,
+        // or to one where none were.
+        for named in [None, Some(4usize)] {
+            let mut enc = Lzma2Encoder::new(&tree).unwrap();
+            if let Some(threads) = named {
+                enc.set_threads(threads);
+            }
+            let before = enc.split_threads();
+            enc.set_total_threads(8);
+            assert_eq!(enc.split_threads(), (2, blocks(4)));
+            enc.set_total_threads(0);
+            assert_eq!(enc.split_threads(), before);
+            assert_eq!(before, (1, blocks(named.unwrap_or(1))));
+        }
     }
 
     /// A total alone writes what its split writes when the caller names it:
@@ -1646,6 +1700,87 @@ mod tests {
                 let want = fresh.encode_to_vec(&src[..block + block / 2]).unwrap();
                 assert!(got == want, "{mf_threads} finder threads, block {block}");
             }
+        }
+    }
+
+    /// Under a memory limit, an encoder that was used with more block threads
+    /// or a larger dictionary keeps no more than the limit pays for: the
+    /// coders of threads a later stream does not run are released, and a
+    /// coder given smaller settings does not keep the window and tables of
+    /// the larger ones.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_memory_limit_releases_what_earlier_streams_built() {
+        /// The window each coder holds, the first thread's first; `None` for
+        /// a block thread whose coder has not been built.
+        fn windows(enc: &mut Lzma2Encoder) -> Vec<Option<u64>> {
+            let mut held = vec![Some(enc.coder.enc.mf.cfg().allocated())];
+            for slot in &mut enc.block_coders {
+                held.push(
+                    slot.get_mut()
+                        .unwrap()
+                        .as_mut()
+                        .map(|coder| coder.enc.mf.cfg().allocated()),
+                );
+            }
+            held
+        }
+
+        let src = mixed(1 << 17);
+        let big = LzmaEncProps::new().with_level(5).with_dict_size(1 << 20);
+        let small = big.with_dict_size(1 << 12);
+        let block = 1usize << 15;
+
+        let mut enc = Lzma2Encoder::new(&big).unwrap();
+        enc.set_block_size(block as u64);
+        enc.set_threads(4);
+        enc.sync_coder().unwrap();
+        // Every one of the four block threads codes a block, so every coder
+        // is built at the large dictionary.
+        {
+            let mut out = Vec::new();
+            let cb = enc.mt_callback(&mut out, 4).unwrap();
+            for (t, piece) in src.chunks(block).enumerate() {
+                cb.code(t, t, piece, t == 3).unwrap();
+            }
+        }
+        let large = windows(&mut enc);
+        assert_eq!(large.len(), 4);
+        assert!(large.iter().all(Option::is_some));
+
+        // What a coder built for the small dictionary holds.
+        let want = {
+            let mut fresh = Lzma2Encoder::new(&small).unwrap();
+            fresh.set_block_size(block as u64);
+            fresh.sync_coder().unwrap();
+            let mut out = Vec::new();
+            let cb = fresh.mt_callback(&mut out, 1).unwrap();
+            cb.code(0, 0, &src[..block], true).unwrap();
+            drop(cb);
+            fresh.coder.enc.mf.cfg().allocated()
+        };
+        assert!(want < large[0].unwrap(), "{want} {large:?}");
+
+        // The small dictionary, and a limit that pays for two of its coders.
+        enc.set_props(&small).unwrap();
+        let per = enc.mem_usage_per_thread();
+        enc.set_mem_limit(2 * per);
+        let threads = enc.threads_reduced();
+        assert_eq!(threads, 2);
+        {
+            let mut out = Vec::new();
+            let cb = enc.mt_callback(&mut out, threads).unwrap();
+            cb.code(0, 0, &src[..block], false).unwrap();
+            cb.code(1, 1, &src[block..2 * block], true).unwrap();
+        }
+        let now = windows(&mut enc);
+        assert!(now.len() <= threads, "{now:?}: coders kept past {threads}");
+        for (i, held) in now.into_iter().enumerate() {
+            let held = held.unwrap_or(0);
+            assert!(
+                held <= want,
+                "coder {i} holds {held}, the settings need {want}"
+            );
         }
     }
 

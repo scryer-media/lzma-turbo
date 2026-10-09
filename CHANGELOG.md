@@ -26,6 +26,15 @@
   those are what the bytes depend on. `Lzma2PushEncoder` allocates its window
   when it codes its first chunk rather than in `new`, which still refuses any
   setting the allocation would refuse.
+- A fresh match finder asks the allocator for its window, hash and son
+  tables already zeroed, where it allocated them and then wrote a zero to
+  every byte. None of them needs that fill: the window is read into before
+  it is read, the hash heads are cleared for every stream, and the son links
+  are written before they are followed. Large fresh allocations come back as
+  untouched zero pages, so a stream much smaller than the dictionary no
+  longer makes the whole window and son table resident, and an encoder built
+  for each small stream skips a fill the size of its tables. Output is
+  unchanged. CI checks the allocation under Miri.
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.
@@ -40,7 +49,11 @@
   path uses, and builds each of the others when its thread first has a block.
   A request for more block threads than the input has blocks no longer builds
   coders that never run, and a second stream allocates nothing the first
-  already allocated. Dropping the `Lzma2Encoder` releases them.
+  already allocated. Dropping the `Lzma2Encoder` releases them. Under
+  `set_mem_limit`, a stream keeps only the coders it is allowed: those of
+  block threads it does not run are released, and a coder given other
+  settings than it was built with is built again rather than keeping the
+  window and tables of the larger ones.
 - A block's output buffer is reserved once, at the most a block of that length
   can come to (the SDK's `destBlockSize`), instead of being grown by doubling
   as the block is written.
@@ -63,7 +76,9 @@
   at all, is split as before, and the finder's default with no total is still
   one thread. The total is not a count of operating-system
   threads: a block coder with a threaded finder runs on three, so a total of N
-  over a binary tree starts about 1.5 N.
+  over a binary tree starts about 1.5 N. Setting the total back to zero
+  returns to the block-thread count `set_threads` was last given, or one; it
+  used to leave one block thread whatever had been named.
 - `Lzma2PushEncoder::reset` and `LzmaPushEncoder::reset` make a push encoder
   ready for another stream with new settings. The encoder keeps its queue, and
   its window and tables wherever the next stream needs no more than they
@@ -80,8 +95,9 @@
   written out on the walk and at each `unsafe` block, and a test compares the
   walk against the checked one over tens of thousands of generated tables,
   down to one-slot cyclic buffers and positions at the normalisation and wrap
-  boundaries. The accesses made once per position keep their checks, and the
-  output is unchanged.
+  boundaries; CI runs that comparison under Miri as well, so an access
+  outside its slice fails the build. The accesses made once per position keep
+  their checks, and the output is unchanged.
 - `CrcFolder::range` folds a range from its first piece instead of from the
   empty checksum. Combining a piece with nothing gives the piece back, and it
   cost a whole fold to do it: a range that is exactly one piece, as each file
