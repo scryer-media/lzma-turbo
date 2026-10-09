@@ -2578,6 +2578,66 @@ mod tests {
     }
 
     #[test]
+    fn the_next_runs_go_out_while_a_landed_run_waits_to_be_drained() {
+        // 7-Zip's in-order thread holds its block until it has written it,
+        // and the other threads read and decode the blocks after it in the
+        // meantime: with four threads, three runs are taken in and decoded
+        // while the first waits for the caller. The same here, under the pair
+        // bound: nothing is drained, so the run that landed holds its pair,
+        // and the fourth run is still admitted and dispatched.
+        let mut d = decoder(4, u64::MAX);
+        let runs: Vec<_> = (0..4).map(|i| run(4 * MIB, i)).collect();
+        let mut stream = Vec::new();
+        let mut cuts = Vec::new();
+        for r in &runs {
+            stream.extend_from_slice(r);
+            cuts.push(stream.len() + 1);
+        }
+        stream.push(0);
+        *cuts.last_mut().expect("four runs") = stream.len();
+        let mut from = 0;
+        let mut pieces = cuts.iter().map(|&to| {
+            let p = exact(&stream[from..to]);
+            from = to;
+            p
+        });
+
+        for _ in 0..3 {
+            let piece = pieces.next().expect("piece");
+            assert!(d.feed_owned(piece).expect("feed").is_none());
+            d.scan().expect("scan");
+            assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        }
+        // One of them lands and is not drained.
+        assert!(d.collect(true));
+        let l = d.ledger();
+        assert!(l.runs_waiting >= 1, "{l:?}");
+
+        let last = pieces.next().expect("piece");
+        assert!(
+            d.feed_owned(last).expect("feed").is_none(),
+            "the fourth run's input refused while a landed run waits: {:?}",
+            d.ledger()
+        );
+        d.scan().expect("scan");
+        assert_eq!(
+            d.dispatch().expect("dispatch"),
+            Dispatch::Sent,
+            "{:?}",
+            d.ledger()
+        );
+        let l = d.ledger();
+        assert_eq!(l.runs_out + l.runs_waiting, 4, "{l:?}");
+        assert!(l.runs_waiting >= 1, "{l:?}");
+        assert!(
+            d.held_bytes() <= d.pair_bound(),
+            "held {} over the pair bound {}",
+            d.held_bytes(),
+            d.pair_bound()
+        );
+    }
+
+    #[test]
     fn a_finished_decoder_keeps_nothing_parked() {
         // Nothing can be fed to a finished decoder, so nothing it parked for
         // the next piece or the next run will ever be used.

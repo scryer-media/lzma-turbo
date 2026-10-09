@@ -127,6 +127,16 @@
   did under a limit smaller than the first run before that run's end was
   seen: `drain` decoded nothing and asked for the input it had just refused.
   The chase now decodes what is held so the rest can come in.
+- `Lzma2AdaptiveDecoder` with chasing turned off no longer decodes on the
+  calling thread a run it is only waiting to be fed. A parked input buffer
+  counted as held made such a decoder look full, so it chased, and having
+  finished that run the chase held on into the next and could decode the
+  rest of the stream there. Parked input no longer counts toward that check,
+  and the chase stops at a run boundary.
+- `Lzma2AdaptiveDecoder` drops what it had parked once `drain` reports
+  `Finished`, so `held_bytes()` is zero after the stream ends.
+- `Lzma2AdaptiveDecoder::feed_owned` returns `Error::Cancelled` after
+  `cancel`, including for an empty piece.
 - `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
   split into input pieces, runs out, runs waiting and parked buffers; runs
   out, decoding and waiting; the peak held; and dispatch refusals by cause,
