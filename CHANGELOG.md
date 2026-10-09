@@ -80,8 +80,9 @@
   written out on the walk and at each `unsafe` block, and a test compares the
   walk against the checked one over tens of thousands of generated tables,
   down to one-slot cyclic buffers and positions at the normalisation and wrap
-  boundaries. The accesses made once per position keep their checks, and the
-  output is unchanged.
+  boundaries; CI runs that comparison under Miri as well, so an access
+  outside its slice fails the build. The accesses made once per position keep
+  their checks, and the output is unchanged.
 - `CrcFolder::range` folds a range from its first piece instead of from the
   empty checksum. Combining a piece with nothing gives the piece back, and it
   cost a whole fold to do it: a range that is exactly one piece, as each file

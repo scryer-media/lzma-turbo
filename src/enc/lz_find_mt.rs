@@ -2663,17 +2663,25 @@ mod tests {
         (got, son, d)
     }
 
+    /// Generated tables the differential test below walks. Under Miri, which
+    /// runs the CI job that checks every unchecked access for undefined
+    /// behaviour, a thousand: the same generator and the same seed, so
+    /// they are the first cases of the full run, one-slot cyclic buffers and
+    /// the normalisation and wrap boundaries among them.
+    const WALK_CASES: u32 = if cfg!(miri) { 1_000 } else { 60_000 };
+
     /// The walk with its per-node accesses unchecked must be the walk with
     /// every access checked: the same answer, the same tree, the same
     /// matches, whatever the window and the tables hold. Built with debug
     /// assertions, as tests are, every unchecked access here is also checked
     /// against its slice, so a case that stepped outside would fail this
-    /// rather than pass it by luck.
+    /// rather than pass it by luck; under Miri, an access outside its slice
+    /// is reported as undefined behaviour whatever the build.
     #[test]
     fn the_unchecked_walk_is_the_checked_walk_on_any_tables() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let (mut walked, mut refused) = (0_u32, 0_u32);
-        for case_no in 0..60_000 {
+        for case_no in 0..WALK_CASES {
             let c = case(&mut rng);
             let want = walk(&c, get_matches_spec_n_2_checked);
             let got = walk(&c, get_matches_spec_n_2);
@@ -2686,7 +2694,7 @@ mod tests {
         }
         // Both of the kernel's answers are well represented.
         assert!(
-            walked > 2_000 && refused > 2_000,
+            walked > WALK_CASES / 30 && refused > WALK_CASES / 30,
             "{walked} walked, {refused} refused"
         );
     }

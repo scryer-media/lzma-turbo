@@ -19,8 +19,12 @@ port rules and what was left out are in `docs/encoder.md`.
 2. The reference is `C/` in a checkout of github.com/ip7z/7zip at the commit
    named in `docs/porting.md`. Cite the C function name in a comment when a Rust
    function corresponds to one.
-3. `unsafe` is allowed where the C relies on the margin invariant, and only
-   there. Every `unsafe` block carries a `// SAFETY:` comment stating the
+3. `unsafe` is allowed where the C relies on the margin invariant, and
+   elsewhere only where CI verifies it: a differential test against a checked
+   version of the same code, run natively in the ordinary suite and under Miri
+   in a CI job that `ci-complete` requires. The threaded match finder's tree
+   walk is the one such case today, verified by the `unchecked-kernel-miri`
+   job. Every `unsafe` block carries a `// SAFETY:` comment stating the
    invariant that makes it sound and which check established it.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only
