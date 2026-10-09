@@ -287,10 +287,14 @@ fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     dec.set_chase(false);
     // The decoder charges a piece its allocation and admits it by that, so a
     // read sized past the limit would never be taken. Under a tight limit the
-    // reads come down to a quarter of it, and never below a small floor.
-    let piece_len = usize::try_from(shot.memory_limit / 4)
-        .unwrap_or(usize::MAX)
-        .clamp(ADAPTIVE_PIECE_MIN, ADAPTIVE_PIECE);
+    // reads come down to a quarter of it, and not below a small floor - but
+    // never past the limit itself, which the floor would be under a limit
+    // smaller than it.
+    let limit = usize::try_from(shot.memory_limit).unwrap_or(usize::MAX);
+    let piece_len = (limit / 4)
+        .clamp(ADAPTIVE_PIECE_MIN, ADAPTIVE_PIECE)
+        .min(limit)
+        .max(1);
     let mut hand: Option<Vec<u8>> = None;
     let mut eof = false;
     let mut write_err = None;
@@ -727,5 +731,20 @@ mod tests {
             assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
             assert_eq!(line.crc32, Some(want), "{lane}: --verify");
         }
+    }
+
+    /// Under a limit smaller than the read floor the adaptive shot still
+    /// reads pieces the decoder can take, and decodes the stream.
+    #[test]
+    fn an_adaptive_shot_under_a_limit_below_the_read_floor_decodes() {
+        let data = payload();
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let xz = lzma_turbo::encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+        let input = Scratch::new("small-limit.xz", &xz);
+        let mut s = shot("adaptive");
+        s.threads = 2;
+        s.memory_limit = 48 << 10;
+        let line = measure(&s, &input.0).expect("adaptive shot under 48 KiB");
+        assert_eq!(line.bytes_out, data.len() as u64);
     }
 }
