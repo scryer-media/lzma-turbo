@@ -171,13 +171,7 @@ impl Pool {
     /// Hands a run to whichever worker wakes first.
     pub(crate) fn dispatch(&self, job: Job) -> Result<(), Error> {
         match &self.job_tx {
-            Some(tx) => {
-                self.decoding.fetch_add(1, Ordering::Relaxed);
-                tx.send(job).map_err(|_| {
-                    self.decoding.fetch_sub(1, Ordering::Relaxed);
-                    Error::Cancelled
-                })
-            }
+            Some(tx) => tx.send(job).map_err(|_| Error::Cancelled),
             None => Err(Error::Cancelled),
         }
     }
@@ -260,7 +254,6 @@ fn worker(
         };
 
         if cancel.load(Ordering::Relaxed) {
-            decoding.fetch_sub(1, Ordering::Relaxed);
             let _ = tx.send(Done {
                 index: job.index,
                 out_offset: job.out_offset,
@@ -274,6 +267,10 @@ fn worker(
             });
             continue;
         }
+
+        // Counted from here, where a worker has the run in hand, and not from
+        // the dispatch: a job waiting on the channel is not being decoded.
+        decoding.fetch_add(1, Ordering::Relaxed);
 
         // A worker that dies without answering would leave its dispatcher
         // waiting for a block that is never coming, so a panic is caught,
@@ -403,7 +400,7 @@ pub(crate) fn locate(index: u64, out_offset: u64, e: Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Pool;
+    use super::{Job, Pool};
 
     /// A worker counts as live from the moment the pool holds its handle, not
     /// from the moment the OS gets round to running it.
@@ -425,5 +422,27 @@ mod tests {
         }
         pool.shutdown();
         assert_eq!(pool.live(), 0, "a worker outlived shutdown");
+    }
+
+    /// A job on the channel that no worker has taken is not being decoded.
+    ///
+    /// A pool with no workers is where that is certain: the job is queued and
+    /// nothing can receive it, so a count raised on dispatch reports a run
+    /// being decoded that nobody is decoding.
+    #[test]
+    fn a_queued_job_is_not_counted_as_decoding() {
+        let pool = Pool::new(0);
+        pool.dispatch(Job {
+            index: 0,
+            out_offset: 0,
+            unpacked_len: 0,
+            packed: alloc::vec::Vec::new(),
+            out: alloc::vec::Vec::new(),
+            held: 0,
+            #[cfg(feature = "crc")]
+            plan: crate::mt::checksum::ChecksumPlan::none(),
+        })
+        .expect("dispatch");
+        assert_eq!(pool.decoding(), 0);
     }
 }

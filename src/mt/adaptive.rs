@@ -98,7 +98,8 @@ pub struct AdaptiveLedger {
     /// decoded and not yet collected.
     pub runs_out: usize,
     /// Runs a worker is decoding right now: [`Self::runs_out`] less the ones
-    /// whose blocks are finished and waiting to be collected.
+    /// no worker has taken yet and the ones whose blocks are finished and
+    /// waiting to be collected.
     pub runs_decoding: usize,
     /// Decoded blocks waiting their turn to be handed over.
     pub runs_waiting: usize,
