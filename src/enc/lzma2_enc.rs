@@ -428,6 +428,10 @@ pub struct Lzma2Encoder {
     block_size: u64,
     /// C: `props.numBlockThreads_Max`.
     threads: usize,
+    /// The block thread count [`Lzma2Encoder::set_threads`] was last given,
+    /// 1 if it never was: what `threads` goes back to when the total is
+    /// cleared.
+    named_threads: usize,
     /// C: `props.numTotalThreads`, or 0 when the caller has not set one.
     total_threads: usize,
     /// The memory the block threads may take together, `u64::MAX` for no
@@ -477,6 +481,7 @@ impl Lzma2Encoder {
             dict_size,
             block_size: BLOCK_SIZE_SOLID,
             threads: 1,
+            named_threads: 1,
             total_threads: 0,
             mem_limit: u64::MAX,
             expected_data_size: u64::MAX,
@@ -682,6 +687,7 @@ impl Lzma2Encoder {
     /// single-threaded path, byte for byte as before block threads existed.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads.clamp(1, THREADS_LIMIT);
+        self.named_threads = self.threads;
     }
 
     /// The total thread budget, block threads times match-finder threads.
@@ -690,7 +696,7 @@ impl Lzma2Encoder {
     /// [`Lzma2Encoder::set_threads`] left alone, `Lzma2EncProps_Normalize`
     /// divides the budget: `numBlockThreads_Max = numTotalThreads /
     /// numThreads`. Setting it to zero goes back to "derive it from the block
-    /// thread count".
+    /// thread count", the one [`Lzma2Encoder::set_threads`] was last given.
     ///
     /// The divisor is the match finder's thread count: the one
     /// [`LzmaEncProps::with_num_threads`] named, or, where none was named, two
@@ -708,9 +714,7 @@ impl Lzma2Encoder {
     /// starts about `1.5 N` threads.
     pub fn set_total_threads(&mut self, threads: usize) {
         self.total_threads = threads;
-        if threads != 0 {
-            self.threads = 0;
-        }
+        self.threads = if threads != 0 { 0 } else { self.named_threads };
     }
 
     /// A ceiling on the memory the block threads may take together.
@@ -1408,6 +1412,21 @@ mod tests {
             enc.set_total_threads(total);
             enc.set_threads(threads);
             assert_eq!(enc.split_threads(), (finder, blocks(threads)));
+        }
+
+        // Clearing a total goes back to the block threads named before it,
+        // or to one where none were.
+        for named in [None, Some(4usize)] {
+            let mut enc = Lzma2Encoder::new(&tree).unwrap();
+            if let Some(threads) = named {
+                enc.set_threads(threads);
+            }
+            let before = enc.split_threads();
+            enc.set_total_threads(8);
+            assert_eq!(enc.split_threads(), (2, blocks(4)));
+            enc.set_total_threads(0);
+            assert_eq!(enc.split_threads(), before);
+            assert_eq!(before, (1, blocks(named.unwrap_or(1))));
         }
     }
 

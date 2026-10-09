@@ -67,7 +67,9 @@
   at all, is split as before, and the finder's default with no total is still
   one thread. The total is not a count of operating-system
   threads: a block coder with a threaded finder runs on three, so a total of N
-  over a binary tree starts about 1.5 N.
+  over a binary tree starts about 1.5 N. Setting the total back to zero
+  returns to the block-thread count `set_threads` was last given, or one; it
+  used to leave one block thread whatever had been named.
 - `Lzma2PushEncoder::reset` and `LzmaPushEncoder::reset` make a push encoder
   ready for another stream with new settings. The encoder keeps its queue, and
   its window and tables wherever the next stream needs no more than they
