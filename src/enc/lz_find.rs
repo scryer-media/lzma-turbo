@@ -122,6 +122,12 @@ pub(crate) struct MatchFinder {
     pub(crate) num_refs: usize,
 
     pub(crate) expected_data_size: u64,
+
+    /// How many buffers this finder has allocated since it was made: the
+    /// window, the tables, and for the threaded finder its two hand-off
+    /// buffers, which count as one.
+    #[cfg(test)]
+    pub(crate) allocs: u32,
 }
 
 /// The byte table the hash functions index.
@@ -210,6 +216,8 @@ impl MatchFinder {
             crc,
             num_refs: 0,
             expected_data_size: u64::MAX,
+            #[cfg(test)]
+            allocs: 0,
         }
     }
 
@@ -551,6 +559,10 @@ impl MatchFinder {
                 .try_reserve_exact(plan.block_size as usize)
                 .map_err(|_| Error::Alloc)?;
             self.buf_base.resize(plan.block_size as usize, 0);
+            #[cfg(test)]
+            {
+                self.allocs += 1;
+            }
         }
 
         // C 22.02: "we don't reallocate buffer, if old size is enough"
@@ -566,6 +578,10 @@ impl MatchFinder {
             .map_err(|_| Error::Alloc)?;
         self.hash.resize(plan.num_refs, 0);
         self.son_base = plan.hash_size_sum;
+        #[cfg(test)]
+        {
+            self.allocs += 1;
+        }
         Ok(())
     }
 

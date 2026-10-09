@@ -147,6 +147,28 @@ pub trait SeqOutStream {
     ///
     /// Whatever the sink reports; the encoder turns it into [`Error::Write`].
     fn write(&mut self, data: &[u8]) -> Result<(), Error>;
+
+    /// Writes all of `data` and leaves it empty.
+    ///
+    /// The block-threaded encoder hands each finished block over through
+    /// this, a whole block in one buffer of its own. A sink that queues what
+    /// it is given can take the allocation ([`core::mem::take`]) instead of
+    /// copying the block; the encoder then allocates the next block's buffer
+    /// afresh. The default copies through [`SeqOutStream::write`] and leaves
+    /// `data` its capacity, which the encoder uses again.
+    ///
+    /// C: `ISeqOutStream` has nothing like it; `Lzma2Enc_MtCallback_Write`
+    /// passes the block's buffer to `ISeqOutStream_Write` and keeps it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SeqOutStream::write`]. `data` is in an unspecified state after an
+    /// error.
+    fn write_vec(&mut self, data: &mut alloc::vec::Vec<u8>) -> Result<(), Error> {
+        self.write(data)?;
+        data.clear();
+        Ok(())
+    }
 }
 
 impl SeqOutStream for alloc::vec::Vec<u8> {

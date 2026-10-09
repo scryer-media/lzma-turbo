@@ -814,11 +814,13 @@ pub(crate) struct MtShared {
     /// Raised when the hash or bt thread caught a panic. The lz thread reads
     /// it in `CheckErrors`, as the C reads `failure_LZ_BT`.
     thread_failed: AtomicBool,
-    /// The allocations `Common`'s pointers address. Never referenced through
-    /// these fields; they are here so that the buffers outlive every thread.
-    _win: Vec<u8>,
-    _tab: Vec<u32>,
-    _bufs: Vec<u32>,
+    /// The allocations `Common`'s pointers address. Nothing reads or writes
+    /// through these fields while a thread can reach the pointers; they are
+    /// here so that the buffers outlive every thread, and so that
+    /// [`MatchFinderMt::create`] can take them back for the next block.
+    own_win: Vec<u8>,
+    own_tab: Vec<u32>,
+    own_bufs: Vec<u32>,
 }
 
 // SAFETY: `Common`'s three raw pointers address allocations owned by this same
@@ -1376,10 +1378,36 @@ impl MatchFinderMt {
             return Err(Error::Param);
         }
 
+        // C: `MatchFinderMt_Create` keeps `hashBuf` once it has it, and
+        // `MatchFinder_Create` keeps a window and tables that are long enough.
+        // The block before left all three in `sh`; they go back to where the
+        // C keeps them, so that a second block allocates nothing. Both
+        // producer threads were joined when that block's `with_threads`
+        // returned, which is what makes this handle the last one. If it is
+        // not, the buffers stay with whoever still holds them and this block
+        // allocates its own.
         let mut bufs: Vec<u32> = Vec::new();
-        bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
-            .map_err(|_| Error::Alloc)?;
-        bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+        if let Some(old) = self.sh.take().and_then(Arc::into_inner) {
+            self.mfb.buf_base = old.own_win;
+            self.mfb.hash = old.own_tab;
+            bufs = old.own_bufs;
+        }
+        if bufs.len() == HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2 {
+            // Every word of a hash block and of a bt block is written by the
+            // thread that fills it before the thread it is handed to reads it.
+            // The two words past `btBuf` are the exception: the lz thread
+            // parks on them after a failure.
+            bufs[HASH_BUFFER_SIZE + BT_BUFFER_SIZE..].fill(0);
+        } else {
+            bufs = Vec::new();
+            bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
+                .map_err(|_| Error::Alloc)?;
+            bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+            #[cfg(test)]
+            {
+                self.mfb.allocs += 1;
+            }
+        }
 
         let before = keep_add_buffer_before
             .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
@@ -1470,9 +1498,9 @@ impl MatchFinderMt {
             bt_shift: AtomicUsize::new(0),
             lz_shift: AtomicUsize::new(0),
             thread_failed: AtomicBool::new(false),
-            _win: win,
-            _tab: tab,
-            _bufs: bufs,
+            own_win: win,
+            own_tab: tab,
+            own_bufs: bufs,
         }));
         Ok(())
     }
@@ -1506,7 +1534,9 @@ impl MatchFinderMt {
     #[cfg(test)]
     pub(crate) fn allocated(&self) -> u64 {
         match &self.sh {
-            Some(sh) => sh._win.len() as u64 + (sh._tab.len() as u64 + sh._bufs.len() as u64) * 4,
+            Some(sh) => {
+                sh.own_win.len() as u64 + (sh.own_tab.len() as u64 + sh.own_bufs.len() as u64) * 4
+            }
             None => self.mfb.allocated(),
         }
     }

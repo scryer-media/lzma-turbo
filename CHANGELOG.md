@@ -29,6 +29,25 @@
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.
+- The threaded match finder keeps its window, its tables and its two hand-off
+  buffers from one block to the next. It used to allocate and zero all of them
+  again for every block, about 100 MiB at level 5, while the buffers of the
+  block before were still held. A stream coded in blocks on one block thread
+  with a two-thread finder therefore held two encoders' worth of memory at
+  each block boundary; it now holds one.
+- The block-parallel LZMA2 coder keeps one coder per block thread for as long
+  as the `Lzma2Encoder` lives, the first of them being the coder the one-thread
+  path uses, and builds each of the others when its thread first has a block.
+  A request for more block threads than the input has blocks no longer builds
+  coders that never run, and a second stream allocates nothing the first
+  already allocated. Dropping the `Lzma2Encoder` releases them.
+- A block's output buffer is reserved once, at the most a block of that length
+  can come to (the SDK's `destBlockSize`), instead of being grown by doubling
+  as the block is written.
+- `SeqOutStream::write_vec`: the block-parallel coder hands each finished
+  block to the sink as the buffer it was written into. The default writes it
+  through `write` and keeps the buffer for the next block; a sink that queues
+  its input can take the buffer and skip the copy.
 
 ## 0.7.0 - 2026-10-07
 

@@ -432,6 +432,15 @@ pub struct Lzma2Encoder {
     /// What [`Lzma2Encoder::coder`] was built with, so that a change of block
     /// size can be noticed.
     coder_props: LzmaEncProps,
+    /// C: `me->coders[1..]`, the coders of the block threads after the first;
+    /// [`Lzma2Encoder::coder`] is the first thread's, as `me->coders[0]` is.
+    /// Each is built when its thread first takes a block, and is kept from
+    /// then on - window, tables and all - for every later block and stream.
+    #[cfg(feature = "std")]
+    block_coders: Vec<Mutex<Option<Lzma2EncInt>>>,
+    /// The settings every coder in `block_coders` has.
+    #[cfg(feature = "std")]
+    block_coder_props: LzmaEncProps,
 }
 
 impl Lzma2Encoder {
@@ -458,6 +467,10 @@ impl Lzma2Encoder {
             mem_limit: u64::MAX,
             expected_data_size: u64::MAX,
             coder_props: *props,
+            #[cfg(feature = "std")]
+            block_coders: Vec::new(),
+            #[cfg(feature = "std")]
+            block_coder_props: *props,
         })
     }
 
@@ -744,7 +757,13 @@ impl Lzma2Encoder {
     /// The sink must be [`Send`] because with more than one thread the worker
     /// that finished a block is the one that writes it, in order. C: the same
     /// `ISeqOutStream` is reached from `Lzma2Enc_MtCallback_Write` on whichever
-    /// thread holds the write turn.
+    /// thread holds the write turn. Each block reaches the sink whole,
+    /// through [`SeqOutStream::write_vec`], which a sink may override to keep
+    /// the block's buffer instead of copying it.
+    ///
+    /// The encoder keeps each block thread's coder, with its window and
+    /// tables, for the next block and the next stream; dropping the encoder
+    /// is what releases them.
     pub fn encode_slice(
         &mut self,
         src: &[u8],
@@ -818,8 +837,8 @@ impl Lzma2Encoder {
         self.run_mt(MtInput::Data(src), out, threads)
     }
 
-    /// The body both threaded entry points share: build the per-thread coders
-    /// and the per-block output buffers, then hand them to `MtCoder`.
+    /// The body both threaded entry points share: line up the per-thread
+    /// coders and the per-block output buffers, then hand them to `MtCoder`.
     #[cfg(feature = "std")]
     fn run_mt(
         &mut self,
@@ -828,20 +847,53 @@ impl Lzma2Encoder {
         threads: usize,
     ) -> Result<(), Error> {
         let block_size = usize::try_from(self.block_size()).map_err(|_| Error::Param)?;
+        let expected_data_size = self.expected_data_size;
+        let cb = self.mt_callback(out, threads)?;
+        MtCoder {
+            block_size,
+            num_threads_max: threads,
+            expected_data_size,
+            input,
+            callback: &cb,
+        }
+        .code()
+    }
+
+    /// What `MtCoder` drives for one stream on `threads` block threads.
+    #[cfg(feature = "std")]
+    fn mt_callback<'o>(
+        &'o mut self,
+        out: &'o mut (dyn SeqOutStream + Send),
+        threads: usize,
+    ) -> Result<Lzma2MtCallback<'o>, Error> {
         let props = self.coder_props;
 
-        // C: `me->coders[i]`, one per block thread, and `me->outBufs[i]`, one
-        // per block in flight. The C allocates the out buffers at
-        // `destBlockSize` and passes them to `MtCoder` by index; here they are
-        // growable and behind mutexes, so an incompressible block cannot
-        // overflow one.
-        let mut coders = Vec::new();
-        coders
-            .try_reserve_exact(threads)
-            .map_err(|_| Error::Alloc)?;
-        for _ in 0..threads {
-            coders.push(Mutex::new(Lzma2EncInt::new(&props)?));
+        // C: `me->coders[i]`, one per block thread. `Lzma2Enc_EncodeMt1`
+        // creates a coder's `CLzmaEnc` the first time that coder is given a
+        // block, and so does this: a slot is empty until then. The ones an
+        // earlier stream built are given this stream's settings, as
+        // `Lzma2EncInt_InitStream` gives them.
+        if self.block_coder_props != props {
+            for slot in &mut self.block_coders {
+                if let Some(coder) = slot.get_mut().unwrap_or_else(|e| e.into_inner()) {
+                    coder.set_props(&props)?;
+                }
+            }
+            self.block_coder_props = props;
         }
+        let more = threads
+            .saturating_sub(1)
+            .saturating_sub(self.block_coders.len());
+        self.block_coders
+            .try_reserve_exact(more)
+            .map_err(|_| Error::Alloc)?;
+        for _ in 0..more {
+            self.block_coders.push(Mutex::new(None));
+        }
+
+        // C: `me->outBufs[i]`, one per block in flight, passed to `MtCoder`
+        // by index. They are behind mutexes here, and each is given its
+        // length by the block thread that first writes into it.
         let mut out_bufs = Vec::new();
         out_bufs
             .try_reserve_exact(BLOCKS_MAX)
@@ -850,26 +902,25 @@ impl Lzma2Encoder {
             out_bufs.push(Mutex::new(Vec::new()));
         }
 
-        let cb = Lzma2MtCallback {
-            coders,
+        Ok(Lzma2MtCallback {
+            first: Mutex::new(&mut self.coder),
+            rest: &self.block_coders,
+            props,
             out_bufs,
             out: Mutex::new(out),
-        };
-        MtCoder {
-            block_size,
-            num_threads_max: threads,
-            expected_data_size: self.expected_data_size,
-            input,
-            callback: &cb,
-        }
-        .code()
+        })
     }
 }
 
 /// C: `Lzma2Enc_MtCallback_Code` and `Lzma2Enc_MtCallback_Write`.
 #[cfg(feature = "std")]
 struct Lzma2MtCallback<'o> {
-    coders: Vec<Mutex<Lzma2EncInt>>,
+    /// C: `me->coders[0]`.
+    first: Mutex<&'o mut Lzma2EncInt>,
+    /// C: `me->coders[1..]`; see [`Lzma2Encoder::block_coders`].
+    rest: &'o [Mutex<Option<Lzma2EncInt>>],
+    /// What a coder built during this stream is built with.
+    props: LzmaEncProps,
     out_bufs: Vec<Mutex<Vec<u8>>>,
     out: Mutex<&'o mut (dyn SeqOutStream + Send)>,
 }
@@ -888,21 +939,43 @@ impl MtCoderCallback for Lzma2MtCallback<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         dest.clear();
-        let mut coder = self.coders[coder_index]
+        // C: `destBlockSize`, the `blockSize + (blockSize >> 10) + 16` every
+        // `outBuf` is allocated at, here of this block's own length: more
+        // than a block of all stored chunks comes to, taken once and not
+        // reached by doubling. The buffer can still grow, so nothing rests
+        // on the bound.
+        let room = src.len().saturating_add((src.len() >> 10) + 16);
+        if dest.capacity() < room {
+            dest.try_reserve_exact(room).map_err(|_| Error::Alloc)?;
+        }
+
+        if coder_index == 0 {
+            let mut coder = self.first.lock().unwrap_or_else(|e| e.into_inner());
+            return coder.encode_mt1_mem(src, &mut *dest, finished);
+        }
+        let mut slot = self.rest[coder_index - 1]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let coder = match &mut *slot {
+            Some(coder) => coder,
+            // C: `if (!p->enc) p->enc = LzmaEnc_Create(...)`, at the head
+            // of `Lzma2Enc_EncodeMt1`.
+            None => slot.insert(Lzma2EncInt::new(&self.props)?),
+        };
         coder.encode_mt1_mem(src, &mut *dest, finished)
     }
 
     /// C: `Lzma2Enc_MtCallback_Write`.
     fn write(&self, out_buf_index: usize) -> Result<(), Error> {
-        let data = self.out_bufs[out_buf_index]
+        let mut data = self.out_bufs[out_buf_index]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // The whole block, in a buffer nothing else needs until the next
+        // block that draws this index: the sink may keep it.
         self.out
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .write(&data)
+            .write_vec(&mut data)
     }
 }
 
@@ -1278,6 +1351,183 @@ mod tests {
                     .encode_mt1_stream(input, &mut out, BLOCK_SIZE_SOLID, u64::MAX, 10, true);
             assert!(res.is_err(), "{mf_threads} finder threads");
         }
+    }
+
+    /// One block after another and one stream after another on the threaded
+    /// finder: the window, the tables and the hand-off buffers are allocated
+    /// for the first block and for no other, and what is written is what an
+    /// encoder that has never run writes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_threaded_finder_allocates_for_its_first_block_only() {
+        let whole = mixed(900_000);
+        let props = LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(1 << 18)
+            .with_num_threads(2);
+        // (block size, input): six blocks, then a smaller dictionary over
+        // other bytes, then the first dictionary again. Every later window
+        // and table fits inside the first.
+        let streams: [(u64, &[u8]); 4] = [
+            (1 << 17, &whole[..700_000]),
+            (1 << 16, &whole[300_000..750_000]),
+            (1 << 17, &whole[100_000..900_000]),
+            (1 << 17, &whole[..1]),
+        ];
+        let mut reused = Lzma2Encoder::new(&props).unwrap();
+        for (i, (block, src)) in streams.into_iter().enumerate() {
+            reused.set_block_size(block);
+            let mut got = Vec::new();
+            reused
+                .encode_send(&mut SliceStream::new(src), &mut got)
+                .unwrap();
+            assert!(reused.coder.enc.mf.is_mt(), "stream {i}");
+            assert_eq!(reused.coder.enc.mf.cfg().allocs, 3, "stream {i}");
+
+            let mut fresh = Lzma2Encoder::new(&props).unwrap();
+            fresh.set_block_size(block);
+            let mut want = Vec::new();
+            fresh
+                .encode_send(&mut SliceStream::new(src), &mut want)
+                .unwrap();
+            assert!(got == want, "stream {i}");
+        }
+    }
+
+    /// A block thread's coder is built when that thread first has a block,
+    /// and is the same coder for every stream after: with new settings it
+    /// writes what a coder built with them writes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_block_threads_coder_is_built_once_and_when_it_is_needed() {
+        fn built(enc: &mut Lzma2Encoder) -> Vec<Option<*const LzmaEnc>> {
+            enc.block_coders
+                .iter_mut()
+                .map(|slot| {
+                    slot.get_mut()
+                        .unwrap()
+                        .as_ref()
+                        .map(|coder| core::ptr::from_ref::<LzmaEnc>(&coder.enc))
+                })
+                .collect()
+        }
+
+        let src = mixed(200_000);
+        for mf_threads in [1u32, 2] {
+            let props = LzmaEncProps::new()
+                .with_level(5)
+                .with_dict_size(1 << 20)
+                .with_num_threads(mf_threads);
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            let first: *const LzmaEnc = &*enc.coder.enc;
+            let mut kept = None;
+            // The second stream has a smaller dictionary, so the coder the
+            // first one built is given other settings.
+            for block in [1usize << 16, 1 << 15, 1 << 16] {
+                enc.set_block_size(block as u64);
+                enc.set_threads(4);
+                enc.sync_coder().unwrap();
+                let (head, tail) = src.split_at(block);
+                let tail = &tail[..block / 2];
+
+                let mut got = Vec::new();
+                {
+                    let cb = enc.mt_callback(&mut got, 4).unwrap();
+                    // The third block thread takes the first block, the
+                    // first thread the last; the other two never run.
+                    cb.code(2, 5, head, false).unwrap();
+                    cb.code(0, 1, tail, true).unwrap();
+                    cb.write(5).unwrap();
+                    cb.write(1).unwrap();
+                }
+                assert!(core::ptr::eq(first, &*enc.coder.enc));
+                let now = built(&mut enc);
+                assert_eq!(now.len(), 3);
+                assert!(now[0].is_none() && now[2].is_none());
+                assert!(now[1].is_some());
+                assert_eq!(*kept.get_or_insert(now[1]), now[1]);
+
+                let mut fresh = Lzma2Encoder::new(&props).unwrap();
+                fresh.set_block_size(block as u64);
+                let want = fresh.encode_to_vec(&src[..block + block / 2]).unwrap();
+                assert!(got == want, "{mf_threads} finder threads, block {block}");
+            }
+        }
+    }
+
+    /// A block's output buffer is as long as a block of that length can come
+    /// to before the first byte goes into it, and stays that long.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_blocks_output_buffer_is_sized_once() {
+        // Nothing here compresses, so the block comes out longer than it
+        // went in.
+        let src = pseudo_random(100_000);
+        let room = src.len() + (src.len() >> 10) + 16;
+        let mut enc = Lzma2Encoder::new(&LzmaEncProps::new().with_dict_size(1 << 16)).unwrap();
+        enc.set_block_size(1 << 17);
+        enc.sync_coder().unwrap();
+        let mut out = Vec::new();
+        let cb = enc.mt_callback(&mut out, 2).unwrap();
+        cb.code(0, 0, &src, true).unwrap();
+        let (len, cap) = {
+            let buf = cb.out_bufs[0].lock().unwrap();
+            (buf.len(), buf.capacity())
+        };
+        assert!(len > src.len() && len <= room);
+        // What was reserved, not the next power of two above the length.
+        assert!((room..room + room / 8).contains(&cap), "{cap} for {room}");
+
+        // The same buffer takes a second, shorter block as it is.
+        cb.write(0).unwrap();
+        cb.code(0, 0, &src[..1000], true).unwrap();
+        assert_eq!(cb.out_bufs[0].lock().unwrap().capacity(), cap);
+    }
+
+    /// A sink that keeps what it is handed is handed every block whole, once,
+    /// and in order; one that does not is written the same bytes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_finished_block_is_handed_to_the_sink_whole() {
+        #[derive(Default)]
+        struct Keeps {
+            blocks: Vec<Vec<u8>>,
+            writes: usize,
+        }
+        impl SeqOutStream for Keeps {
+            fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+                self.writes += 1;
+                self.blocks.push(data.to_vec());
+                Ok(())
+            }
+            fn write_vec(&mut self, data: &mut Vec<u8>) -> Result<(), Error> {
+                self.blocks.push(core::mem::take(data));
+                Ok(())
+            }
+        }
+
+        let src = mixed(300_000);
+        let props = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        enc.set_block_size(1 << 16);
+        enc.set_threads(3);
+
+        let mut copied = Vec::new();
+        enc.encode_slice(&src, &mut copied).unwrap();
+
+        let mut kept = Keeps::default();
+        enc.encode_slice(&src, &mut kept).unwrap();
+        assert_eq!(kept.writes, 0);
+        assert_eq!(kept.blocks.len(), src.len().div_ceil(1 << 16));
+        assert!(kept.blocks.concat() == copied);
+
+        // The default leaves the caller its buffer, emptied.
+        let mut sink = Vec::new();
+        let mut block = Vec::with_capacity(64);
+        block.extend_from_slice(b"one block");
+        SeqOutStream::write_vec(&mut sink, &mut block).unwrap();
+        assert_eq!(sink, b"one block");
+        assert!(block.is_empty() && block.capacity() >= 64);
     }
 
     /// Runs that compress and runs that do not, so that long matches, short
