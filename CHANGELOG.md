@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The threaded match finder's binary-tree walk tests the one byte at the
+  current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
+  Most nodes of a walk differ at that byte, so they now cost two byte loads
+  instead of a word scan over two slices, and the two bytes loaded are the
+  ones that order the node. No `unsafe` is involved and the output is
+  unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
+  with one thread and threaded.
+
 ## 0.7.0 - 2026-10-07
 
 - The crate is now licensed Apache-2.0 instead of GPL-3.0-or-later, matching

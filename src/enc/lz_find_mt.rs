@@ -450,12 +450,22 @@ fn get_matches_spec_n_2(
 
                 let pair0 = son[pair];
 
-                // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
-                // absolute window indices: it returns `len` unchanged exactly
-                // when the byte at `len` already differs.
-                let run = match_run(win, diff, len, len_limit);
-                if run != len {
-                    len = run;
+                // C: `if (len[diff] == len[0])`, the one byte the C tests
+                // before it scans. Most nodes of a walk differ right here, so
+                // asking this first keeps the word scan, and the two slices it
+                // cuts, off the common path; the bytes loaded for it are the
+                // ones the ordering test below needs, so a node that differs
+                // costs two loads and no more. The walk never reaches a node
+                // with `len` at the limit: both bounds start at `cur`, below
+                // it, and a scan that runs to the limit ends the walk.
+                debug_assert!(len < len_limit);
+                let mut a = win[len - diff];
+                let mut b = win[len];
+                if a == b {
+                    // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
+                    // absolute window indices, from the byte after the one
+                    // just tested.
+                    len = match_run(win, diff, len + 1, len_limit);
                     if max_len < len {
                         max_len = len;
                         d[di] = (len - cur) as u32;
@@ -514,10 +524,14 @@ fn get_matches_spec_n_2(
                             break;
                         }
                     }
+                    // The scan stopped short of the limit, at the first byte
+                    // that differs: that pair is what orders this node.
+                    a = win[len - diff];
+                    b = win[len];
                 }
                 {
                     let cur_match = pos.wrapping_sub(delta);
-                    if win[len - diff] < win[len] {
+                    if a < b {
                         delta = son[pair + 1];
                         son[ptr1] = cur_match;
                         ptr1 = pair + 1;
@@ -526,7 +540,9 @@ fn get_matches_spec_n_2(
                             return None;
                         }
                     } else {
-                        delta = son[pair];
+                        // `son[pair]`, loaded above; nothing has written the
+                        // tree since.
+                        delta = pair0;
                         son[ptr0] = cur_match;
                         ptr0 = pair;
                         len0 = len;
