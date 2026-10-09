@@ -84,7 +84,7 @@ pub use lzma2::scan::run_boundaries;
 pub use lzma2::scan::{Lzma2Run, Lzma2RunChunks, Lzma2RunScanner};
 
 #[cfg(feature = "std")]
-pub use mt::adaptive::{DrainStatus, Lzma2AdaptiveDecoder};
+pub use mt::adaptive::{AdaptiveLedger, DrainStatus, Lzma2AdaptiveDecoder};
 #[cfg(all(feature = "std", feature = "crc"))]
 pub use mt::checksum;
 #[cfg(all(feature = "std", feature = "crc"))]

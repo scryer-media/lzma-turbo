@@ -82,6 +82,55 @@
   down to one-slot cyclic buffers and positions at the normalisation and wrap
   boundaries. The accesses made once per position keep their checks, and the
   output is unchanged.
+- `CrcFolder::range` folds a range from its first piece instead of from the
+  empty checksum. Combining a piece with nothing gives the piece back, and it
+  cost a whole fold to do it: a range that is exactly one piece, as each file
+  of a block is when the split points are the file boundaries, now costs no
+  fold, and a range of `n` pieces costs `n - 1`. On Apple M5 Max, 8192
+  one-piece `u32` ranges took 61 ms at 4 KiB a piece and 131 to 138 ms at
+  16 MiB a piece; they now take under 0.3 ms at either size.
+- `Lzma2AdaptiveDecoder` holds what 7-Zip holds: once the runs of the
+  stream are known, one run pair (its input and its output) per thread and
+  two of the caller's pieces, under the default budget as under a larger
+  limit; a caller's tighter limit still governs, and `memory_limit()`
+  reports the figure in force. The pieces are what holding input in the
+  caller's pieces costs over run-sized buffers. On Apple M5 Max, decoding a
+  2 GiB archive of 16 runs went from 2691 to 1165 MiB peak RSS at 4 threads
+  and from 3203 to about 2060 MiB at 8, at the same wall time as before and
+  as 7-Zip.
+- `Lzma2AdaptiveDecoder` no longer settles on one run out under a memory
+  limit that pays for several. The input budget set aside a whole run pair
+  for every thread, including the ones already out with a run and already
+  charged for it; it now sets aside an output buffer only for the threads
+  that have none, since a thread with a run out or a run waiting its turn
+  has its buffer already. A whole piece that completes the run in hand is
+  now taken whenever the limit has room for it, where the floor used to
+  refuse any piece that ran more than a megabyte past the run's end. A run
+  that would be refused for want of room first gets the parked capacity its
+  dispatch will not reuse - every spare output buffer but the last, every
+  parked input piece - when that is enough to let it through. And no more
+  output buffers are parked than there are threads without one.
+- `Lzma2AdaptiveDecoder` keeps a full read's input buffer when it comes back
+  after a short piece, such as the tail a caller cuts at a run boundary.
+  Buffers were judged against the last piece taken, so every full read after
+  a tail paid a fresh allocation; they are now judged against the largest of
+  the last eight pieces.
+- `Lzma2AdaptiveDecoder::feed_owned` admits a piece by its allocation's
+  capacity, which is what holding it costs, instead of by its length. A short
+  piece in a large buffer, such as a head cut from a full read, was taken
+  under a limit with room for its bytes but not its buffer, and
+  `held_bytes()` went past the limit; it is now refused.
+- `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
+  split into input pieces, runs out, runs waiting and parked buffers; runs
+  out, decoding and waiting; the peak held; and dispatch refusals by cause,
+  each counted once per run, with input refusals and sheds.
+- `Lzma2AdaptiveDecoder::dispatch_cost(unpacked_len)`: what dispatching a run
+  adds to `held_bytes()`, the arithmetic the decoder's own dispatch rule uses,
+  for a caller that gates its reads on the same predicate.
+- `Lzma2AdaptiveDecoder::set_memory_limit(limit)`: changes the limit
+  mid-stream, so a caller with a queue of its own can give the decoder the
+  budget less that queue before each feed or drain. `held_bytes()` is
+  documented as excluding anything the caller holds.
 
 ## 0.7.0 - 2026-10-07
 

@@ -99,6 +99,7 @@ fn main() {
     let mut shot_filter: Option<String> = None;
     let mut shot_encode = false;
     let mut shot_verify = false;
+    let mut shot_memory_limit = u64::MAX;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -143,6 +144,12 @@ fn main() {
                 };
             }
             "--verify" => shot_verify = true,
+            "--memory-limit" => {
+                shot_memory_limit = args
+                    .next()
+                    .and_then(|v| parse_bytes(&v))
+                    .unwrap_or_else(|| fail("--memory-limit needs a size"));
+            }
             "--portable" => portable = true,
             "--index" => index = true,
             "--checksum" => {
@@ -182,6 +189,7 @@ fn main() {
             filter: shot_filter,
             encode: shot_encode,
             verify: shot_verify,
+            memory_limit: shot_memory_limit,
         };
         std::process::exit(shot::run(&shot, files.first().map(PathBuf::as_path)));
     }
@@ -970,6 +978,16 @@ unsafe impl GlobalAlloc for Counting {
 
 /// Starts a measurement: returns the live-bytes baseline and pulls the peak
 /// down to it.
+/// A size in bytes, or in MiB or GiB with an `M` or `G` suffix.
+fn parse_bytes(v: &str) -> Option<u64> {
+    let (num, shift) = match v.as_bytes().last()? {
+        b'M' | b'm' => (&v[..v.len() - 1], 20),
+        b'G' | b'g' => (&v[..v.len() - 1], 30),
+        _ => (v, 0),
+    };
+    num.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
 fn alloc_watch_reset() -> usize {
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
