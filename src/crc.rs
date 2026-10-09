@@ -287,18 +287,24 @@ impl<W: Foldable> CrcFolder<W> {
         }
         let end = offset.checked_add(len)?;
         let mut pos = offset;
-        let mut acc = W::EMPTY;
+        // Folded from the first piece and not from the empty checksum:
+        // combining a piece with nothing gives the piece back, and costs a
+        // whole fold to do it.
+        let mut acc = None;
         for (&s, &(l, c)) in self.pieces.range(offset..end) {
             if s != pos {
                 return None;
             }
-            acc = W::fold(acc, c, l);
+            acc = Some(match acc {
+                None => c,
+                Some(a) => W::fold(a, c, l),
+            });
             pos = s.checked_add(l)?;
             if pos >= end {
                 break;
             }
         }
-        if pos == end { Some(acc) } else { None }
+        if pos == end { acc } else { None }
     }
 
     /// How many pieces are held.
@@ -504,6 +510,52 @@ mod tests {
                     s64.finalize(),
                     crc64_xz(&data),
                     "Crc64Xz, len {len}, {label}"
+                );
+            }
+        }
+    }
+
+    /// A stand-in checksum that carries the number of folds that made it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Counted {
+        bytes: u64,
+        folds: u32,
+    }
+
+    impl Foldable for Counted {
+        const EMPTY: Self = Counted { bytes: 0, folds: 0 };
+
+        fn fold(a: Self, b: Self, len_b: u64) -> Self {
+            Counted {
+                bytes: a.bytes + len_b,
+                folds: a.folds + b.folds + 1,
+            }
+        }
+    }
+
+    /// A range is folded from its first piece, so a range that is one piece
+    /// costs no fold and one of `n` pieces costs `n - 1`. A file that is
+    /// exactly one piece used to pay for a fold to combine it with nothing.
+    #[test]
+    fn folder_folds_a_range_from_its_first_piece() {
+        let mut f = CrcFolder::<Counted>::new();
+        for i in 0..4u64 {
+            let piece = Counted {
+                bytes: 10,
+                folds: 0,
+            };
+            f.push(i * 10, 10, piece);
+        }
+        for pieces in 1..=4u64 {
+            for first in 0..=(4 - pieces) {
+                let whole = Counted {
+                    bytes: pieces * 10,
+                    folds: pieces as u32 - 1,
+                };
+                assert_eq!(
+                    f.range(first * 10, pieces * 10),
+                    Some(whole),
+                    "{pieces} piece(s) from piece {first}"
                 );
             }
         }

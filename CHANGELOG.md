@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `CrcFolder::range` folds a range from its first piece instead of from the
+  empty checksum. Combining a piece with nothing gives the piece back, and it
+  cost a whole fold to do it: a range that is exactly one piece, as each file
+  of a block is when the split points are the file boundaries, now costs no
+  fold, and a range of `n` pieces costs `n - 1`. On Apple M5 Max, 8192
+  one-piece `u32` ranges took 61 ms at 4 KiB a piece and 131 to 138 ms at
+  16 MiB a piece; they now take under 0.3 ms at either size.
+
 ## 0.7.0 - 2026-10-07
 
 - The crate is now licensed Apache-2.0 instead of GPL-3.0-or-later, matching
