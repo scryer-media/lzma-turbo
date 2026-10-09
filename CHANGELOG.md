@@ -1,5 +1,175 @@
 # Changelog
 
+## 0.8.0 - 2026-10-09
+
+- The threaded match finder's binary-tree walk tests the one byte at the
+  current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
+  Most nodes of a walk differ at that byte, so they now cost two byte loads
+  instead of a word scan over two slices, and the two bytes loaded are the
+  ones that order the node. No `unsafe` is involved and the output is
+  unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
+  with one thread and threaded.
+- `Lzma2Encoder` builds its encoder once. A block size or a thread split that
+  changes the settings in force used to build a second one in place of the
+  one `new` had made; the settings are now applied to that one, as
+  `LzmaEnc_SetProps` applies them in the SDK.
+- An LZMA2 encode that knows how long its input is allocates a window no
+  longer than that input needs. The SDK's window comes from the dictionary and
+  a 2 MiB keep window whatever the input, which is 3 MiB for a 100-byte input
+  with a 4 KiB dictionary; `encode_slice`, `encode_to_vec`, a block of the
+  block-parallel coder and a `Lzma2PushEncoder` whose input ends before its
+  queue has filled now take 64 KiB plus the input. Only a length that is
+  certain is used - a slice, a block limit, a finished queue - never the
+  `set_data_size` hint, and the output is unchanged: the window's length is
+  not something the match finder's results depend on. The match finder's
+  tables are still sized by the dictionary and the data-size hint, because
+  those are what the bytes depend on. `Lzma2PushEncoder` allocates its window
+  when it codes its first chunk rather than in `new`, which still refuses any
+  setting the allocation would refuse.
+- A fresh match finder asks the allocator for its window, hash and son
+  tables already zeroed, where it allocated them and then wrote a zero to
+  every byte. None of them needs that fill: the window is read into before
+  it is read, the hash heads are cleared for every stream, and the son links
+  are written before they are followed. Large fresh allocations come back as
+  untouched zero pages, so a stream much smaller than the dictionary no
+  longer makes the whole window and son table resident, and an encoder built
+  for each small stream skips a fill the size of its tables. Output is
+  unchanged. CI checks the allocation under Miri.
+- The match finder keeps a window that is already long enough instead of
+  allocating again whenever the size differs, so an encoder used for inputs of
+  different sizes allocates for the largest once.
+- The threaded match finder keeps its window, its tables and its two hand-off
+  buffers from one block to the next. It used to allocate and zero all of them
+  again for every block, about 100 MiB at level 5, while the buffers of the
+  block before were still held. A stream coded in blocks on one block thread
+  with a two-thread finder therefore held two encoders' worth of memory at
+  each block boundary; it now holds one.
+- The block-parallel LZMA2 coder keeps one coder per block thread for as long
+  as the `Lzma2Encoder` lives, the first of them being the coder the one-thread
+  path uses, and builds each of the others when its thread first has a block.
+  A request for more block threads than the input has blocks no longer builds
+  coders that never run, and a second stream allocates nothing the first
+  already allocated. Dropping the `Lzma2Encoder` releases them. Under
+  `set_mem_limit`, a stream keeps only the coders it is allowed: those of
+  block threads it does not run are released, and a coder given other
+  settings than it was built with is built again rather than keeping the
+  window and tables of the larger ones.
+- A block's output buffer is reserved once, at the most a block of that length
+  can come to (the SDK's `destBlockSize`), instead of being grown by doubling
+  as the block is written.
+- `SeqOutStream::write_vec`: the block-parallel coder hands each finished
+  block to the sink as the buffer it was written into. The default writes it
+  through `write` and keeps the buffer for the next block; a sink that queues
+  its input can take the buffer and skip the copy.
+- `Lzma2Encoder::set_total_threads` with no block-thread count named now
+  divides the total the way the SDK's `Lzma2EncProps_Normalize` does. The
+  divisor is the match finder's thread count, and where the settings name none
+  it is two for a binary-tree finder outside fast mode and one for a hash chain
+  or fast mode: a total of N is N / 2 block coders with threaded finders, or N
+  block coders whose finder cannot thread. It used to be N block coders with
+  one-thread finders whatever the finder, and with the automatic block size it
+  was one solid block on one thread whatever the total, because the automatic
+  size looked at the block-thread count the caller had not set. Output changes
+  only for that last combination - a total, no block threads named and
+  `BLOCK_SIZE_AUTO` - which is now coded in blocks when the split comes to more
+  than one block coder. A caller who names block threads, or no thread count
+  at all, is split as before, and the finder's default with no total is still
+  one thread. The total is not a count of operating-system
+  threads: a block coder with a threaded finder runs on three, so a total of N
+  over a binary tree starts about 1.5 N. Setting the total back to zero
+  returns to the block-thread count `set_threads` was last given, or one; it
+  used to leave one block thread whatever had been named.
+- `Lzma2PushEncoder::reset` and `LzmaPushEncoder::reset` make a push encoder
+  ready for another stream with new settings. The encoder keeps its queue, and
+  its window and tables wherever the next stream needs no more than they
+  already hold, so a caller coding many streams one after another allocates
+  for the largest of them once. What is written after a reset is what a new
+  encoder with those settings writes; a stream that was under way is
+  abandoned.
+- The threaded match finder's binary-tree walk no longer bounds-checks the
+  accesses it makes once per node: the node's two sons, the two bytes at the
+  current match length and the store that relinks the tree. The walk tests
+  five conditions on its arguments before it starts and panics, which the bt
+  thread reports as a failed stream, on a call that breaks one; its own
+  distance and length tests carry them to every index. The argument is
+  written out on the walk and at each `unsafe` block, and a test compares the
+  walk against the checked one over tens of thousands of generated tables,
+  down to one-slot cyclic buffers and positions at the normalisation and wrap
+  boundaries; CI runs that comparison under Miri as well, so an access
+  outside its slice fails the build. The accesses made once per position keep
+  their checks, and the output is unchanged.
+- `CrcFolder::range` folds a range from its first piece instead of from the
+  empty checksum. Combining a piece with nothing gives the piece back, and it
+  cost a whole fold to do it: a range that is exactly one piece, as each file
+  of a block is when the split points are the file boundaries, now costs no
+  fold, and a range of `n` pieces costs `n - 1`. On Apple M5 Max, 8192
+  one-piece `u32` ranges took 61 ms at 4 KiB a piece and 131 to 138 ms at
+  16 MiB a piece; they now take under 0.3 ms at either size.
+- `Lzma2AdaptiveDecoder` holds what 7-Zip holds: once the runs of the
+  stream are known, one run pair (its input and its output) per thread and
+  two of the caller's pieces, under the default budget as under a larger
+  limit; a caller's tighter limit still governs, and `memory_limit()`
+  reports the figure in force. Runs already handed out count at their own
+  sizes, so a stream whose runs vary keeps room for a large run still out.
+  The pieces are what holding input in the caller's pieces costs over
+  run-sized buffers. On Apple M5 Max, decoding a
+  2 GiB archive of 16 runs went from 2691 to 1165 MiB peak RSS at 4 threads
+  and from 3203 to about 2060 MiB at 8, at the same wall time as before and
+  as 7-Zip.
+- `Lzma2AdaptiveDecoder` no longer settles on one run out under a memory
+  limit that pays for several. The input budget set aside a whole run pair
+  for every thread, including the ones already out with a run and already
+  charged for it; it now sets aside an output buffer only for the threads
+  that have none, since a thread with a run out or a run waiting its turn
+  has its buffer already. A whole piece that completes the run in hand is
+  now taken whenever the limit has room for it, where the floor used to
+  refuse any piece that ran more than a megabyte past the run's end. A run
+  that would be refused for want of room first gets the parked capacity its
+  dispatch will not reuse - every spare output buffer but the last, every
+  parked input piece - when that is enough to let it through. And no more
+  output buffers are parked than there are threads without one.
+- `Lzma2AdaptiveDecoder` keeps a full read's input buffer when it comes back
+  after a short piece, such as the tail a caller cuts at a run boundary.
+  Buffers were judged against the last piece taken, so every full read after
+  a tail paid a fresh allocation; they are now judged against the largest of
+  the last eight pieces.
+- `Lzma2AdaptiveDecoder::feed_owned` admits a piece by its allocation's
+  capacity, which is what holding it costs, instead of by its length. A short
+  piece in a large buffer, such as a head cut from a full read, was taken
+  under a limit with room for its bytes but not its buffer, and
+  `held_bytes()` went past the limit; it is now refused.
+- `Lzma2AdaptiveDecoder` with chasing turned off no longer stalls when it
+  refuses a piece outright with nothing out and nothing landed since, as it
+  did under a limit smaller than the first run before that run's end was
+  seen: `drain` decoded nothing and asked for the input it had just refused.
+  The chase now decodes what is held so the rest can come in.
+- `Lzma2AdaptiveDecoder` with chasing turned off no longer decodes on the
+  calling thread a run it is only waiting to be fed. A parked input buffer
+  counted as held made such a decoder look full, so it chased, and having
+  finished that run the chase held on into the next and could decode the
+  rest of the stream there. Parked input no longer counts toward that check,
+  and the chase stops at a run boundary.
+- `Lzma2AdaptiveDecoder` drops what it had parked once `drain` reports
+  `Finished`, so `held_bytes()` is zero after the stream ends.
+- `Lzma2AdaptiveDecoder::feed_owned` returns `Error::Cancelled` after
+  `cancel`, including for an empty piece.
+- `Lzma2AdaptiveDecoder::feed_owned` and `feed_shared` no longer take
+  `held_bytes()` past `memory_limit()` by a parked input buffer. Input is
+  admitted without counting what is parked, since a copy goes into a parked
+  buffer; a piece handed over does not, so the parked buffer was held on top
+  of it. Parked input is now dropped when keeping it would exceed the limit.
+- `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
+  split into input pieces, runs out, runs waiting and parked buffers; runs
+  out, decoding and waiting; the peak held; and dispatch refusals by cause,
+  each counted once per run, with input refusals and sheds.
+- `Lzma2AdaptiveDecoder::dispatch_cost(unpacked_len)`: what dispatching a run
+  adds to `held_bytes()`, the arithmetic the decoder's own dispatch rule uses,
+  for a caller that gates its reads on the same predicate.
+- `Lzma2AdaptiveDecoder::set_memory_limit(limit)`: changes the limit
+  mid-stream, so a caller with a queue of its own can give the decoder the
+  budget less that queue before each feed or drain. `held_bytes()` is
+  documented as excluding anything the caller holds.
+
 ## 0.7.0 - 2026-10-07
 
 - The crate is now licensed Apache-2.0 instead of GPL-3.0-or-later, matching

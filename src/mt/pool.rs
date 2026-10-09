@@ -88,6 +88,10 @@ pub(crate) struct Pool {
     /// scheduled yet still counts. Only a test reads it, but it is what makes
     /// "no thread is left behind" checkable rather than asserted.
     live: Arc<AtomicUsize>,
+    /// Runs handed to a worker and not yet decoded: raised on dispatch and
+    /// lowered by the worker as it hands the block back, so a block that is
+    /// finished but not yet collected does not count.
+    decoding: Arc<AtomicUsize>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -103,6 +107,7 @@ impl Pool {
             job_rx: Arc::new(std::sync::Mutex::new(job_rx)),
             cancel: Arc::new(AtomicBool::new(false)),
             live: Arc::new(AtomicUsize::new(0)),
+            decoding: Arc::new(AtomicUsize::new(0)),
             handles: Vec::new(),
         }
     }
@@ -121,6 +126,12 @@ impl Pool {
         self.live.load(Ordering::Relaxed)
     }
 
+    /// How many runs a worker is decoding right now. A run whose block is
+    /// finished and waiting to be collected is not one of them.
+    pub(crate) fn decoding(&self) -> usize {
+        self.decoding.load(Ordering::Relaxed)
+    }
+
     /// Spawns one more worker, if the pool is still accepting work.
     ///
     /// Workers are added on demand: a decoder configured for sixteen threads
@@ -133,6 +144,7 @@ impl Pool {
         let tx = self.done_tx.clone();
         let cancel = Arc::clone(&self.cancel);
         let live = Arc::clone(&self.live);
+        let decoding = Arc::clone(&self.decoding);
         let prop = self.dict_prop;
         let name = alloc::format!("lzma2-mt-{}", self.handles.len());
         // Counted here rather than as the worker's first act: the count has to
@@ -142,7 +154,7 @@ impl Pool {
         // fewer live workers than it holds handles for.
         self.live.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name(name).spawn(move || {
-            worker(prop, &rx, &tx, &cancel);
+            worker(prop, &rx, &tx, &cancel, &decoding);
             live.fetch_sub(1, Ordering::Relaxed);
         });
         // A thread that will not start is not an error: the work is simply
@@ -219,6 +231,7 @@ fn worker(
     rx: &std::sync::Mutex<Receiver<Job>>,
     tx: &Sender<Done>,
     cancel: &AtomicBool,
+    decoding: &AtomicUsize,
 ) {
     let mut dec = match Lzma2Decoder::new_probs_only(dict_prop) {
         Ok(d) => d,
@@ -255,6 +268,10 @@ fn worker(
             continue;
         }
 
+        // Counted from here, where a worker has the run in hand, and not from
+        // the dispatch: a job waiting on the channel is not being decoded.
+        decoding.fetch_add(1, Ordering::Relaxed);
+
         // A worker that dies without answering would leave its dispatcher
         // waiting for a block that is never coming, so a panic is caught,
         // reported as the internal failure it is, and the decoder rebuilt.
@@ -266,6 +283,7 @@ fn worker(
                 dec = match Lzma2Decoder::new_probs_only(dict_prop) {
                     Ok(d) => d,
                     Err(e) => {
+                        decoding.fetch_sub(1, Ordering::Relaxed);
                         let _ = tx.send(Done {
                             index: job.index,
                             out_offset: job.out_offset,
@@ -295,6 +313,7 @@ fn worker(
         };
 
         let out = dec.take_block_dic();
+        decoding.fetch_sub(1, Ordering::Relaxed);
         if tx
             .send(Done {
                 index: job.index,
@@ -381,7 +400,7 @@ pub(crate) fn locate(index: u64, out_offset: u64, e: Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Pool;
+    use super::{Job, Pool};
 
     /// A worker counts as live from the moment the pool holds its handle, not
     /// from the moment the OS gets round to running it.
@@ -403,5 +422,27 @@ mod tests {
         }
         pool.shutdown();
         assert_eq!(pool.live(), 0, "a worker outlived shutdown");
+    }
+
+    /// A job on the channel that no worker has taken is not being decoded.
+    ///
+    /// A pool with no workers is where that is certain: the job is queued and
+    /// nothing can receive it, so a count raised on dispatch reports a run
+    /// being decoded that nobody is decoding.
+    #[test]
+    fn a_queued_job_is_not_counted_as_decoding() {
+        let pool = Pool::new(0);
+        pool.dispatch(Job {
+            index: 0,
+            out_offset: 0,
+            unpacked_len: 0,
+            packed: alloc::vec::Vec::new(),
+            out: alloc::vec::Vec::new(),
+            held: 0,
+            #[cfg(feature = "crc")]
+            plan: crate::mt::checksum::ChecksumPlan::none(),
+        })
+        .expect("dispatch");
+        assert_eq!(pool.decoding(), 0);
     }
 }

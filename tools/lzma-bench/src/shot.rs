@@ -25,7 +25,8 @@
 //! ```text
 //! lzma-bench --shot info
 //! lzma-bench --shot <lane> [--threads N] [--preset P] [--mf-threads N]
-//!            [--filter F] [--direction encode|decode] [--verify] <file>
+//!            [--filter F] [--direction encode|decode] [--memory-limit B]
+//!            [--verify] <file>
 //! ```
 
 use std::fs::File;
@@ -35,7 +36,8 @@ use std::time::Instant;
 
 use lzma_turbo::xz::{CheckType, FilterFlags, XzOptions, XzParallelReader, XzReader};
 use lzma_turbo::{
-    Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader, LzmaEncProps, LzmaReader, XzWriter,
+    DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader,
+    LzmaEncProps, LzmaReader, XzWriter,
 };
 
 use crate::{Crc32, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_from_prop};
@@ -50,6 +52,9 @@ pub const HELP: &str = "\
                    lzma2          Lzma2Reader over the LZMA2 stream of a
                                   single-block .xz or a single-folder .7z
                    lzma2-mt       Lzma2ParallelDecoder, --threads N
+                   adaptive       Lzma2AdaptiveDecoder fed the stream in
+                                  4 MiB pieces it takes ownership of,
+                                  --threads N, optional --memory-limit B
                    rust2-mt       lzma-rust2 Lzma2ReaderMt, --threads N
                    xz             XzReader over a whole .xz file
                    xz-par         XzParallelReader, --threads N
@@ -60,6 +65,8 @@ pub const HELP: &str = "\
                                   --filter F --direction encode|decode
                  F is x86, arm, armthumb, arm64, ppc, sparc, ia64, riscv,
                  delta:N (distance N) or bcj2 (filter lane only)
+  --memory-limit B  the adaptive lane's memory limit in bytes, or with an
+                 M or G suffix in MiB or GiB (default: none)
   --verify       a decoder shot also reports a CRC-32 of what it decoded,
                  at the cost of a pass over it inside the timed region";
 
@@ -73,6 +80,8 @@ pub struct Shot {
     pub encode: bool,
     /// Whether a decoder hashes its output for the harness to check.
     pub verify: bool,
+    /// The adaptive lane's memory limit.
+    pub memory_limit: u64,
 }
 
 /// What a shot reports.
@@ -207,6 +216,7 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
                 input_buffered: 0,
             })
         }
+        "adaptive" => adaptive(shot, path, bytes_in),
         "rust2-mt" => {
             let (prop, stream) = lzma2_stream(path)?;
             let dict = dict_size_from_prop(prop);
@@ -248,6 +258,109 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
         "filter" => filter(shot, path, bytes_in),
         other => Err(format!("unknown shot lane {other:?}")),
     }
+}
+
+/// The size of a piece the adaptive lane hands over: what a reader pulling
+/// its own input in pieces it gives away would read at a time.
+const ADAPTIVE_PIECE: usize = 4 << 20;
+/// The smallest read the adaptive shot makes under a tight limit.
+const ADAPTIVE_PIECE_MIN: usize = 64 << 10;
+
+/// `Lzma2AdaptiveDecoder` the way a consumer pulling its own input drives it:
+/// read a piece, hand it over whole, drain, and when the decoder refuses the
+/// piece, drain and wait for a worker until it takes it. The pieces it is
+/// done with come back through `reclaim_piece`, so the reader's footprint is
+/// the pieces in flight and the one in its hand.
+///
+/// Chasing is off: the stream is on disk, so a run at the cursor is short
+/// only because the rest of it has not been handed over yet.
+fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
+    let (prop, mut stream) = lzma2_stream(path)?;
+    let opts = Lzma2MtOptions {
+        threads: shot.threads.max(1),
+        memory_limit: shot.memory_limit,
+    };
+    let mut sink = Sink::new(shot.verify);
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts).map_err(|e| e.to_string())?;
+    dec.set_chase(false);
+    // The decoder charges a piece its allocation and admits it by that, so a
+    // read sized past the limit would never be taken. Under a tight limit the
+    // reads come down to a quarter of it, and not below a small floor - but
+    // never past the limit itself, which the floor would be under a limit
+    // smaller than it.
+    let limit = usize::try_from(shot.memory_limit).unwrap_or(usize::MAX);
+    let piece_len = (limit / 4)
+        .clamp(ADAPTIVE_PIECE_MIN, ADAPTIVE_PIECE)
+        .min(limit)
+        .max(1);
+    let mut hand: Option<Vec<u8>> = None;
+    let mut eof = false;
+    let mut write_err = None;
+    loop {
+        if hand.is_none() && !eof {
+            let mut piece = dec.reclaim_piece().unwrap_or_default();
+            piece.clear();
+            piece.reserve_exact(piece_len);
+            piece.resize(piece_len, 0);
+            let mut filled = 0;
+            while filled < piece.len() {
+                match stream
+                    .read(&mut piece[filled..])
+                    .map_err(|e| e.to_string())?
+                {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            piece.truncate(filled);
+            if filled < piece_len {
+                eof = true;
+            }
+            if filled != 0 {
+                hand = Some(piece);
+            }
+        }
+        if let Some(piece) = hand.take() {
+            hand = dec.feed_owned(piece).map_err(|e| e.to_string())?;
+        }
+        if eof && hand.is_none() {
+            dec.end_of_input();
+        }
+        let status = dec
+            .drain_upto(OUT_CHUNK, |_, b| {
+                if let Err(e) = sink.write_all(b) {
+                    write_err.get_or_insert(e);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        if let Some(e) = write_err.take() {
+            return Err(e.to_string());
+        }
+        match status {
+            DrainStatus::Finished => break,
+            DrainStatus::Progress => {}
+            DrainStatus::NeedsMoreInput => {
+                // Refused, or nothing left to read: the only thing that can
+                // change either is a worker finishing.
+                if (hand.is_some() || eof) && !dec.wait_for_worker() && hand.is_some() {
+                    return Err("the decoder refused a piece with nothing in flight".into());
+                }
+            }
+        }
+    }
+    let seconds = t0.elapsed().as_secs_f64();
+    eprintln!("ADAPTIVE_LEDGER {:?}", dec.ledger());
+    drop(dec);
+    Ok(Line {
+        bytes_in,
+        bytes_out: sink.written,
+        crc32: sink.crc.map(|mut c| c.finish()),
+        seconds,
+        peak_alloc: alloc_watch_peak(base),
+        input_buffered: 0,
+    })
 }
 
 fn open(path: &Path) -> Result<BufReader<File>, String> {
@@ -573,6 +686,7 @@ mod tests {
             filter: None,
             encode: false,
             verify: false,
+            memory_limit: u64::MAX,
         }
     }
 
@@ -606,7 +720,7 @@ mod tests {
         want.update(&data);
         let want = want.finish();
 
-        for lane in ["xz", "xz-par", "lzma2", "lzma2-mt"] {
+        for lane in ["xz", "xz-par", "lzma2", "lzma2-mt", "adaptive"] {
             let mut s = shot(lane);
             let line = measure(&s, &input.0).expect("decode shot");
             assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
@@ -617,5 +731,20 @@ mod tests {
             assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
             assert_eq!(line.crc32, Some(want), "{lane}: --verify");
         }
+    }
+
+    /// Under a limit smaller than the read floor the adaptive shot still
+    /// reads pieces the decoder can take, and decodes the stream.
+    #[test]
+    fn an_adaptive_shot_under_a_limit_below_the_read_floor_decodes() {
+        let data = payload();
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let xz = lzma_turbo::encode_xz(&data, &props, CheckType::Crc64, 0).expect("encode");
+        let input = Scratch::new("small-limit.xz", &xz);
+        let mut s = shot("adaptive");
+        s.threads = 2;
+        s.memory_limit = 48 << 10;
+        let line = measure(&s, &input.0).expect("adaptive shot under 48 KiB");
+        assert_eq!(line.bytes_out, data.len() as u64);
     }
 }

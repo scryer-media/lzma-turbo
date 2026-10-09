@@ -8,6 +8,11 @@ license = "Apache-2.0"
 repository = "https://github.com/scryer-media/lzma-turbo"
 publish = false
 
+[features]
+# The adaptive decoder's diagnostic counters, printed when it is dropped and
+# `LZMA_ADAPTIVE_STATS` is set.
+adaptive-stats = ["lzma-turbo/adaptive-stats"]
+
 [dependencies]
 lzma-turbo = { path = "../.." }
 lzma-rust2 = "0.20.1"

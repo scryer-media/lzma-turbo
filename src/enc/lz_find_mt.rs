@@ -363,6 +363,30 @@ fn get_heads(
 // The bt thread's kernel
 // ---------------------------------------------------------------------------
 
+/// `s[i]`, with the bounds check left to the caller.
+///
+/// # Safety
+///
+/// `i < s.len()`.
+#[inline(always)]
+unsafe fn at<T: Copy>(s: &[T], i: usize) -> T {
+    debug_assert!(i < s.len());
+    // SAFETY: the caller's contract.
+    unsafe { *s.get_unchecked(i) }
+}
+
+/// `s[i] = v`, with the bounds check left to the caller.
+///
+/// # Safety
+///
+/// `i < s.len()`.
+#[inline(always)]
+unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
+    debug_assert!(i < s.len());
+    // SAFETY: the caller's contract.
+    unsafe { *s.get_unchecked_mut(i) = v }
+}
+
 /// C: `GetMatchesSpecN_2` in `C/LzFindOpt.c`.
 ///
 /// The binary-tree walk, run over a whole run of positions instead of one.
@@ -379,9 +403,368 @@ fn get_heads(
 /// `USE_SON_PREFETCH` is a load hoist with no effect on the values and is left
 /// to the compiler. `USE_LONG_MATCH_OPT` is *not* - it changes what is emitted
 /// (a run of `2`-pair entries) - and is ported.
+///
+/// # Bounds
+///
+/// The accesses a walk makes once per node - the node's two sons, the two
+/// bytes at the current length, and the store that relinks the tree - are not
+/// bounds-checked. Everything they rest on is established from the arguments
+/// by the asserts at the top, on every call, so this is a safe function: with
+/// any arguments and any contents of `win`, `son` and `heads`, a call that
+/// could step outside a slice panics before its first unchecked access. The
+/// accesses made once per position or less (`heads`, `d`, the empty node, the
+/// full-length match and its long-match run) keep their checks, and nothing
+/// here forms a hash index: the hash thread does, in `get_heads`, with a
+/// masked value and a checked index.
+///
+/// Write `n` for `hsize - hi` at entry, the positions this call may consume,
+/// and `k` for how many it has consumed. The asserts establish, of the values
+/// at entry:
+///
+/// - **A** `cyclic_buffer_pos + n <= cyclic_buffer_size`
+/// - **B** `2 * cyclic_buffer_size <= son.len()`
+/// - **C** `cur + max_len_0 <= len_limit_0`
+/// - **D** `len_limit_0 + n <= win.len()`
+/// - **E** `min(pos, cyclic_buffer_size) <= cur + 1`
+///
+/// **Counters (K).** A head is taken before anything is touched, so `k >= 1`
+/// in a walk, where `cur`, `pos` and `cyclic_buffer_pos` are their entry values
+/// plus `k - 1` and `len_limit` is `len_limit_0 + k`. The long-match loop moves
+/// all four on by one and then takes the next head, which it does only after
+/// testing `hi != hsize`; so in a walk `k <= n`, and `cyclic_buffer_pos` stays
+/// at most its entry value plus `n - 1`, which by A is below
+/// `cyclic_buffer_size`.
+///
+/// **The tree.** Every node is visited with `1 <= delta < cbs`, where `cbs` is
+/// `min(pos, cyclic_buffer_size)` taken when the walk began. The first `delta`
+/// is a head: zero is refused, and one not below `cbs` takes the empty-node
+/// branch instead of a walk. A later one is `pos - m` for a son `m` that was
+/// tested `m < cur_match`, and `cur_match = pos - delta` is exact because
+/// `delta < cbs <= pos`; so the new `delta` is at least one and no wrap, and
+/// the walk goes round again only after testing it below `cbs`. From that,
+/// `back` - `cyclic_buffer_pos - delta`, or `cbs - (delta - cyclic_buffer_pos)`
+/// where that would be negative - is below `cyclic_buffer_size`: the first is
+/// at most `cyclic_buffer_pos`, the second less than `cbs`. So `pair + 1 =
+/// 2 * back + 1` is below `2 * cyclic_buffer_size`, inside `son` by B. `ptr0`
+/// and `ptr1` begin as `2 * cyclic_buffer_pos + 1` and `2 * cyclic_buffer_pos`,
+/// inside by K and B, and afterwards hold a `pair` or `pair + 1` of an earlier
+/// node. Every tree index is thus formed from a distance already tested
+/// against the cyclic size.
+///
+/// **The window.** `max_len` stays below `len_limit` through a walk: it
+/// begins at `cur + max_len_0`, which C and K put at or below `len_limit - 1`,
+/// and is raised only to a scan result, and a scan result equal to the limit
+/// ends the walk. `len0` and `len1` begin at `cur`, below the limit for the
+/// same reason, and are only ever set to a `len` at which bytes were read. At
+/// the top of a node, then, `cur <= len < len_limit`. The scan is asked for
+/// `len + 1 ..= len_limit`, and its answer is tested to lie there rather than
+/// trusted, so `len` only grows; if the answer is the limit, `max_len < len`
+/// and the walk ends without another read, and otherwise `len < len_limit`
+/// again. So both byte reads at the current length are at
+/// `len <= len_limit - 1`, and `len_limit <= len_limit_0 + n` by K, which D
+/// puts inside the window. The
+/// older byte is at `len - diff` with `diff = delta <= cbs - 1`; E and K give
+/// `min(pos, cyclic_buffer_size) <= cur + 1` at every position (both sides
+/// move on together, and a `pos` that wraps only makes the left side
+/// smaller), so `diff <= cur <= len` and the index neither underflows nor
+/// exceeds `len`.
+///
+/// **What changes under the caller.** None of the above depends on where the
+/// stream is or on what the tables hold. The window slide and the position
+/// normalisation both happen between calls, and the five conditions are
+/// tested again on the next: either can at worst make a call panic, which the
+/// bt thread reports as a failed stream. They do not, for the reasons given
+/// where the kernel is called. The slices themselves stay valid for the call:
+/// `son` is the bt thread's alone, and the hash thread, which refills the
+/// window while this runs, writes only above the stream position it had
+/// published when it produced these heads and moves the window only under
+/// `hash_sync.cs`. The bt thread holds that across every call of this
+/// function: it lets go only inside `get_next_block`, between calls, and takes
+/// up any move before it cuts the window slice for the next. Every byte read
+/// here is below `len_limit_0 + n`, which the caller makes
+/// `b.buffer + hash_num_avail` at most - that published position - so the
+/// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn get_matches_spec_n_2(
+    win: &[u8],
+    len_limit_0: usize,
+    mut pos: u32,
+    mut cur: usize,
+    son: &mut [u32],
+    cut_value: u32,
+    d: &mut [u32],
+    mut di: usize,
+    max_len_0: usize,
+    heads: &[u32],
+    mut hi: usize,
+    limit: usize,
+    hsize: usize,
+    mut cyclic_buffer_pos: u32,
+    cyclic_buffer_size: u32,
+) -> Option<(usize, u32)> {
+    if hi == hsize {
+        return Some((di, pos));
+    }
+    // The conditions of "# Bounds". They hold on every call the bt thread
+    // makes; a caller that broke one would otherwise reach the unchecked
+    // accesses below with indices nothing vouches for.
+    assert!(hi < hsize && hsize <= heads.len(), "heads");
+    let n = hsize - hi;
+    let cyclic = cyclic_buffer_size as usize;
+    assert!(
+        (cyclic_buffer_pos as usize)
+            .checked_add(n)
+            .is_some_and(|end| end <= cyclic),
+        "A: the run passes the end of the cyclic buffer"
+    );
+    assert!(son.len() / 2 >= cyclic, "B: the tree is short");
+    assert!(
+        cur.checked_add(max_len_0)
+            .is_some_and(|end| end <= len_limit_0),
+        "C: no room for the hashed bytes below the limit"
+    );
+    assert!(
+        len_limit_0
+            .checked_add(n)
+            .is_some_and(|end| end <= win.len()),
+        "D: the run passes the end of the window"
+    );
+    assert!(
+        pos.min(cyclic_buffer_size) as usize <= cur + 1,
+        "E: a distance could reach before the window"
+    );
+
+    let mut len_limit = len_limit_0;
+    loop {
+        if hi == hsize {
+            break;
+        }
+        let mut delta = heads[hi];
+        hi += 1;
+        if delta == 0 {
+            return None;
+        }
+        len_limit += 1;
+
+        let mut cbs = cyclic_buffer_size;
+        if pos < cbs {
+            if delta > pos {
+                return None;
+            }
+            cbs = pos;
+        }
+
+        if delta >= cbs {
+            let ptr1 = (cyclic_buffer_pos as usize) << 1;
+            d[di] = 0;
+            di += 1;
+            son[ptr1] = K_EMPTY_HASH_VALUE;
+            son[ptr1 + 1] = K_EMPTY_HASH_VALUE;
+        } else {
+            di += 1;
+            let distances = di;
+
+            let mut ptr0 = ((cyclic_buffer_pos as usize) << 1) + 1;
+            let mut ptr1 = (cyclic_buffer_pos as usize) << 1;
+
+            let mut cut_value = cut_value;
+            let (mut len0, mut len1) = (cur, cur);
+            let mut max_len = cur + max_len_0;
+            // K: the slot being linked is inside the cyclic buffer.
+            debug_assert!((cyclic_buffer_pos as usize) < cyclic);
+            debug_assert!(cbs == pos.min(cyclic_buffer_size));
+            debug_assert!(len_limit <= len_limit_0 + n && len_limit <= win.len());
+
+            loop {
+                debug_assert!(delta != 0 && delta < cbs && cbs <= cyclic_buffer_size);
+                // C: the "SPEC code" wrap, `_cyclicBufferPos - delta
+                // (+ cbs if it went below zero)`, written so that neither arm
+                // leaves `u32` on the way: `delta` is below `cbs`.
+                let back = if cyclic_buffer_pos < delta {
+                    cbs - (delta - cyclic_buffer_pos)
+                } else {
+                    cyclic_buffer_pos - delta
+                };
+                debug_assert!((back as usize) < cyclic);
+                let pair = (back as usize) << 1;
+
+                let diff = delta as usize;
+                let mut len = if len0 < len1 { len0 } else { len1 };
+
+                // SAFETY: "the tree" in `# Bounds`. `delta` was tested below
+                // `cbs`, which is at most the cyclic size, before this node
+                // was reached, so `back` is below the cyclic size and
+                // `pair = 2 * back` is below `2 * cyclic <= son.len()`
+                // (assert B).
+                let pair0 = unsafe { at(son, pair) };
+
+                // C: `if (len[diff] == len[0])`, the one byte the C tests
+                // before it scans. Most nodes of a walk differ right here, so
+                // asking this first keeps the word scan, and the two slices it
+                // cuts, off the common path; the bytes loaded for it are the
+                // ones the ordering test below needs, so a node that differs
+                // costs two loads and no more. The walk never reaches a node
+                // with `len` at the limit: both bounds start at `cur`, below
+                // it, and a scan that runs to the limit ends the walk.
+                debug_assert!(cur <= len && len < len_limit);
+                debug_assert!(max_len < len_limit);
+                debug_assert!(diff <= cur);
+                // SAFETY: "the window" in `# Bounds`. `diff <= cur <= len`
+                // (assert E carried along by the counters), so `len - diff`
+                // does not underflow, and it is at most `len`, which the
+                // next comment puts inside the window.
+                let mut a = unsafe { at(win, len - diff) };
+                // SAFETY: "the window" in `# Bounds`. `len < len_limit` at
+                // the top of every node, and `len_limit <= len_limit_0 + n
+                // <= win.len()` (the counters, assert D).
+                let mut b = unsafe { at(win, len) };
+                if a == b {
+                    // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
+                    // absolute window indices, from the byte after the one
+                    // just tested.
+                    let from = len;
+                    len = match_run(win, diff, from + 1, len_limit);
+                    // The scan answers within `from + 1 ..= len_limit`. The
+                    // byte reads further down rest on that, so it is tested
+                    // here and not taken on trust from another module.
+                    if len <= from || len > len_limit {
+                        return None;
+                    }
+                    if max_len < len {
+                        max_len = len;
+                        d[di] = (len - cur) as u32;
+                        d[di + 1] = delta - 1;
+                        di += 2;
+
+                        if len == len_limit {
+                            let pair1 = son[pair + 1];
+                            son[ptr1] = pair0;
+                            son[ptr0] = pair1;
+                            d[distances - 1] = (di - distances) as u32;
+
+                            // C: `USE_LONG_MATCH_OPT`. While the next position
+                            // has the same head distance and the bytes at the
+                            // far end still agree, the match simply shifts by
+                            // one: emit it and copy the tree node instead of
+                            // walking again.
+                            if hi == hsize
+                                || heads[hi] != delta
+                                || win[len_limit - diff] != win[len_limit]
+                                || di >= limit
+                            {
+                                break;
+                            }
+                            loop {
+                                d[di] = 2;
+                                d[di + 1] = (len_limit - cur) as u32;
+                                d[di + 2] = delta - 1;
+                                di += 3;
+                                cur += 1;
+                                len_limit += 1;
+                                cyclic_buffer_pos += 1;
+                                {
+                                    let dest = (cyclic_buffer_pos as usize) << 1;
+                                    let back = if cyclic_buffer_pos < delta {
+                                        cbs - (delta - cyclic_buffer_pos)
+                                    } else {
+                                        cyclic_buffer_pos - delta
+                                    };
+                                    let src = (back as usize) << 1;
+                                    let p0 = son[src];
+                                    let p1 = son[src + 1];
+                                    son[dest] = p0;
+                                    son[dest + 1] = p1;
+                                }
+                                pos = pos.wrapping_add(1);
+                                hi += 1;
+                                if hi == hsize
+                                    || heads[hi] != delta
+                                    || win[len_limit - diff] != win[len_limit]
+                                    || di >= limit
+                                {
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // The scan stopped short of the limit, at the first byte
+                    // that differs: that pair is what orders this node.
+                    debug_assert!(diff < len && len < len_limit);
+                    // SAFETY: "the window" in `# Bounds`. `len` is the scan's
+                    // answer, tested above the `len` it started from, which
+                    // was at least `diff`.
+                    a = unsafe { at(win, len - diff) };
+                    // SAFETY: "the window" in `# Bounds`. The answer was
+                    // tested to be at most `len_limit`, and one equal to it
+                    // left the walk above because `max_len < len_limit`; so
+                    // `len < len_limit <= win.len()`.
+                    b = unsafe { at(win, len) };
+                }
+                {
+                    let cur_match = pos.wrapping_sub(delta);
+                    debug_assert!(ptr0 < 2 * cyclic && ptr1 < 2 * cyclic);
+                    if a < b {
+                        // SAFETY: "the tree" in `# Bounds`. `back` is below
+                        // the cyclic size, so `pair + 1 = 2 * back + 1` is
+                        // below `2 * cyclic <= son.len()` (assert B).
+                        delta = unsafe { at(son, pair + 1) };
+                        // SAFETY: "the tree" in `# Bounds`. `ptr1` is
+                        // `2 * cyclic_buffer_pos`, with `cyclic_buffer_pos`
+                        // below the cyclic size (assert A and the counters),
+                        // or the `pair + 1` of an earlier node; both are
+                        // below `2 * cyclic <= son.len()`.
+                        unsafe { put(son, ptr1, cur_match) };
+                        ptr1 = pair + 1;
+                        len1 = len;
+                        if delta >= cur_match {
+                            return None;
+                        }
+                    } else {
+                        // `son[pair]`, loaded above; nothing has written the
+                        // tree since.
+                        delta = pair0;
+                        // SAFETY: "the tree" in `# Bounds`. `ptr0` is
+                        // `2 * cyclic_buffer_pos + 1`, with
+                        // `cyclic_buffer_pos` below the cyclic size (assert A
+                        // and the counters), or the `pair` of an earlier
+                        // node; both are below `2 * cyclic <= son.len()`.
+                        unsafe { put(son, ptr0, cur_match) };
+                        ptr0 = pair;
+                        len0 = len;
+                        if delta >= cur_match {
+                            return None;
+                        }
+                    }
+                    delta = pos.wrapping_sub(delta);
+
+                    cut_value -= 1;
+                    if cut_value == 0 || delta >= cbs {
+                        son[ptr0] = K_EMPTY_HASH_VALUE;
+                        son[ptr1] = K_EMPTY_HASH_VALUE;
+                        d[distances - 1] = (di - distances) as u32;
+                        break;
+                    }
+                }
+            }
+        }
+        pos = pos.wrapping_add(1);
+        cyclic_buffer_pos += 1;
+        cur += 1;
+        if di >= limit {
+            break;
+        }
+    }
+    Some((di, pos))
+}
+
+/// [`get_matches_spec_n_2`] as it was with every access bounds-checked: the
+/// reference the unchecked walk is compared against.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn get_matches_spec_n_2_checked(
     win: &[u8],
     len_limit_0: usize,
     mut pos: u32,
@@ -450,12 +833,22 @@ fn get_matches_spec_n_2(
 
                 let pair0 = son[pair];
 
-                // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
-                // absolute window indices: it returns `len` unchanged exactly
-                // when the byte at `len` already differs.
-                let run = match_run(win, diff, len, len_limit);
-                if run != len {
-                    len = run;
+                // C: `if (len[diff] == len[0])`, the one byte the C tests
+                // before it scans. Most nodes of a walk differ right here, so
+                // asking this first keeps the word scan, and the two slices it
+                // cuts, off the common path; the bytes loaded for it are the
+                // ones the ordering test below needs, so a node that differs
+                // costs two loads and no more. The walk never reaches a node
+                // with `len` at the limit: both bounds start at `cur`, below
+                // it, and a scan that runs to the limit ends the walk.
+                debug_assert!(len < len_limit);
+                let mut a = win[len - diff];
+                let mut b = win[len];
+                if a == b {
+                    // The same scan `GetMatchesSpec1` runs, in `LzFindOpt.c`'s
+                    // absolute window indices, from the byte after the one
+                    // just tested.
+                    len = match_run(win, diff, len + 1, len_limit);
                     if max_len < len {
                         max_len = len;
                         d[di] = (len - cur) as u32;
@@ -514,10 +907,14 @@ fn get_matches_spec_n_2(
                             break;
                         }
                     }
+                    // The scan stopped short of the limit, at the first byte
+                    // that differs: that pair is what orders this node.
+                    a = win[len - diff];
+                    b = win[len];
                 }
                 {
                     let cur_match = pos.wrapping_sub(delta);
-                    if win[len - diff] < win[len] {
+                    if a < b {
                         delta = son[pair + 1];
                         son[ptr1] = cur_match;
                         ptr1 = pair + 1;
@@ -526,7 +923,9 @@ fn get_matches_spec_n_2(
                             return None;
                         }
                     } else {
-                        delta = son[pair];
+                        // `son[pair]`, loaded above; nothing has written the
+                        // tree since.
+                        delta = pair0;
                         son[ptr0] = cur_match;
                         ptr0 = pair;
                         len0 = len;
@@ -798,11 +1197,13 @@ pub(crate) struct MtShared {
     /// Raised when the hash or bt thread caught a panic. The lz thread reads
     /// it in `CheckErrors`, as the C reads `failure_LZ_BT`.
     thread_failed: AtomicBool,
-    /// The allocations `Common`'s pointers address. Never referenced through
-    /// these fields; they are here so that the buffers outlive every thread.
-    _win: Vec<u8>,
-    _tab: Vec<u32>,
-    _bufs: Vec<u32>,
+    /// The allocations `Common`'s pointers address. Nothing reads or writes
+    /// through these fields while a thread can reach the pointers; they are
+    /// here so that the buffers outlive every thread, and so that
+    /// [`MatchFinderMt::create`] can take them back for the next block.
+    own_win: Vec<u8>,
+    own_tab: Vec<u32>,
+    own_bufs: Vec<u32>,
 }
 
 // SAFETY: `Common`'s three raw pointers address allocations owned by this same
@@ -833,6 +1234,13 @@ impl MtShared {
     /// holds both critical sections, which is what stops them.
     fn move_block(&self, h: &mut HashState) {
         let c = &self.common;
+        if h.buffer < c.keep_size_before as usize {
+            // As `MatchFinder::move_block`: a window cut to a promised stream
+            // length, and a stream that broke the promise. Ending the stream
+            // with an error keeps the copy below inside the window.
+            h.result = Err(Error::InternalFailure);
+            return;
+        }
         let offset = h.buffer - c.keep_size_before as usize;
         let keep_before = (offset & (K_BLOCK_MOVE_ALIGN - 1)) + c.keep_size_before as usize;
         let from = offset & !(K_BLOCK_MOVE_ALIGN - 1);
@@ -1193,6 +1601,30 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
             let son = unsafe { c.son() };
             // SAFETY: the `hash_buf` block this reads is held, as above.
             let heads = unsafe { c.hash_all() };
+            // The kernel tests five conditions before its unchecked accesses
+            // (its "# Bounds"). Why each holds here, at every call:
+            //
+            // A, the run ends inside the cyclic buffer: `size` was cut to
+            // `cyclic_buffer_size - cyclic_buffer_pos` above.
+            // B, the tree holds two sons a slot: the table plan gives a
+            // binary-tree finder `2 * cyclic_buffer_size` of them, and the
+            // threaded finder is only ever a binary tree.
+            // C, the hashed bytes fit below the limit: heads exist only for
+            // positions with `num_hash_bytes` bytes after them, so
+            // `hash_num_avail >= num_hash_bytes` while any remain, and
+            // `match_max_len` is no smaller; `len_limit` is the lesser.
+            // D, the run ends inside the window: `size` was cut to
+            // `hash_num_avail - len_limit + 1` above, which makes the last
+            // index the kernel can reach `b.buffer + hash_num_avail - 1`,
+            // below the stream position the hash thread had published.
+            // E, no distance reaches before the window: `b.buffer` starts at
+            // zero with `pos` at one and they advance together, so
+            // `pos <= b.buffer + 1` until a window slide. A slide leaves the
+            // hash thread at `keep_size_before` or later and this thread less
+            // than `HASH_BUFFER_SIZE` behind it, and `keep_size_before` is
+            // the cyclic size plus that and more; so afterwards
+            // `cyclic_buffer_size <= b.buffer`. Normalisation only lowers
+            // `pos`, to exactly `cyclic_buffer_size`.
             match get_matches_spec_n_2(
                 win,
                 b.buffer + len_limit as usize - 1,
@@ -1347,15 +1779,42 @@ impl MatchFinderMt {
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        data_limit: u64,
     ) -> Result<(), Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
         }
 
+        // C: `MatchFinderMt_Create` keeps `hashBuf` once it has it, and
+        // `MatchFinder_Create` keeps a window and tables that are long enough.
+        // The block before left all three in `sh`; they go back to where the
+        // C keeps them, so that a second block allocates nothing. Both
+        // producer threads were joined when that block's `with_threads`
+        // returned, which is what makes this handle the last one. If it is
+        // not, the buffers stay with whoever still holds them and this block
+        // allocates its own.
         let mut bufs: Vec<u32> = Vec::new();
-        bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
-            .map_err(|_| Error::Alloc)?;
-        bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+        if let Some(old) = self.sh.take().and_then(Arc::into_inner) {
+            self.mfb.buf_base = old.own_win;
+            self.mfb.hash = old.own_tab;
+            bufs = old.own_bufs;
+        }
+        if bufs.len() == HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2 {
+            // Every word of a hash block and of a bt block is written by the
+            // thread that fills it before the thread it is handed to reads it.
+            // The two words past `btBuf` are the exception: the lz thread
+            // parks on them after a failure.
+            bufs[HASH_BUFFER_SIZE + BT_BUFFER_SIZE..].fill(0);
+        } else {
+            bufs = Vec::new();
+            bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
+                .map_err(|_| Error::Alloc)?;
+            bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+            #[cfg(test)]
+            {
+                self.mfb.allocs += 1;
+            }
+        }
 
         let before = keep_add_buffer_before
             .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
@@ -1364,7 +1823,7 @@ impl MatchFinderMt {
             .checked_add(HASH_BLOCK_SIZE)
             .ok_or(Error::Param)?;
         self.mfb
-            .create(history_size, before, match_max_len, after)?;
+            .create(history_size, before, match_max_len, after, data_limit)?;
 
         // C: `MFB.bigHash = (MFB.hashMask >= 0xFFFFFF)`, set after
         // `MatchFinderMt_Create` and read by `MatchFinderMt_CreateVTable`.
@@ -1393,7 +1852,9 @@ impl MatchFinderMt {
         let son_base = self.mfb.son_base;
         let common = Common {
             win: win.as_mut_ptr(),
-            win_len: win.len(),
+            // `MatchFinder::create` keeps an allocation that is longer than
+            // this window needs; the window is `block_size` of it.
+            win_len: self.mfb.block_size as usize,
             tab: tab.as_mut_ptr(),
             bufs: bufs.as_mut_ptr(),
             hash_mask: self.mfb.hash_mask,
@@ -1444,9 +1905,9 @@ impl MatchFinderMt {
             bt_shift: AtomicUsize::new(0),
             lz_shift: AtomicUsize::new(0),
             thread_failed: AtomicBool::new(false),
-            _win: win,
-            _tab: tab,
-            _bufs: bufs,
+            own_win: win,
+            own_tab: tab,
+            own_bufs: bufs,
         }));
         Ok(())
     }
@@ -1480,7 +1941,9 @@ impl MatchFinderMt {
     #[cfg(test)]
     pub(crate) fn allocated(&self) -> u64 {
         match &self.sh {
-            Some(sh) => sh._win.len() as u64 + (sh._tab.len() as u64 + sh._bufs.len() as u64) * 4,
+            Some(sh) => {
+                sh.own_win.len() as u64 + (sh.own_tab.len() as u64 + sh.own_bufs.len() as u64) * 4
+            }
             None => self.mfb.allocated(),
         }
     }
@@ -1932,7 +2395,10 @@ pub(crate) fn with_threads<T>(
 mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{MatchFinderMt, with_threads};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, with_threads};
     use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
     use crate::enc::stream::{SeqInStream, SliceStream};
@@ -2017,8 +2483,14 @@ mod tests {
         mt.mfb.kind = MatchFinderKind::Bt4;
         mt.mfb.num_hash_bytes = 4;
         mt.mfb.cut_value = 32;
-        mt.create(1 << 16, K_NUM_OPTS as u32, 273, LZMA_MATCH_LEN_MAX + 1)
-            .expect("create");
+        mt.create(
+            1 << 16,
+            K_NUM_OPTS as u32,
+            273,
+            LZMA_MATCH_LEN_MAX + 1,
+            u64::MAX,
+        )
+        .expect("create");
         mt.init_mt().expect("init_mt");
         mt.init();
         // SAFETY: neither producer thread has been started.
@@ -2036,5 +2508,242 @@ mod tests {
             Ok(mt.failed())
         });
         assert_eq!(r, Ok(true), "the stream panic was not reported");
+    }
+
+    /// A small generator with a fixed seed: the cases are the same on every
+    /// run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        }
+
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n
+        }
+    }
+
+    /// One call's arguments.
+    struct Case {
+        win: Vec<u8>,
+        len_limit_0: usize,
+        pos: u32,
+        cur: usize,
+        son: Vec<u32>,
+        cut: u32,
+        d_len: usize,
+        di: usize,
+        max_len_0: usize,
+        heads: Vec<u32>,
+        hi: usize,
+        limit: usize,
+        hsize: usize,
+        cbp: u32,
+        cyclic: u32,
+    }
+
+    /// Arguments that meet the kernel's five conditions and are otherwise as
+    /// hostile as the generator can make them: cyclic buffers down to one
+    /// slot, windows that end exactly where the run does, positions at the
+    /// start of a stream, just normalised and about to wrap, heads that are
+    /// zero or far out of range, and a tree full of zeros and noise.
+    fn case(rng: &mut Rng) -> Case {
+        const CYCLIC: [u32; 12] = [1, 2, 3, 4, 5, 7, 8, 16, 33, 64, 257, 1024];
+        let cyclic = CYCLIC[rng.below(12) as usize];
+        let n = 1 + rng.below(cyclic.min(48)) as usize;
+        let cbp = rng.below(cyclic - n as u32 + 1);
+        let max_len_0 = 1 + rng.below(4) as usize;
+        let len_limit_c = max_len_0 + 1 + rng.below(40) as usize;
+        let cur = rng.below(600) as usize;
+        let deep = cyclic as usize <= cur + 1;
+        let pos = match rng.below(4) {
+            // Just normalised.
+            1 if deep => cyclic,
+            // About to wrap, or wrapping inside the run.
+            2 if deep => u32::MAX - rng.below(n as u32 + 2),
+            3 if deep => cyclic + rng.below(1 << 20),
+            // The start of a stream: no further on than the window is.
+            _ => 1 + rng.below(cur as u32 + 1),
+        };
+        let len_limit_0 = cur + len_limit_c - 1;
+        let win_len = len_limit_0 + n + rng.below(3) as usize;
+        let alphabet = [1, 2, 3, 250][rng.below(4) as usize];
+        let win = (0..win_len).map(|_| rng.below(alphabet) as u8).collect();
+        let sons = 2 * cyclic as usize + rng.below(2) as usize;
+        let son = (0..sons)
+            .map(|_| match rng.below(8) {
+                0 => 0,
+                1 => rng.next(),
+                _ => pos.wrapping_sub(rng.below(2 * cyclic + 4)),
+            })
+            .collect();
+        let hi = rng.below(3) as usize;
+        let hsize = hi + n;
+        let mut heads = Vec::new();
+        let mut last = 1;
+        for _ in 0..hsize + rng.below(2) as usize {
+            // Runs of one distance are what the long-match path feeds on.
+            last = match rng.below(64) {
+                0 => 0,
+                1 => rng.next(),
+                2..=39 => last.max(1),
+                _ => 1 + rng.below(cyclic + 2),
+            };
+            heads.push(last);
+        }
+        let di = rng.below(4) as usize;
+        let d_len = di + n * (3 + 2 * len_limit_c) + 8;
+        let limit = if rng.below(2) == 0 {
+            d_len
+        } else {
+            di + 1 + rng.below(3 * n as u32 + 1) as usize
+        };
+        Case {
+            win,
+            len_limit_0,
+            pos,
+            cur,
+            son,
+            cut: 1 + rng.below(cyclic + 3),
+            d_len,
+            di,
+            max_len_0,
+            heads,
+            hi,
+            limit,
+            hsize,
+            cbp,
+            cyclic,
+        }
+    }
+
+    type Kernel = fn(
+        &[u8],
+        usize,
+        u32,
+        usize,
+        &mut [u32],
+        u32,
+        &mut [u32],
+        usize,
+        usize,
+        &[u32],
+        usize,
+        usize,
+        usize,
+        u32,
+        u32,
+    ) -> Option<(usize, u32)>;
+
+    /// What `kernel` answers for `c`, and the tree and matches it leaves.
+    fn walk(c: &Case, kernel: Kernel) -> (Option<(usize, u32)>, Vec<u32>, Vec<u32>) {
+        let mut son = c.son.clone();
+        let mut d = vec![0xDEAD_BEEF_u32; c.d_len];
+        let got = kernel(
+            &c.win,
+            c.len_limit_0,
+            c.pos,
+            c.cur,
+            &mut son,
+            c.cut,
+            &mut d,
+            c.di,
+            c.max_len_0,
+            &c.heads,
+            c.hi,
+            c.limit,
+            c.hsize,
+            c.cbp,
+            c.cyclic,
+        );
+        (got, son, d)
+    }
+
+    /// Generated tables the differential test below walks. Under Miri, which
+    /// runs the CI job that checks every unchecked access for undefined
+    /// behaviour, a thousand: the same generator and the same seed, so
+    /// they are the first cases of the full run, one-slot cyclic buffers and
+    /// the normalisation and wrap boundaries among them.
+    const WALK_CASES: u32 = if cfg!(miri) { 1_000 } else { 60_000 };
+
+    /// The walk with its per-node accesses unchecked must be the walk with
+    /// every access checked: the same answer, the same tree, the same
+    /// matches, whatever the window and the tables hold. Built with debug
+    /// assertions, as tests are, every unchecked access here is also checked
+    /// against its slice, so a case that stepped outside would fail this
+    /// rather than pass it by luck; under Miri, an access outside its slice
+    /// is reported as undefined behaviour whatever the build.
+    #[test]
+    fn the_unchecked_walk_is_the_checked_walk_on_any_tables() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut walked, mut refused) = (0_u32, 0_u32);
+        for case_no in 0..WALK_CASES {
+            let c = case(&mut rng);
+            let want = walk(&c, get_matches_spec_n_2_checked);
+            let got = walk(&c, get_matches_spec_n_2);
+            assert!(got == want, "case {case_no}");
+            if want.0.is_some() {
+                walked += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        // Both of the kernel's answers are well represented.
+        assert!(
+            walked > WALK_CASES / 30 && refused > WALK_CASES / 30,
+            "{walked} walked, {refused} refused"
+        );
+    }
+
+    /// A call that breaks any one of the five conditions is refused before
+    /// it reads or writes anything: it panics, which the bt thread turns
+    /// into a failed stream.
+    #[test]
+    fn the_walk_refuses_what_it_cannot_vouch_for() {
+        fn base() -> Case {
+            let mut rng = Rng(11);
+            loop {
+                let c = case(&mut rng);
+                if c.cyclic >= 16 && c.hsize - c.hi >= 2 {
+                    return c;
+                }
+            }
+        }
+        type Break = (&'static str, fn(&mut Case));
+        let breaks: [Break; 6] = [
+            ("heads", |c| c.heads.truncate(c.hsize - 1)),
+            ("A", |c| c.cbp = c.cyclic - (c.hsize - c.hi) as u32 + 1),
+            ("B", |c| c.son.truncate(2 * c.cyclic as usize - 1)),
+            ("C", |c| c.max_len_0 = c.len_limit_0 - c.cur + 1),
+            ("D", |c| {
+                c.win.truncate(c.len_limit_0 + (c.hsize - c.hi) - 1)
+            }),
+            ("E", |c| {
+                // A position past the window's start with a cyclic buffer
+                // that reaches back further than the window does.
+                c.cyclic = (c.cur + 2 + (c.hsize - c.hi)) as u32;
+                c.son = vec![0; 2 * c.cyclic as usize];
+                c.cbp = 0;
+                c.pos = c.cur as u32 + 2;
+            }),
+        ];
+        // The base case itself is accepted.
+        let c = base();
+        assert_eq!(
+            walk(&c, get_matches_spec_n_2),
+            walk(&c, get_matches_spec_n_2_checked)
+        );
+        for (name, break_it) in breaks {
+            let mut c = base();
+            break_it(&mut c);
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                walk(&c, get_matches_spec_n_2)
+            }));
+            assert!(refused.is_err(), "condition {name} was not tested");
+        }
     }
 }
