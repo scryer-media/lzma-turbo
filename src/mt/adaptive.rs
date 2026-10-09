@@ -69,6 +69,63 @@ pub enum DrainStatus {
     Finished,
 }
 
+/// Where the decoder's memory is, and why it last held work back: what a
+/// caller tuning its read-ahead, or a harness explaining a decode, reads to
+/// see the mechanism rather than guess at it.
+///
+/// Every byte figure is capacity, as in
+/// [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes), and the four that split
+/// it add up to it. A snapshot: it is taken by
+/// [`ledger`](Lzma2AdaptiveDecoder::ledger) and does not move afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdaptiveLedger {
+    /// Input pieces held: unclaimed, and claimed but still read by a worker.
+    pub input_bytes: u64,
+    /// The buffers of the runs out with workers.
+    pub runs_out_bytes: u64,
+    /// The decoded blocks waiting to be handed over.
+    pub runs_waiting_bytes: u64,
+    /// Output buffers and input pieces parked for reuse.
+    pub parked_bytes: u64,
+    /// The most [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes) has been.
+    pub peak_held_bytes: u64,
+    /// Runs handed to a worker and not yet taken back: being decoded, or
+    /// decoded and not yet collected.
+    pub runs_out: usize,
+    /// Runs a worker is decoding right now: [`Self::runs_out`] less the ones
+    /// whose blocks are finished and waiting to be collected.
+    pub runs_decoding: usize,
+    /// Decoded blocks waiting their turn to be handed over.
+    pub runs_waiting: usize,
+    /// Runs held back at least once because every worker had one.
+    pub refused_busy: u64,
+    /// Runs held back at least once because there was no room for their
+    /// buffer under the limit, while other runs were out.
+    pub refused_room: u64,
+    /// Runs decoded on the calling thread because there was no room for
+    /// them and nothing out whose landing could make some.
+    pub refused_room_chase: u64,
+    /// Runs decoded on the calling thread because they were too large for
+    /// the limit at all.
+    pub refused_too_large: u64,
+    /// Times there was no complete run at the cursor to dispatch.
+    pub refused_incomplete: u64,
+    /// Times a piece of input was refused, in whole or in part.
+    pub input_refusals: u64,
+    /// Times parked capacity was given back to let a run through.
+    pub sheds: u64,
+}
+
+/// Why a run was held back, for counting each run once per cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Busy,
+    Room,
+    RoomChase,
+    TooLarge,
+}
+
 /// A block of decoded output, in the order the caller asked for.
 type Ready = (u64, Vec<u8>, usize);
 
@@ -231,6 +288,12 @@ pub struct Lzma2AdaptiveDecoder {
     #[cfg(feature = "crc")]
     st_seg: Option<Segmenter>,
 
+    /// The counters [`Lzma2AdaptiveDecoder::ledger`] reports.
+    ledger: AdaptiveLedger,
+    /// The run last held back and why, so a run refused on every pass of a
+    /// drain is counted once per cause and not once per pass.
+    last_refusal: Option<(u64, Refusal)>,
+
     /// A worker's error, held until everything before it has been delivered.
     failed: Option<(u64, Error)>,
     complete: bool,
@@ -318,6 +381,8 @@ impl Lzma2AdaptiveDecoder {
             checks: Vec::new(),
             #[cfg(feature = "crc")]
             st_seg: None,
+            ledger: AdaptiveLedger::default(),
+            last_refusal: None,
             failed: None,
             complete: false,
             cancelled: false,
@@ -455,9 +520,57 @@ impl Lzma2AdaptiveDecoder {
         self.runs_claimed
     }
 
+    /// Where the memory is and why work was held back: see
+    /// [`AdaptiveLedger`].
+    ///
+    /// The refusal counts are of runs, each counted once per cause however
+    /// many times a drain found it still refused; the counts of incomplete
+    /// runs and of refused input are of the occasions, because there is no
+    /// run to count them against.
+    #[must_use]
+    pub fn ledger(&self) -> AdaptiveLedger {
+        let parked = self.spare_cap + self.segs.spare_bytes();
+        AdaptiveLedger {
+            input_bytes: self.segs.held_bytes() - self.segs.spare_bytes(),
+            runs_out_bytes: self.outstanding_bytes,
+            runs_waiting_bytes: self.ready_cap,
+            parked_bytes: parked,
+            peak_held_bytes: self.ledger.peak_held_bytes.max(self.held_bytes()),
+            runs_out: self.outstanding,
+            runs_decoding: self.pool.as_ref().map_or(0, Pool::decoding),
+            runs_waiting: self.ready.len() + usize::from(self.part.is_some()),
+            ..self.ledger
+        }
+    }
+
+    /// Raises the peak to what is held now. Called wherever holding can grow.
+    fn mark_peak(&mut self) {
+        let held = self.held_bytes();
+        if held > self.ledger.peak_held_bytes {
+            self.ledger.peak_held_bytes = held;
+        }
+    }
+
+    /// Counts the run at the cursor as held back for `why`, once.
+    fn refuse(&mut self, why: Refusal) {
+        let key = (self.next_index, why);
+        if self.last_refusal == Some(key) {
+            return;
+        }
+        self.last_refusal = Some(key);
+        let l = &mut self.ledger;
+        match why {
+            Refusal::Busy => l.refused_busy += 1,
+            Refusal::Room => l.refused_room += 1,
+            Refusal::RoomChase => l.refused_room_chase += 1,
+            Refusal::TooLarge => l.refused_too_large += 1,
+        }
+    }
+
     /// Samples the accounting for the diagnostic counters.
     #[cfg(feature = "adaptive-stats")]
     fn note_peak(&mut self) {
+        self.mark_peak();
         let held = self.held_bytes();
         if held > self.stats.peak_held {
             self.stats.peak_held = held;
@@ -472,7 +585,9 @@ impl Lzma2AdaptiveDecoder {
     /// Samples the accounting for the diagnostic counters. Built away with
     /// them.
     #[cfg(not(feature = "adaptive-stats"))]
-    fn note_peak(&mut self) {}
+    fn note_peak(&mut self) {
+        self.mark_peak();
+    }
 
     /// Every byte of buffer the decoder is holding.
     ///
@@ -608,6 +723,7 @@ impl Lzma2AdaptiveDecoder {
         buf.try_reserve_exact(take).map_err(|_| Error::Alloc)?;
         buf.extend_from_slice(&data[..take]);
         self.segs.push_owned(buf);
+        self.mark_peak();
         Ok(take)
     }
 
@@ -648,6 +764,7 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Some(seg));
         }
         self.segs.push_owned(seg);
+        self.mark_peak();
         Ok(None)
     }
 
@@ -679,6 +796,7 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Some(range));
         }
         self.segs.push_shared(seg, range);
+        self.mark_peak();
         Ok(None)
     }
 
@@ -796,6 +914,9 @@ impl Lzma2AdaptiveDecoder {
                 }
                 take = usize::try_from(len).unwrap_or(usize::MAX);
             }
+        }
+        if take < len {
+            self.ledger.input_refusals += 1;
         }
         if whole && take < len {
             return Ok(0);
@@ -1197,6 +1318,7 @@ impl Lzma2AdaptiveDecoder {
                 self.ready_bytes += d.unpacked_len as u64;
                 self.ready
                     .insert(d.out_offset, (d.out_offset, d.out, d.unpacked_len));
+                self.mark_peak();
             }
             Err(e) => {
                 self.recycle(d.out);
@@ -1365,14 +1487,17 @@ impl Lzma2AdaptiveDecoder {
         }
         let Some(run) = self.pending.front().copied() else {
             stat!(self.stats.none += 1;);
+            self.ledger.refused_incomplete += 1;
             return Ok(Dispatch::None);
         };
         if run.in_offset != self.cursor_in {
             stat!(self.stats.none += 1;);
+            self.ledger.refused_incomplete += 1;
             return Ok(Dispatch::None);
         }
         if self.outstanding >= self.threads {
             stat!(self.stats.busy += 1;);
+            self.refuse(Refusal::Busy);
             return Ok(Dispatch::Busy);
         }
         let unpacked = usize::try_from(run.unpacked_len).map_err(|_| Error::Alloc)?;
@@ -1391,10 +1516,12 @@ impl Lzma2AdaptiveDecoder {
         let size = run.unpacked_len + run.packed_len;
         if size > self.memory_limit {
             stat!(self.stats.chase_too_big += 1;);
+            self.refuse(Refusal::TooLarge);
             return Ok(Dispatch::Chase);
         }
         if !self.room_for(run) && self.shed_for(run) {
             stat!(self.stats.shed += 1;);
+            self.ledger.sheds += 1;
         }
         if !self.room_for(run) {
             // Room appears when an outstanding block lands. If none is
@@ -1403,9 +1530,11 @@ impl Lzma2AdaptiveDecoder {
             stat!(self.stats.refused_held += self.held_bytes(););
             return Ok(if self.outstanding == 0 {
                 stat!(self.stats.chase_no_room += 1;);
+                self.refuse(Refusal::RoomChase);
                 Dispatch::Chase
             } else {
                 stat!(self.stats.busy += 1;);
+                self.refuse(Refusal::Room);
                 Dispatch::Busy
             });
         }
@@ -1468,6 +1597,7 @@ impl Lzma2AdaptiveDecoder {
         self.cursor_out += run.unpacked_len;
         self.note_end();
         self.release_input();
+        self.mark_peak();
         Ok(Dispatch::Sent)
     }
 
@@ -1607,6 +1737,7 @@ impl Lzma2AdaptiveDecoder {
         self.cursor_out += produced as u64;
         self.retire_runs();
         self.note_end();
+        self.mark_peak();
 
         if status == Status::FinishedWithMark {
             self.complete = true;
@@ -1779,6 +1910,62 @@ mod tests {
         d.scan().expect("scan");
         assert_eq!(d.pending.len(), 1, "the fifth run is declared");
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+    }
+
+    #[test]
+    fn the_ledger_splits_what_is_held_and_counts_each_refusal_once() {
+        let mut stream = run(4 * MIB, 0);
+        stream.extend_from_slice(&run(4 * MIB, 1));
+        stream.extend_from_slice(&run(4 * MIB, 2));
+        stream.push(0);
+        let mut d = decoder(2, u64::MAX);
+        hold(&mut d, &stream);
+        d.scan().expect("scan");
+
+        let sums = |d: &Lzma2AdaptiveDecoder| {
+            let l = d.ledger();
+            assert_eq!(
+                l.input_bytes + l.runs_out_bytes + l.runs_waiting_bytes + l.parked_bytes,
+                d.held_bytes()
+            );
+            assert!(l.peak_held_bytes >= d.held_bytes());
+            l
+        };
+        let l = sums(&d);
+        assert_eq!(l.input_bytes, stream.len() as u64);
+        assert_eq!((l.runs_out, l.runs_waiting), (0, 0));
+
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        let l = sums(&d);
+        assert_eq!(l.runs_out, 2);
+        assert_eq!(l.runs_out_bytes, 8 * MIB as u64);
+        assert!(l.runs_decoding <= 2);
+
+        // Both threads busy: the third run is held back, and however often
+        // the decoder looks at it, that is one refusal.
+        for _ in 0..3 {
+            assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+        }
+        assert_eq!(d.ledger().refused_busy, 1);
+        assert_eq!(d.ledger().refused_room, 0);
+
+        // Landed and waiting to be handed over: out of the workers' hands,
+        // and no longer decoding.
+        while d.outstanding > 0 {
+            assert!(d.collect(true));
+        }
+        let l = sums(&d);
+        assert_eq!((l.runs_out, l.runs_decoding, l.runs_waiting), (0, 0, 2));
+        assert_eq!(l.runs_waiting_bytes, 8 * MIB as u64);
+        let peak = l.peak_held_bytes;
+
+        // Handed over: the buffers are parked or gone, and the peak stays.
+        let mut left = usize::MAX;
+        d.emit(&mut |_, _: &[u8]| {}, &mut left);
+        let l = sums(&d);
+        assert_eq!((l.runs_waiting, l.runs_waiting_bytes), (0, 0));
+        assert_eq!(l.peak_held_bytes, peak);
     }
 
     #[test]
