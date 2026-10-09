@@ -13,8 +13,10 @@
   stream are known, one run pair (its input and its output) per thread and
   two of the caller's pieces, under the default budget as under a larger
   limit; a caller's tighter limit still governs, and `memory_limit()`
-  reports the figure in force. The pieces are what holding input in the
-  caller's pieces costs over run-sized buffers. On Apple M5 Max, decoding a
+  reports the figure in force. Runs already handed out count at their own
+  sizes, so a stream whose runs vary keeps room for a large run still out.
+  The pieces are what holding input in the caller's pieces costs over
+  run-sized buffers. On Apple M5 Max, decoding a
   2 GiB archive of 16 runs went from 2691 to 1165 MiB peak RSS at 4 threads
   and from 3203 to about 2060 MiB at 8, at the same wall time as before and
   as 7-Zip.

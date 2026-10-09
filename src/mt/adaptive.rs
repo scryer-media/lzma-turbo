@@ -266,6 +266,9 @@ pub struct Lzma2AdaptiveDecoder {
     /// from the figure the job carries, so it cannot drift from the buffers it
     /// stands for.
     outstanding_unpacked: u64,
+    /// The packed length of the runs out with workers: their input, which the
+    /// queue goes on charging for until each one lands.
+    outstanding_packed: u64,
     /// Output decoded but not yet handed over, by length: what a caller
     /// steering its read-ahead by [`Lzma2AdaptiveDecoder::in_flight_bytes`]
     /// is told about.
@@ -375,6 +378,7 @@ impl Lzma2AdaptiveDecoder {
             spare_out: Vec::new(),
             spare_cap: 0,
             outstanding_unpacked: 0,
+            outstanding_packed: 0,
             ready_bytes: 0,
             chase_bytes: 0,
             last_unpacked: 0,
@@ -701,7 +705,21 @@ impl Lzma2AdaptiveDecoder {
         }
         let pair = run_in.saturating_add(run_out).max(PAIR_FLOOR);
         let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
+        // The runs already handed out count at their own sizes, and a run
+        // landed and waiting its turn holds its slot's output; only the slots
+        // with neither are reckoned at the run in hand. Otherwise a stream
+        // whose runs vary would have the bound follow the last, small run
+        // down under a large one still out, and the decoder would find itself
+        // over its own limit for work it had already given away.
+        let landed = self.ready.len() + usize::from(self.part.is_some());
+        let idle = self.threads.saturating_sub(self.outstanding + landed);
+        let in_hand = self
+            .outstanding_packed
+            .saturating_add(self.outstanding_bytes)
+            .saturating_add(self.ready_cap)
+            .saturating_add(pair.saturating_mul(idle as u64));
         pair.saturating_mul(self.threads as u64)
+            .max(in_hand)
             .saturating_add(piece.saturating_mul(2))
     }
 
@@ -1144,6 +1162,7 @@ impl Lzma2AdaptiveDecoder {
         self.outstanding = 0;
         self.outstanding_bytes = 0;
         self.outstanding_unpacked = 0;
+        self.outstanding_packed = 0;
         // The pool is shut down above, so nothing else holds the input any
         // more and all of it can go at once.
         self.segs.clear();
@@ -1401,6 +1420,9 @@ impl Lzma2AdaptiveDecoder {
         // cannot drift or go below zero: the unpacked length is the run's own,
         // and the input is charged to the queue, never to the job.
         self.outstanding_unpacked -= d.unpacked_len as u64;
+        // The job's references are exactly the run's packed bytes.
+        let packed: u64 = d.packed.iter().map(|s| s.bytes().len() as u64).sum();
+        self.outstanding_packed -= packed;
         self.outstanding -= 1;
         self.outstanding_bytes -= d.held;
         // Dropping the job's references here is what lets the queue see that
@@ -1696,6 +1718,7 @@ impl Lzma2AdaptiveDecoder {
         stat!(self.stats.sent += 1;);
         stat!(self.stats.worker_bytes += run.unpacked_len;);
         self.outstanding_unpacked += run.unpacked_len;
+        self.outstanding_packed += run.packed_len;
         self.outstanding += 1;
         self.outstanding_bytes += held;
         self.last_unpacked = run.unpacked_len;
@@ -2213,6 +2236,37 @@ mod tests {
         let exact = exact(&stream[..2304]);
         assert!(d.feed_owned(exact).expect("feed").is_none());
         assert!(d.held_bytes() <= d.memory_limit());
+    }
+
+    #[test]
+    fn the_pair_bound_does_not_fall_under_a_large_run_out() {
+        // A 12 MiB run, a 1 MiB run, and the start of a third the scanner has
+        // not seen the end of. Two threads take the first two.
+        let mut stream = run(12 * MIB, 0);
+        stream.extend_from_slice(&run(MIB, 1));
+        let third = run(4 * MIB, 2);
+        stream.extend_from_slice(&third[..MIB]);
+        let mut d = decoder(2, u64::MAX);
+        for piece in stream.chunks(MIB) {
+            hold(&mut d, piece);
+        }
+        d.scan().expect("scan");
+        assert_eq!(d.pending.len(), 2);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+
+        // Nothing is waiting at the cursor, and the last run dispatched is the
+        // small one. Reckoned from that alone, a pair per thread is far less
+        // than the large run out already holds; the bound counts the runs out
+        // at their own sizes, so the decoder is never over its own limit for
+        // work it has already handed out.
+        assert!(d.pending.is_empty());
+        assert!(
+            d.held_bytes() <= d.limit(),
+            "{} held over a limit of {}",
+            d.held_bytes(),
+            d.limit()
+        );
     }
 
     #[test]
