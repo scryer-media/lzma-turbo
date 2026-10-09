@@ -56,6 +56,10 @@ const MIN_BUF_BUDGET: u64 = 1 << 20;
 /// size still spans only a handful of them.
 const PIECE_TARGET: usize = 4 << 20;
 
+/// The least a run pair counts for in the decoder's own bound: two pieces.
+/// See [`Lzma2AdaptiveDecoder::memory_limit`].
+const PAIR_FLOOR: u64 = 2 * PIECE_TARGET as u64;
+
 /// Why [`Lzma2AdaptiveDecoder::drain`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStatus {
@@ -646,10 +650,70 @@ impl Lzma2AdaptiveDecoder {
         self.chase_bytes
     }
 
-    /// The limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under.
+    /// The limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under: the one
+    /// the caller set, or one run pair per thread and two of the caller's
+    /// pieces, whichever is the less.
+    ///
+    /// The second is the decoder's own, and it is what 7-Zip holds, give or
+    /// take the pieces the input is held in: a thread
+    /// decoding a run has that run's input and the buffer it decodes into,
+    /// and a decoder with more runs than threads gains nothing from holding
+    /// more than that. Capacity above it is not read-ahead the workers ever
+    /// get to; it is input read early and output parked. So once the runs of
+    /// the stream are known, the decoder works to that figure under any
+    /// larger limit, an unlimited one included, and this reports it.
     #[must_use]
     pub fn memory_limit(&self) -> u64 {
-        self.memory_limit
+        self.limit()
+    }
+
+    /// The limit the decoder works to: the caller's, or the pair bound.
+    fn limit(&self) -> u64 {
+        self.memory_limit.min(self.pair_bound())
+    }
+
+    /// One run pair - its input and its output - for every thread, and two
+    /// pieces. No bound at all before a run has been seen, because there is
+    /// no pair to count yet; the scan reserve governs that stretch.
+    ///
+    /// The pieces are what holding input in the caller's pieces costs over
+    /// holding it in a buffer a run long, which is what 7-Zip does. The runs
+    /// out are held in whole pieces, and the span they make does not start or
+    /// end on a piece boundary: the piece the first of them starts in has the
+    /// end of the run before it, which is a piece at most, and the piece the
+    /// caller is handing over runs past the last of them into the next.
+    ///
+    /// The piece is the size the caller reads in, not the last piece: the
+    /// last piece of a stream is whatever was left over, and a bound that
+    /// fell with it would put a decoder holding a pair per thread over its
+    /// own limit with the last run in hand, which would then wait for a
+    /// worker to land.
+    ///
+    /// A pair is never counted as less than [`PAIR_FLOOR`]: on a stream of
+    /// small runs the bound would otherwise be a few hundred kilobytes, which
+    /// saves nothing worth having and starves the pipeline of the pieces it
+    /// is fed in.
+    fn pair_bound(&self) -> u64 {
+        let (run_in, run_out) = self.run_pair();
+        if run_in == 0 && run_out == 0 {
+            return u64::MAX;
+        }
+        let pair = run_in.saturating_add(run_out).max(PAIR_FLOOR);
+        let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
+        pair.saturating_mul(self.threads as u64)
+            .saturating_add(piece.saturating_mul(2))
+    }
+
+    /// The packed and unpacked size of the run the decoder is reckoning with:
+    /// the one at the front of the backlog, or the last one dispatched if that
+    /// was larger.
+    fn run_pair(&self) -> (u64, u64) {
+        let run_out = self
+            .pending
+            .front()
+            .map_or(0, |r| r.unpacked_len)
+            .max(self.last_unpacked);
+        (self.known_run(), run_out)
     }
 
     /// Changes the limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under,
@@ -962,7 +1026,7 @@ impl Lzma2AdaptiveDecoder {
     /// holding is counted.
     fn input_free(&self) -> u64 {
         let other = self.held_bytes() - self.segs.held_bytes();
-        self.memory_limit.saturating_sub(other)
+        self.limit().saturating_sub(other)
     }
 
     /// The packed size of the run the decoder is about to claim, or zero
@@ -975,30 +1039,43 @@ impl Lzma2AdaptiveDecoder {
             .max(self.last_packed)
     }
 
-    /// The input's share of the limit, setting aside a run for every slot that
-    /// is idle.
+    /// The input's share of the limit, setting aside an output buffer for
+    /// every slot that has none.
     ///
-    /// Only the idle ones: a run already out with a worker is charged where it
-    /// sits, through `outstanding_bytes`, and [`Self::input_free`] has already
-    /// taken it off. Setting aside a second run for that slot counted it twice,
-    /// and with most of the threads busy that left no share at all - the floor
-    /// governed, and a piece the limit had tens of megabytes of room for was
-    /// refused because it was a little larger than the run in hand.
+    /// A slot is a thread's run pair: the run's input, and the buffer it is
+    /// decoded into. A slot with a run out has both, charged where they sit;
+    /// a slot whose run has landed and is waiting its turn to be handed over
+    /// still has its output, and that buffer is the one its next run will be
+    /// decoded into once it is handed over and parked. Neither needs anything
+    /// set aside. Only a slot with no output at all does, and for it the
+    /// budget sets aside a buffer, not a pair: the input half of that slot's
+    /// pair is exactly what this budget is for.
+    ///
+    /// Setting aside a whole pair for every thread, busy or not, counted the
+    /// runs out twice and the read-ahead for the next run as well, and with
+    /// most of the threads busy that left the input no share at all.
+    /// Treating a slot whose output was waiting its turn as idle was the
+    /// same mistake by one buffer: it held back the input for that slot's
+    /// next run until the block was handed over, and a slot that is waiting
+    /// on the input for its next run is a thread doing nothing.
     fn buf_budget(&self) -> u64 {
-        let idle = self.threads.saturating_sub(self.outstanding);
+        let landed = self.ready.len() + usize::from(self.part.is_some());
+        let idle = self
+            .threads
+            .saturating_sub(self.outstanding)
+            .saturating_sub(landed);
         self.buf_budget_for(idle as u64)
     }
 
-    /// The input's share of the limit when `slots` workers could be at work.
+    /// The input's share of the limit when `slots` slots have no output
+    /// buffer yet.
     fn buf_budget_for(&self, slots: u64) -> u64 {
         let free = self.input_free();
-        let run_in = self.known_run();
-        let run_out = self
-            .pending
-            .front()
-            .map_or(0, |r| r.unpacked_len)
-            .max(self.last_unpacked);
-        let work = run_in.saturating_add(run_out).saturating_mul(slots);
+        let (run_in, run_out) = self.run_pair();
+        // What the slots without a buffer will want once their runs are
+        // dispatched, less what is parked for them already: parked output is
+        // charged where it sits, and dispatch moves it rather than allocating.
+        let reserve = run_out.saturating_mul(slots).saturating_sub(self.spare_cap);
         // Nothing is known about the runs yet: the scan reserve says how much
         // input to accept against that, and it is what grows when the scan
         // needs more. See `room_to_take`.
@@ -1020,12 +1097,18 @@ impl Lzma2AdaptiveDecoder {
             .dead_bytes()
             .saturating_add(run_in)
             .saturating_add(MIN_BUF_BUDGET);
+        // Once the runs are known the limit is at most a pair per thread (see
+        // `pair_bound`), so what the outputs are not owed is the input's: a
+        // pair per thread is in plus out, and the outs are counted. Before
+        // they are known the limit may be anything, and the scan reserve is
+        // kept to half of what is free so that finding the first run cannot
+        // take the room the first dispatch needs.
         let share = if unknown {
-            self.scan_reserve
+            self.scan_reserve.min(free / 2)
         } else {
-            free.saturating_sub(work)
+            free.saturating_sub(reserve)
         };
-        share.min(free / 2).max(floor).min(free)
+        share.max(floor).min(free)
     }
 
     /// Declares that no more input is coming. A stream that then does not end
@@ -1174,7 +1257,7 @@ impl Lzma2AdaptiveDecoder {
                     // taken: at the memory limit `feed` refuses everything, so
                     // a decoder that waited there would wait forever.
                     let waiting_for_input =
-                        !self.chase && !self.input_done && self.held_bytes() < self.memory_limit;
+                        !self.chase && !self.input_done && self.held_bytes() < self.limit();
                     if !busy && !waiting_for_input {
                         stat!(self.stats.chase_steps_none_arm += 1;);
                         if self.st_step(&mut sink, &mut left)? {
@@ -1211,7 +1294,7 @@ impl Lzma2AdaptiveDecoder {
                 // matter how many threads there are. Once the input is over,
                 // or the memory limit means no more can be taken, there is
                 // nothing better, so wait.
-                if !self.input_done && self.held_bytes() < self.memory_limit {
+                if !self.input_done && self.held_bytes() < self.limit() {
                     progress |= did;
                     return Ok(if progress {
                         DrainStatus::Progress
@@ -1273,7 +1356,7 @@ impl Lzma2AdaptiveDecoder {
         // recycling never sits on a large part of the limit it would otherwise
         // be dispatching with.
         let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
-        let room = (self.memory_limit / 8).min(piece.saturating_mul(self.threads as u64 + 2));
+        let room = (self.limit() / 8).min(piece.saturating_mul(self.threads as u64 + 2));
         self.segs.set_park_budget(room, self.threads + 2);
         self.segs.retain_from(self.cursor_in);
     }
@@ -1417,7 +1500,18 @@ impl Lzma2AdaptiveDecoder {
             .map_or(self.last_unpacked, |r| r.unpacked_len)
             .max(OUT_STEP_ST as u64);
         let held = self.spare_out.len();
-        if held < self.threads + 2 && self.worth_parking(buf.capacity(), want, held) {
+        // A run buffer is parked only for a thread that has no output buffer:
+        // one with a run out has one, and so does one whose run has landed
+        // and is waiting its turn, which will come back here before that
+        // thread can be given another run. A buffer parked beyond those is
+        // capacity the limit counts and nothing can use, and at a pair per
+        // thread it is the input of the next run, which then cannot be read
+        // until a worker lands. Chase-step buffers are small and come and go
+        // with the chase, so they are left to the cap below.
+        let landed = self.ready.len() + usize::from(self.part.is_some());
+        let surplus =
+            buf.capacity() > OUT_STEP_ST && self.outstanding + landed + held >= self.threads;
+        if !surplus && held < self.threads + 2 && self.worth_parking(buf.capacity(), want, held) {
             stat!(self.stats.parked_out += 1;);
             self.spare_cap += buf.capacity() as u64;
             self.spare_out.push(buf);
@@ -1453,7 +1547,7 @@ impl Lzma2AdaptiveDecoder {
         if held == 0 {
             return true;
         }
-        let cap_room = (self.memory_limit / 8).min(
+        let cap_room = (self.limit() / 8).min(
             want.max(OUT_STEP_ST as u64)
                 .saturating_mul(self.threads as u64),
         );
@@ -1514,7 +1608,7 @@ impl Lzma2AdaptiveDecoder {
         // capacity, counted where they sit, and dispatch moves them rather than
         // allocating more.
         let size = run.unpacked_len + run.packed_len;
-        if size > self.memory_limit {
+        if size > self.limit() {
             stat!(self.stats.chase_too_big += 1;);
             self.refuse(Refusal::TooLarge);
             return Ok(Dispatch::Chase);
@@ -1610,7 +1704,7 @@ impl Lzma2AdaptiveDecoder {
     /// does not already cover, because that is parked capacity, counted where
     /// it sits, and dispatch moves it rather than allocating more.
     fn room_for(&self, run: Lzma2Run) -> bool {
-        self.held_bytes() + self.dispatch_cost(run.unpacked_len) <= self.memory_limit
+        self.held_bytes() + self.dispatch_cost(run.unpacked_len) <= self.limit()
     }
 
     /// Gives back the parked capacity a dispatch of `run` would not reuse, if
@@ -1631,7 +1725,7 @@ impl Lzma2AdaptiveDecoder {
             return false;
         }
         let after = self.held_bytes() - unused;
-        if after.saturating_add(self.dispatch_cost(run.unpacked_len)) > self.memory_limit {
+        if after.saturating_add(self.dispatch_cost(run.unpacked_len)) > self.limit() {
             return false;
         }
         if let Some(last) = self.spare_out.pop() {
@@ -1883,9 +1977,11 @@ mod tests {
 
     #[test]
     fn the_piece_that_completes_the_run_in_hand_is_taken() {
-        // Four threads, four runs out, so there is no idle slot to reckon a
-        // budget for: what governs is the floor, the run in hand and a header.
-        let mut d = decoder(4, 50 * MIB as u64);
+        // Eight threads under a caller's limit tighter than a pair each, four
+        // runs out: the four slots without an output buffer have theirs set
+        // aside, and what is left for input is the floor - the run in hand and
+        // a header.
+        let mut d = decoder(8, 50 * MIB as u64);
         for i in 0..4 {
             hold(&mut d, &run(4 * MIB, i));
         }
@@ -1904,12 +2000,123 @@ mod tests {
         // A whole 4 MiB piece: the megabyte or so that completes the fifth run
         // and three megabytes of the sixth. The floor leaves room for the run
         // and a megabyte beyond it, which is less than the piece, but the
-        // limit has room for it many times over.
+        // limit has room for it.
         let piece = exact(&tail[3 * MIB..7 * MIB]);
+        assert!(d.limit() < d.pair_bound());
         assert!(d.feed_owned(piece).expect("feed").is_none(), "refused");
         d.scan().expect("scan");
         assert_eq!(d.pending.len(), 1, "the fifth run is declared");
-        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Busy);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert!(d.held_bytes() <= d.limit());
+    }
+
+    #[test]
+    fn a_short_last_piece_does_not_shrink_the_pair_bound() {
+        // Three runs and the end marker, fed in whole pieces of the size the
+        // caller reads in: the last piece is the few hundred bytes left over.
+        let mut stream = run(4 * MIB, 0);
+        stream.extend_from_slice(&run(4 * MIB, 1));
+        stream.extend_from_slice(&run(4 * MIB, 2));
+        stream.push(0);
+        let tail = stream.len() % PIECE_TARGET;
+        assert!(tail != 0 && (tail as u64) < MIN_BUF_BUDGET);
+
+        let mut d = decoder(2, u64::MAX);
+        let (whole, last) = stream.split_at(stream.len() - tail);
+        for piece in whole.chunks(PIECE_TARGET) {
+            hold(&mut d, piece);
+        }
+        d.scan().expect("scan");
+        let bound = d.pair_bound();
+        assert!(bound < u64::MAX);
+
+        // The tail is the end of the stream, not the size of the pieces in
+        // flight: the bound a pair per thread and its pieces make is the one
+        // the whole pieces made. Were it to fall with the tail, a decoder
+        // holding a pair per thread and its whole pieces would find itself
+        // over its own limit with the last run in hand, and that run would
+        // wait for a worker to land before it could go.
+        hold(&mut d, last);
+        d.scan().expect("scan");
+        assert_eq!(d.pair_bound(), bound);
+    }
+
+    #[test]
+    fn a_pair_per_thread_held_in_whole_pieces_fits_the_bound() {
+        // Two threads, 1 MiB pieces, and runs that do not line up with them:
+        // a small first run ends four bytes short of the first piece's end,
+        // so the two 4 MiB runs after it are held in pieces reaching from
+        // that first piece to one past their own end - a piece more than
+        // their packed bytes come to.
+        let mut stream = run(MIB - 52, 0);
+        assert_eq!(stream.len(), MIB - 4);
+        stream.extend_from_slice(&run(4 * MIB, 1));
+        stream.extend_from_slice(&run(4 * MIB, 2));
+        stream.extend_from_slice(&run(2 * MIB, 3));
+        stream.push(0);
+
+        let mut d = decoder(2, u64::MAX);
+        for piece in stream[..10 * MIB].chunks(MIB) {
+            hold(&mut d, piece);
+        }
+        d.scan().expect("scan");
+        assert_eq!(d.pending.len(), 3);
+
+        // The small run goes, lands and is handed over; the first piece stays,
+        // because the next run starts in it.
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert!(d.collect(true));
+        let mut left = usize::MAX;
+        d.emit(&mut |_, _: &[u8]| {}, &mut left);
+        assert_eq!(d.segs.held_bytes() - d.segs.spare_bytes(), 10 * MIB as u64);
+
+        // Each thread takes one of the 4 MiB runs. That is a pair per thread,
+        // which is what the bound is for, and it must not be refused for the
+        // pieces the pairs are held in.
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert!(d.held_bytes() <= d.limit());
+    }
+
+    #[test]
+    fn no_more_output_buffers_are_kept_than_there_are_threads() {
+        let mut stream = run(4 * MIB, 0);
+        for i in 1..4 {
+            stream.extend_from_slice(&run(4 * MIB, i));
+        }
+        stream.push(0);
+        let mut d = decoder(2, u64::MAX);
+        hold(&mut d, &stream);
+        d.scan().expect("scan");
+        assert_eq!(d.pending.len(), 4);
+
+        // Both threads take a run, both land and wait to be handed over, and
+        // the third run goes out while they wait: three output buffers for
+        // two threads, which is the pipeline working, not waste.
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        while d.outstanding > 0 {
+            assert!(d.collect(true));
+        }
+        assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        assert_eq!((d.outstanding, d.ready.len()), (1, 2));
+
+        // The first is handed over. Both threads still have an output buffer -
+        // one decoding into it, one waiting its turn with it - so nothing
+        // could take a parked one before one of those two came back, and that
+        // one is what it would take. Parked, it is capacity the limit counts
+        // and nothing uses: at a pair per thread, it is the input of the next
+        // run, which then cannot be read until a worker lands.
+        let mut left = 4 * MIB;
+        d.emit(&mut |_, _: &[u8]| {}, &mut left);
+        assert_eq!(d.ready.len(), 1);
+        assert!(d.spare_out.is_empty(), "{} parked", d.spare_out.len());
+
+        // The second is handed over with one thread decoding: the other has
+        // no buffer, and the next run will want one.
+        let mut left = 4 * MIB;
+        d.emit(&mut |_, _: &[u8]| {}, &mut left);
+        assert_eq!(d.spare_out.len(), 1);
     }
 
     #[test]
