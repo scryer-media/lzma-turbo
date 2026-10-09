@@ -203,6 +203,38 @@ fn the_threaded_finder_survives_the_window_sliding_past_the_input() {
     }
 }
 
+/// The smallest dictionary there is, under an input several windows long. The
+/// cyclic buffer is at its shortest, so every tree link wraps it within a few
+/// kilobytes, and the window slides under the bt thread more than once. The
+/// tree walk leaves the bounds of its per-node accesses to the tests it makes
+/// of each distance against that cyclic size, so this is where a wrong one
+/// would show: the output must be the single-threaded finder's, byte for
+/// byte, and decode back.
+#[test]
+fn the_threaded_finder_is_the_single_one_at_the_smallest_dictionary() {
+    for (kind, fb, src) in [
+        (MatchFinderKind::Bt4, 32, mixed(6 << 20)),
+        (MatchFinderKind::Bt2, 5, mixed(4 << 20)),
+        (MatchFinderKind::Bt5, 273, corpus(6 << 20)),
+    ] {
+        let st = LzmaEncProps::new()
+            .with_level(6)
+            .with_match_finder(kind)
+            .with_fast_bytes(fb)
+            .with_dict_size(1 << 12);
+        let (prop, out) = encode_stream(&mt(&st), &src);
+        round_trip(prop, &out, &src, &format!("{kind:?} fb {fb}"));
+
+        let (_, single) = encode_stream(&st, &src);
+        assert!(
+            out == single,
+            "{kind:?} fb {fb}: threaded finder {} bytes, single-threaded {}",
+            out.len(),
+            single.len()
+        );
+    }
+}
+
 /// A source that hands out `ok` bytes of `data` and then fails, either with an
 /// error or by panicking.
 struct FailingStream<'a> {
