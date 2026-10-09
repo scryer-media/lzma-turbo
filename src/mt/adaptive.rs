@@ -214,6 +214,10 @@ pub struct Lzma2AdaptiveDecoder {
     threads: usize,
     ordered: bool,
     chase: bool,
+    /// Whether the last input offered was refused outright and nothing has
+    /// freed room since. A decoder that has refused input is not waiting for
+    /// it.
+    input_refused: bool,
 
     // Input, as the pieces it was handed over in. Nothing before `cursor_in`
     // is retained, and a piece a worker still holds is freed when the worker
@@ -356,6 +360,7 @@ impl Lzma2AdaptiveDecoder {
             threads: options.threads.max(1),
             ordered: true,
             chase: true,
+            input_refused: false,
             segs: SegQueue::default(),
             input_done: false,
             scanner: Lzma2RunScanner::new(),
@@ -1013,6 +1018,9 @@ impl Lzma2AdaptiveDecoder {
                 take = usize::try_from(len).unwrap_or(usize::MAX);
             }
         }
+        // Refused outright, that is: a part taken is input the decoder is
+        // still reading, and the rest is offered again on the next turn.
+        self.input_refused = take == 0 || (whole && take < len);
         if take < len {
             self.ledger.input_refusals += 1;
         }
@@ -1256,6 +1264,11 @@ impl Lzma2AdaptiveDecoder {
             self.scan()?;
             let mut did = self.collect(false);
             did |= self.emit(&mut sink, &mut left);
+            if did {
+                // A block landed or was handed over, and either one frees
+                // room: input refused before it may well be taken now.
+                self.input_refused = false;
+            }
             self.check_failed()?;
 
             // The chase decoder must not steal a run that a worker could take,
@@ -1291,8 +1304,17 @@ impl Lzma2AdaptiveDecoder {
                     // Waiting for input is only waiting if input can still be
                     // taken: at the memory limit `feed` refuses everything, so
                     // a decoder that waited there would wait forever.
-                    let waiting_for_input =
-                        !self.chase && !self.input_done && self.held_bytes() < self.limit();
+                    //
+                    // Nor is it waiting for input it has refused when nothing
+                    // has freed room since. Before the first run is known the
+                    // input budget is a guess, and a run larger than the limit
+                    // is refused piece by piece until its end is seen, which
+                    // with nothing out is never; the chase decodes what is
+                    // held so the rest can come in.
+                    let waiting_for_input = !self.chase
+                        && !self.input_done
+                        && !self.input_refused
+                        && self.held_bytes() < self.limit();
                     if !busy && !waiting_for_input {
                         stat!(self.stats.chase_steps_none_arm += 1;);
                         if self.st_step(&mut sink, &mut left)? {
@@ -2267,6 +2289,51 @@ mod tests {
             d.held_bytes(),
             d.limit()
         );
+    }
+
+    #[test]
+    fn a_refused_reader_is_never_left_waiting_on_itself() {
+        // Chase off, a 2 MiB limit, and a first run of 4 MiB fed in 512 KiB
+        // pieces: the run is larger than the limit, and until its end is seen
+        // nobody knows that. The decoder takes what the scan reserve allows
+        // and then refuses the next piece, with nothing out and no complete
+        // run to dispatch.
+        let mut stream = run(4 * MIB, 0);
+        stream.extend_from_slice(&run(1 << 16, 1));
+        stream.push(0);
+        let mut d = decoder(4, 2 * MIB as u64);
+        d.set_chase(false);
+
+        let mut out = 0usize;
+        let mut pieces = stream.chunks(MIB / 2).peekable();
+        let mut hand: Option<Vec<u8>> = None;
+        loop {
+            if hand.is_none() {
+                hand = pieces.next().map(exact);
+            }
+            let refused = match hand.take() {
+                Some(p) => {
+                    hand = d.feed_owned(p).expect("feed");
+                    hand.is_some()
+                }
+                None => {
+                    d.end_of_input();
+                    false
+                }
+            };
+            let status = d.drain(|_, b| out += b.len()).expect("drain");
+            if status == DrainStatus::Finished {
+                break;
+            }
+            // Asking for more input it has just refused, with nothing out to
+            // wait for, is a decoder waiting on its own caller forever. With
+            // the input refused, the decode has to go on without it.
+            assert!(
+                !(refused && status == DrainStatus::NeedsMoreInput && d.outstanding == 0),
+                "refused a piece and then asked for more, with nothing in flight"
+            );
+        }
+        assert_eq!(out, 4 * MIB + (1 << 16));
     }
 
     #[test]

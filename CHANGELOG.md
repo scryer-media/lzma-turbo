@@ -42,6 +42,11 @@
   piece in a large buffer, such as a head cut from a full read, was taken
   under a limit with room for its bytes but not its buffer, and
   `held_bytes()` went past the limit; it is now refused.
+- `Lzma2AdaptiveDecoder` with chasing turned off no longer stalls when it
+  refuses a piece outright with nothing out and nothing landed since, as it
+  did under a limit smaller than the first run before that run's end was
+  seen: `drain` decoded nothing and asked for the input it had just refused.
+  The chase now decodes what is held so the rest can come in.
 - `Lzma2AdaptiveDecoder::ledger()` returns an `AdaptiveLedger`: held bytes
   split into input pieces, runs out, runs waiting and parked buffers; runs
   out, decoding and waiting; the peak held; and dispatch refusals by cause,
