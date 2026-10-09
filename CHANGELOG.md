@@ -13,9 +13,9 @@
   limit that pays for several. Three rules held it there. The input budget
   set aside a run for every thread, including the ones already out with a
   run and already charged for it; it now sets aside a run for the idle
-  threads only (worked through at 4 threads, a 1538 MiB limit, 128 MiB runs and 3 out, the
-  input ceiling goes from 513 to 577 MiB and the room for the next piece from
-  1 to 65 MiB). A whole piece that completes the run in hand is now taken
+  threads only (worked through at 4 threads, a 1538 MiB limit, 128 MiB runs
+  and 3 out, the input ceiling goes from 513 to 577 MiB and the room for the
+  next piece from 1 to 65 MiB). A whole piece that completes the run in hand is now taken
   whenever the limit has room for it, where the floor used to refuse any
   piece that ran more than a megabyte past the run's end. And a run that
   would be refused for want of room first gets the parked capacity its
