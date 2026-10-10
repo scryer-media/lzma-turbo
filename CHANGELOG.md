@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0 - 2026-10-10
+
+- `Lzma2AdaptiveDecoder` gains two setters for a caller that widens the
+  decode while it runs. `set_read_ahead(threads)` keeps room under the pair
+  bound for one more run's input for each thread the caller reads ahead for
+  beyond the ceiling in force, and nothing more; without it the bound refused
+  the input a caller had read ahead to decide whether to widen, so on a
+  stream of large runs it saw one run of backlog at most and widened a thread
+  at a time. `set_hand_back_waits(true)` makes a drain return
+  `DrainStatus::Progress` where it would otherwise block for a worker, so the
+  caller can apply a wider ceiling while it waits instead of after the next
+  run lands, and finish with `wait_for_worker` when it has nothing to listen
+  for. Both are off by default; what is decoded, and in what order, is
+  unchanged (`tests/adaptive.rs` decodes the same stream with hand-back on
+  while widening, and checks that read-ahead at or below the ceiling leaves
+  `memory_limit` as it was).
+
 ## 0.8.0 - 2026-10-09
 
 - The adaptive LZMA2 decoder holds less memory under its own limit. A run
