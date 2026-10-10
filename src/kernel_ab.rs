@@ -17,6 +17,8 @@
 //! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
 //! - `LZMA_TURBO_FINDER`: `st` for the C's single-threaded match finder where
 //!   one thread runs a binary tree in normal mode, or `inline` (default).
+//! - `LZMA_TURBO_HC_HEADS`: `off` for the C's hash-chain finder, which looks
+//!   each position's head up as it gets there, or `on` (default).
 //!
 //! The numbers these produced are in `docs/simd-kernels-report.md`.
 
@@ -66,6 +68,13 @@ pub(crate) fn delta_blocked() -> bool {
 pub(crate) fn inline_finder() -> bool {
     static CACHED: AtomicU8 = AtomicU8::new(UNSET);
     cached(&CACHED, "LZMA_TURBO_FINDER", |v| u8::from(v != "st")) == 1
+}
+
+/// Whether the hash-chain finder takes its heads a run of positions ahead.
+/// `false` is the C's lookup at each position.
+pub(crate) fn hc_heads() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_HC_HEADS", |v| u8::from(v != "off")) == 1
 }
 
 const UNSET: u8 = 255;

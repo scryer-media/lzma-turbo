@@ -3792,4 +3792,66 @@ mod tests {
             assert!(got == want, "{what}: LZMA2 blocks in place, block {block}");
         }
     }
+
+    /// The hash-chain finder taking its heads a run of positions ahead finds
+    /// what it found looking each up as it got there, through a window that
+    /// slides many times, at the end of the stream, and with skips of every
+    /// length between the calls; and an encoder writes the same bytes with
+    /// it at every hash-chain level.
+    #[test]
+    fn hash_chain_heads_taken_ahead_find_the_same_matches() {
+        let mut rng = Rng(0x4EAD_5EED);
+        for kind in [MatchFinderKind::Hc4, MatchFinderKind::Hc5] {
+            for len in [0usize, 1, 4, 5, 6, 4_000, 300_000, 1_500_000] {
+                let src = block_bytes(&mut rng, len);
+                let seed = u64::from(rng.next()) | 1;
+                let mut traces = Vec::new();
+                for ahead in [false, true] {
+                    let mut mf = MatchFinder::new();
+                    mf.kind = kind;
+                    mf.num_hash_bytes = kind.num_hash_bytes();
+                    mf.cut_value = 16;
+                    mf.hc_heads = ahead;
+                    mf.create(
+                        1 << 16,
+                        K_NUM_OPTS as u32,
+                        64,
+                        LZMA_MATCH_LEN_MAX + 1,
+                        u64::MAX,
+                    )
+                    .expect("create");
+                    let mut stream = SliceStream::new(&src);
+                    mf.init(&mut stream);
+                    traces.push(drive_st(&mut mf, &mut stream, seed));
+                }
+                assert!(traces[0] == traces[1], "{kind:?}, {len} bytes");
+            }
+        }
+
+        let pool = block_bytes(&mut rng, 3 << 20);
+        for case in 0..16 {
+            let at = rng.below((pool.len() - (1 << 20)) as u32) as usize;
+            let src = &pool[at..at + rng.below(1 << 20) as usize];
+            let level = rng.below(5);
+            let dict = 1u32 << (12 + rng.below(9));
+            let props = LzmaEncProps::new().with_level(level).with_dict_size(dict);
+            let mut out = Vec::new();
+            for ahead in [false, true] {
+                let mut enc = crate::enc::LzmaEncoder::new(&props).unwrap();
+                enc.inner.mf.cfg().hc_heads = ahead;
+                let mut bytes = Vec::new();
+                enc.encode(&mut SliceStream::new(src), &mut bytes).unwrap();
+                assert!(
+                    !enc.inner.mf.cfg().kind.bt_mode(),
+                    "level {level} is a hash chain"
+                );
+                out.push(bytes);
+            }
+            assert!(
+                out[0] == out[1],
+                "case {case}: level {level} dict {dict}, {} bytes",
+                src.len()
+            );
+        }
+    }
 }
