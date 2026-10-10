@@ -1128,15 +1128,73 @@ impl Common {
         unsafe { core::slice::from_raw_parts_mut(self.bufs.add(offset), HASH_BLOCK_SIZE as usize) }
     }
 
-    /// The whole `bt_buf` allocation, including the two-word failure buffer
-    /// that follows it.
+    /// One block of `bt_buf`.
+    ///
+    /// Never the whole buffer: a reference to it would cover the blocks the
+    /// other thread is writing at the same time, and forming one is itself
+    /// an access to all of it.
     ///
     /// # Safety
     ///
     /// As [`Common::hash_block`], for the bt and lz threads.
     #[allow(clippy::mut_from_ref)]
+    unsafe fn bt_block(&self, offset: usize) -> &mut [u32] {
+        // SAFETY: as `hash_block`; `offset` names a whole block of `bt_buf`,
+        // which starts `HASH_BUFFER_SIZE` words into `bufs`.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.bufs.add(HASH_BUFFER_SIZE + offset),
+                BT_BLOCK_SIZE as usize,
+            )
+        }
+    }
+
+    /// The two words past `bt_buf` the lz thread parks on after a failure,
+    /// at `BT_BUFFER_SIZE` in `bt_buf`'s indexing.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the lz thread, the only one that touches them.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn bt_park(&self) -> &mut [u32] {
+        // SAFETY: `bufs` is `HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2` words long
+        // (`MatchFinderMt::create`), and no other thread forms a reference
+        // to the last two.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE + BT_BUFFER_SIZE), 2)
+        }
+    }
+
+    /// The block of `bt_buf` the lz thread is reading at `pos`, in
+    /// `bt_buf`'s indexing, with that block's first index: a whole block, or
+    /// the two parking words once `pos` has been sent there.
+    ///
+    /// # Safety
+    ///
+    /// Caller must be the lz thread, holding the block `pos` is in.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn bt_held(&self, pos: usize) -> (usize, &mut [u32]) {
+        if pos >= BT_BUFFER_SIZE {
+            // SAFETY: the caller is the lz thread.
+            (BT_BUFFER_SIZE, unsafe { self.bt_park() })
+        } else {
+            let base = pos & !(BT_BLOCK_SIZE as usize - 1);
+            // SAFETY: the caller holds the block `pos` is in.
+            (base, unsafe { self.bt_block(base) })
+        }
+    }
+
+    /// The whole `bt_buf` allocation, including the two parking words, for
+    /// a test that fills it before any thread is started.
+    ///
+    /// # Safety
+    ///
+    /// No producer thread may be running.
+    #[cfg(test)]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn bt_all(&self) -> &mut [u32] {
-        // SAFETY: as `hash_block`; callers index a block they hold.
+        // SAFETY: nothing else is running.
         unsafe {
             core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE), BT_BUFFER_SIZE + 2)
         }
@@ -1191,7 +1249,7 @@ struct BtState {
 struct LzState {
     /// C: `p->pointerToCurPos`, as an index into the window.
     pointer_to_cur_pos: usize,
-    /// C: `p->btBufPos`, as an index into `bt_all`.
+    /// C: `p->btBufPos`, as an index into `bt_buf` (see `Common::bt_held`).
     bt_buf_pos: usize,
     /// C: `p->btBufPosLimit`.
     bt_buf_pos_limit: usize,
@@ -1484,19 +1542,6 @@ impl MtShared {
     }
 }
 
-impl Common {
-    /// The whole `hash_buf` allocation.
-    ///
-    /// # Safety
-    ///
-    /// As [`Common::hash_block`]: callers index a block they hold.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn hash_all(&self) -> &mut [u32] {
-        // SAFETY: as `hash_block`.
-        unsafe { core::slice::from_raw_parts_mut(self.bufs, HASH_BUFFER_SIZE) }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HASH THREAD
 // ---------------------------------------------------------------------------
@@ -1662,7 +1707,7 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
 
     // SAFETY: this block of `bt_buf` is the bt thread's until it releases
     // `filled`, and the `hash_buf` blocks it reads are held the same way.
-    let d = &mut unsafe { c.bt_all() }[block_offset..block_offset + BT_BLOCK_SIZE as usize];
+    let d = unsafe { c.bt_block(block_offset) };
     d[1] = b.hash_num_avail;
 
     if b.failure {
@@ -1682,8 +1727,8 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
                 sh.apply_bt_shift(b);
                 let k = hash_block_offset(bi) as u32;
                 // SAFETY: `get_next_block` has just handed this block over.
-                let h = unsafe { c.hash_all() };
-                if h[k as usize] < 2 {
+                let h = unsafe { c.hash_block(k as usize) };
+                if h[0] < 2 {
                     // The hash thread failed (see `hash_thread_func`). Not in
                     // the C, whose hash thread cannot fail: handled as its
                     // "internal data failure" below.
@@ -1691,8 +1736,8 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
                     d[0] = 0;
                     return;
                 }
-                avail = h[k as usize + 1];
-                b.hash_buf_pos_limit = k + h[k as usize];
+                avail = h[1];
+                b.hash_buf_pos_limit = k + h[0];
                 b.hash_num_avail = avail;
                 b.hash_buf_pos = k + 2;
             }
@@ -1750,8 +1795,12 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
             let win = unsafe { c.win() };
             // SAFETY: `son` is the bt thread's exclusive range.
             let son = unsafe { c.son() };
+            // The `hash_buf` block `hash_buf_pos` is in: `hash_buf_pos` stays
+            // below `hash_buf_pos_limit`, which is at most the block's end.
+            let head_base = b.hash_buf_pos as usize & !(HASH_BLOCK_SIZE as usize - 1);
             // SAFETY: the `hash_buf` block this reads is held, as above.
-            let heads = unsafe { c.hash_all() };
+            let heads = unsafe { c.hash_block(head_base) };
+            let head_pos = b.hash_buf_pos as usize - head_base;
             // The kernel tests five conditions before its unchecked accesses
             // (its "# Bounds"). Why each holds here, at every call:
             //
@@ -1787,9 +1836,9 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
                 cur_pos as usize,
                 c.num_hash_bytes as usize - 1,
                 heads,
-                b.hash_buf_pos as usize,
+                head_pos,
                 limit as usize,
-                (b.hash_buf_pos + size) as usize,
+                head_pos + size as usize,
                 cyclic_buffer_pos,
                 c.cyclic_buffer_size,
             ) {
@@ -1853,8 +1902,8 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
         sh.thread_failed.store(true, Ordering::SeqCst);
         // SAFETY: this block of `bt_buf` is still the bt thread's; `filled`
         // is released only after this returns.
-        let bt = unsafe { sh.common().bt_all() };
-        bt[block_offset] = 0;
+        let d = unsafe { sh.common().bt_block(block_offset) };
+        d[0] = 0;
     }
     // C: "We suppose that we have called GetNextBlock() from start. So buffer
     // is LOCKED".
@@ -2295,13 +2344,15 @@ impl MatchFinderMt {
             let base = bt_block_offset(bi);
             // SAFETY: `get_next_block` has just handed this block over, and
             // the lz thread holds it until the next call.
-            let bt = unsafe { c.bt_all() };
-            let num_items = bt[base];
+            let bt = unsafe { c.bt_block(base) };
+            let num_items = bt[0];
             l.bt_buf_pos_limit = base + num_items as usize;
-            l.bt_num_avail_bytes = bt[base + 1];
+            l.bt_num_avail_bytes = bt[1];
             l.bt_buf_pos = base + 2;
             if !(2..=BT_BLOCK_SIZE).contains(&num_items) {
-                bt[BT_BUFFER_SIZE] = 0;
+                // SAFETY: this is the lz thread.
+                let park = unsafe { c.bt_park() };
+                park[0] = 0;
                 l.bt_buf_pos = BT_BUFFER_SIZE;
                 l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
                 l.failure_lz_bt = true;
@@ -2447,17 +2498,19 @@ impl MatchFinderMt {
     pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
         let sh = self.shared();
         let c = sh.common();
-        // SAFETY: the lz thread owns `lz_state` and holds the current `bt_buf`
-        // block until its next `get_next_block`.
-        let (l, bt) = unsafe { (&mut *sh.lz_state.get(), c.bt_all()) };
+        // SAFETY: the lz thread owns `lz_state`.
+        let l = unsafe { &mut *sh.lz_state.get() };
+        // SAFETY: the lz thread holds the current `bt_buf` block until its
+        // next `get_next_block`. `bt_pos` below indexes that block.
+        let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
 
-        let mut bt_pos = l.bt_buf_pos;
+        let mut bt_pos = l.bt_buf_pos - base;
         let len = bt[bt_pos];
         bt_pos += 1;
 
         if c.mix == Mix::None {
             let bt_lim = bt_pos + len as usize;
-            l.bt_buf_pos = bt_lim;
+            l.bt_buf_pos = base + bt_lim;
             l.bt_num_avail_bytes -= 1;
             self.increase_lz_pos();
             let mut di = 0;
@@ -2472,7 +2525,7 @@ impl MatchFinderMt {
 
         let avail = l.bt_num_avail_bytes - 1;
         l.bt_num_avail_bytes = avail;
-        l.bt_buf_pos = bt_pos + len as usize;
+        l.bt_buf_pos = base + bt_pos + len as usize;
 
         let mut di = 0;
         if len == 0 {
@@ -2523,9 +2576,8 @@ impl MatchFinderMt {
             let sh = self.shared();
             let c = sh.common();
             // SAFETY: the lz thread owns `lz_state` and the low hash, and may
-            // read the window and the block it holds.
-            let (l, hash, win, bt) =
-                unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win(), c.bt_all()) };
+            // read the window.
+            let (l, hash, win) = unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win()) };
             let avail = l.bt_num_avail_bytes;
             l.bt_num_avail_bytes = avail.wrapping_sub(1);
             if min_len != 0 && avail >= min_len {
@@ -2541,7 +2593,9 @@ impl MatchFinderMt {
             }
             l.lz_pos += 1;
             l.pointer_to_cur_pos += 1;
-            l.bt_buf_pos += bt[l.bt_buf_pos] as usize + 1;
+            // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
+            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
+            l.bt_buf_pos += bt[l.bt_buf_pos - base] as usize + 1;
             num -= 1;
             if num == 0 {
                 return;
@@ -2630,7 +2684,9 @@ pub(crate) fn run_block<T>(
     // SAFETY: between streams `block` and `common` are the lz thread's: the
     // pair is waiting on `can_start`, which only this thread's first
     // `get_next_block` in `body` sets, and the caller holds no borrow of
-    // `common` across this call.
+    // `common` across this call. `Stop` gives the block back only once both
+    // threads have stopped; `a_direct_block_is_read_as_the_copied_window_is`
+    // checks the hand-off at both ends, natively and under Miri.
     unsafe {
         *sh.block.get() = BlockInput {
             ptr: src.as_ptr(),
@@ -2701,7 +2757,9 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, with_threads};
+    use super::{
+        MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, run_block, with_threads,
+    };
     use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
     use crate::enc::stream::{SeqInStream, SliceStream};
@@ -3049,5 +3107,203 @@ mod tests {
             }));
             assert!(refused.is_err(), "condition {name} was not tested");
         }
+    }
+
+    /// Bytes with long and short repeats among noise, so that the finder
+    /// reports matches of every length and none.
+    fn block_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        while v.len() < len {
+            let run = 1 + rng.below(300) as usize;
+            if v.len() > 8 && rng.below(3) != 0 {
+                let back = 1 + rng.below(v.len().min(70_000) as u32) as usize;
+                for _ in 0..run {
+                    v.push(v[v.len() - back]);
+                }
+            } else {
+                let alphabet = [2, 5, 256][rng.below(3) as usize];
+                for _ in 0..run {
+                    v.push(rng.below(alphabet) as u8);
+                }
+            }
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// The calls the encoder makes on one block - `GetNumAvailableBytes`,
+    /// then `GetMatches` or a `Skip` within what is available - for at most
+    /// `calls` positions, everything the finder answers written to `trace`.
+    /// With `panics` set it ends in a panic, as a coder that failed would.
+    fn drive(mt: &mut MatchFinderMt, seed: u64, calls: usize, panics: bool, trace: &mut Vec<u32>) {
+        let mut rng = Rng(seed);
+        let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
+        for _ in 0..calls {
+            let avail = mt.get_num_available_bytes();
+            trace.push(avail);
+            if avail == 0 {
+                break;
+            }
+            if rng.below(4) == 0 {
+                let n = 1 + rng.below(avail.min(40));
+                mt.skip(n);
+                trace.push(u32::MAX - n);
+            } else {
+                let k = mt.get_matches(&mut d);
+                trace.push(k as u32);
+                trace.extend_from_slice(&d[..k]);
+            }
+            trace.push(u32::from(mt.window()[mt.cur() - 1]));
+        }
+        assert!(!panics, "a coder that fails partway through its block");
+    }
+
+    /// `create`, `InitMt` and `Init` for one block of `len` bytes, the window
+    /// cut to it as `encode_slice` cuts it, or no window with `direct`.
+    fn prepare(mt: &mut MatchFinderMt, kind: MatchFinderKind, len: usize, direct: bool) {
+        mt.mfb.kind = kind;
+        mt.mfb.num_hash_bytes = match kind {
+            MatchFinderKind::Bt2 => 2,
+            MatchFinderKind::Bt3 => 3,
+            MatchFinderKind::Bt4 => 4,
+            _ => 5,
+        };
+        mt.mfb.cut_value = 32;
+        mt.mfb.expected_data_size = len as u64;
+        mt.create(
+            1 << 16,
+            K_NUM_OPTS as u32,
+            LZMA_MATCH_LEN_MAX,
+            LZMA_MATCH_LEN_MAX + 1,
+            len as u64,
+            direct,
+        )
+        .expect("create");
+        mt.init_mt().expect("init_mt");
+        mt.init();
+    }
+
+    /// The direct-input path is `run_block` handing the kept producer threads
+    /// a raw pointer to the caller's block, and taking it back in `Stop` once
+    /// both have stopped. It must find, block after block, what the copying
+    /// path finds - `with_threads` reading the same bytes into the finder's
+    /// own window - and the encoder must write the same bytes through it.
+    ///
+    /// Each block is a fresh allocation, dropped as soon as `run_block`
+    /// returns, so under Miri a producer thread that read the block after
+    /// `Stop` is a use after free, and one that raced the hand-off at either
+    /// end is a data race. The schedule ends blocks at every point the lz
+    /// thread can: before the threads are started at all, just after the
+    /// first hand-off, partway through, at the end, and in a panic, after
+    /// which the kept pair must take the next block as if nothing happened.
+    /// Which of the producers' steps each of those meets is left to the
+    /// scheduler, natively and under Miri's.
+    #[test]
+    fn a_direct_block_is_read_as_the_copied_window_is() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (len, kinds): (usize, &[MatchFinderKind]) = if cfg!(miri) {
+            (1_000, &[MatchFinderKind::Bt4])
+        } else {
+            (
+                300_000,
+                &[
+                    MatchFinderKind::Bt2,
+                    MatchFinderKind::Bt3,
+                    MatchFinderKind::Bt4,
+                    MatchFinderKind::Bt5,
+                ],
+            )
+        };
+        // (block length, calls before the block ends, whether it panics)
+        let schedule = [
+            (len, usize::MAX, false),
+            (len, 0, false),
+            (len, 1, false),
+            (len / 3 + 7, 37, false),
+            (len, usize::MAX, false),
+            (len / 2, 61, true),
+            (1, usize::MAX, false),
+            (0, usize::MAX, false),
+            (len / 5 + 3, usize::MAX, false),
+        ];
+
+        let mut rng = Rng(0xD1EC_7B10_C4ED);
+        let mut direct = MatchFinderMt::new();
+        let mut copied = MatchFinderMt::new();
+        for &kind in kinds {
+            for (i, &(len, calls, panics)) in schedule.iter().enumerate() {
+                let src = block_bytes(&mut rng, len);
+                let seed = u64::from(rng.next()) | 1;
+                let what = format!("{kind:?}, block {i}");
+
+                prepare(&mut copied, kind, len, false);
+                let sh = copied.stream_handle().expect("created");
+                let mut want = Vec::new();
+                let mut input = SliceStream::new(&src);
+                let copied_run = catch_unwind(AssertUnwindSafe(|| {
+                    with_threads(&sh, &mut input, || {
+                        drive(&mut copied, seed, calls, panics, &mut want);
+                        Ok(())
+                    })
+                }));
+
+                prepare(&mut direct, kind, len, true);
+                let sh = direct.block_handle().expect("spawn").expect("created");
+                let mut got = Vec::new();
+                let block = src.clone();
+                let direct_run = catch_unwind(AssertUnwindSafe(|| {
+                    run_block(&sh, &block, || {
+                        drive(&mut direct, seed, calls, panics, &mut got);
+                        Ok(())
+                    })
+                }));
+                drop(block);
+
+                assert_eq!(copied_run.is_err(), panics, "{what}");
+                assert_eq!(direct_run.is_err(), panics, "{what}");
+                if !panics {
+                    assert_eq!(copied_run.unwrap(), Ok(()), "{what}");
+                    assert_eq!(direct_run.unwrap(), Ok(()), "{what}");
+                }
+                assert!(got == want, "{what}: the direct block found other matches");
+                if calls == usize::MAX {
+                    assert_eq!(
+                        want.last(),
+                        Some(&0),
+                        "{what}: the block was not read to its end"
+                    );
+                }
+                assert_eq!(direct.windows(), (0, 0), "{what}: the block is still held");
+                assert_eq!(direct.spawns, 1, "{what}: one pair for every block");
+            }
+        }
+
+        // And the encoder: block coders that read their blocks in place write
+        // what the stream path, which copies them into the window, writes.
+        let (len, block) = if cfg!(miri) {
+            (1_500, 600)
+        } else {
+            (400_000, 1 << 16)
+        };
+        let src = block_bytes(&mut rng, len);
+        let props = LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(1 << 12)
+            .with_num_threads(2);
+        let mut in_place = Lzma2Encoder::new(&props).unwrap();
+        in_place.set_block_size(block);
+        in_place.set_threads(2);
+        in_place.set_data_size(len as u64);
+        let mut got = Vec::new();
+        in_place.encode_slice(&src, &mut got).unwrap();
+        let mut copying = Lzma2Encoder::new(&props).unwrap();
+        copying.set_block_size(block);
+        copying.set_data_size(len as u64);
+        let mut want = Vec::new();
+        copying
+            .encode_send(&mut SliceStream::new(&src), &mut want)
+            .unwrap();
+        assert!(got == want, "reading blocks in place changed the output");
     }
 }

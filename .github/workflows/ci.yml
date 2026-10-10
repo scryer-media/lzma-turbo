@@ -570,7 +570,14 @@ jobs:
   # the match finder's window and tables over from `alloc_zeroed` through
   # `Vec::from_raw_parts`; its test allocates every `Zeroable` type at odd
   # lengths, reads, writes, grows and frees each, and Miri checks the layout,
-  # the initialisation and the free.
+  # the initialisation and the free. Third, the direct-input hand-off in
+  # `run_block` (`src/enc/lz_find_mt.rs`), which gives the kept producer
+  # threads a raw pointer to the caller's block and takes it back in `Stop`;
+  # its differential test reads the same blocks through it and through the
+  # copying window path, ending blocks before the threads start, just after
+  # the first hand-off, partway, at the end and in a panic, and drops each
+  # block as soon as `run_block` returns, so that under Miri a read after
+  # `Stop` is a use after free and a racing hand-off is a data race.
   unchecked-kernel-miri:
     name: unchecked-kernel-miri
     runs-on: ubuntu-24.04
@@ -588,16 +595,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: The tree walk's tests and the zeroed allocation's test under Miri
+      - name: The tree walk's, the zeroed allocation's and the direct block's tests under Miri
         run: |
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
             --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_
+            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
+            enc::lz_find_mt::tests::a_direct_block_
       - name: The same tests in the release build
         run: |
           cargo test --locked --release --lib \
             --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_
+            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
+            enc::lz_find_mt::tests::a_direct_block_
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.
