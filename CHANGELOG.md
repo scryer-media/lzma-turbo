@@ -45,6 +45,26 @@
   longer makes the whole window and son table resident, and an encoder built
   for each small stream skips a fill the size of its tables. Output is
   unchanged. CI checks the allocation under Miri.
+- On Linux the encoder advises transparent huge pages
+  (`madvise(MADV_HUGEPAGE)`) for its large buffers - the match finder's
+  window, hash and son tables, the threaded finder's buffers and each block
+  thread's input - as the SDK's `BigAlloc` does for the same buffers. Only
+  the whole 2 MiB pages inside each buffer are advised; the allocation is
+  unchanged, the advice is best-effort and a kernel that refuses it changes
+  nothing, and no other system is touched. The tree walk misses the cache on
+  nearly every node, and huge pages take the TLB miss off each of those.
+  Verified, median of three on an x86-64 Linux host with transparent huge
+  pages in `madvise` mode, a 256 MiB level-5 two-block-thread encode (four
+  threads): 13.51 s, down from 14.70 s (1.09x), user CPU 51.1 s from 55.0 s;
+  the output is byte-identical.
+- A block thread's threaded match finder starts its hash and tree threads for
+  its first block and keeps them for every block after, as the SDK keeps the
+  threads `MatchFinderMt_Create` starts, where it started and joined a pair
+  for each block. The block is handed to the kept pair rather than to a
+  fresh one. Verified, median of three on the same host and encode: 13.74 s
+  against 13.55 s before (0.99x, inside the run-to-run spread of the before
+  arm, 13.26-14.20 s), so it is not a speed change at eight blocks a stream;
+  the output is byte-identical.
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.

@@ -117,7 +117,11 @@ fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     // valid `T` (`Zeroable`). The `Vec` takes ownership and frees it with the
     // same layout. CI checks this under Miri: the `unchecked-kernel-miri` job
     // runs `a_zeroed_vec_is_zeroes_of_every_zeroable_type`.
-    Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
+    let v = unsafe { Vec::from_raw_parts(ptr, len, len) };
+    // Before any page of it is touched, so the faults that fill it come in
+    // huge pages.
+    crate::enc::huge_pages::advise_vec(&v);
+    Ok(v)
 }
 
 /// C: `CMatchFinder`.
@@ -146,6 +150,11 @@ pub(crate) struct MatchFinder {
     pub(crate) cut_value: u32,
 
     pub(crate) buf_base: Vec<u8>,
+    /// C: `p->directInput`: the input is a slice the threaded finder reads in
+    /// place, so [`MatchFinder::create`] allocates no window. Only
+    /// [`crate::enc::lz_find_mt::MatchFinderMt`] sets it; this finder always
+    /// reads through its window.
+    pub(crate) direct_input: bool,
 
     pub(crate) block_size: u32,
     pub(crate) keep_size_before: u32,
@@ -243,6 +252,7 @@ impl MatchFinder {
             // C: MatchFinder_SetDefaultSettings.
             cut_value: 32,
             buf_base: Vec::new(),
+            direct_input: false,
             block_size: 0,
             keep_size_before: 0,
             keep_size_after: 0,
@@ -591,8 +601,10 @@ impl MatchFinder {
         // tables below are: an encoder that is given one input after another
         // then allocates for the largest of them once. `block_size` is the
         // window's length from here on, whatever the allocation's.
+        // C: with `directInput` there is no window to create. One kept from
+        // an earlier stream stays for the next stream that needs it.
         self.block_size = plan.block_size;
-        if self.buf_base.len() < plan.block_size as usize {
+        if !self.direct_input && self.buf_base.len() < plan.block_size as usize {
             self.buf_base = Vec::new();
             self.buf_base = zeroed_vec(plan.block_size as usize)?;
             #[cfg(test)]
