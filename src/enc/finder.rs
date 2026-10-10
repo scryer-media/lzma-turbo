@@ -17,12 +17,26 @@ use crate::error::Error;
 #[cfg(feature = "std")]
 use crate::enc::lz_find_mt::MatchFinderMt;
 
+/// Which finder `LzmaEnc_Alloc` picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinderMode {
+    /// C: `MatchFinder_CreateVTable`, a hash chain, or a fast-mode tree.
+    St,
+    /// C: `MatchFinderMt_CreateVTable`, `p->mtMode`.
+    Threaded,
+    /// The threaded finder's stages run on the caller's thread a block at a
+    /// time: a binary tree in normal mode held to one thread, where the C
+    /// takes the single-threaded finder. The matches are the same; see
+    /// `crate::enc::lz_find_mt::MatchFinderMt::get_next_block_bt`.
+    Inline,
+}
+
 /// C: `p->matchFinderObj` together with the vtable that goes with it.
 pub(crate) enum Finder {
     /// C: `MFB` with `MatchFinder_CreateVTable`.
     St(MatchFinder),
     /// C: `p->matchFinderMt` with `MatchFinderMt_CreateVTable`, used when
-    /// `p->mtMode`.
+    /// `p->mtMode`, and with no threads in [`FinderMode::Inline`].
     #[cfg(feature = "std")]
     Mt(MatchFinderMt),
 }
@@ -56,12 +70,25 @@ impl Finder {
         }
     }
 
-    /// Whether this is the threaded finder.
+    /// Whether this is the threaded finder, with its threads.
     #[cfg(test)]
     pub(crate) fn is_mt(&self) -> bool {
         #[cfg(feature = "std")]
         {
-            matches!(self, Finder::Mt(_))
+            matches!(self, Finder::Mt(mt) if !mt.is_inline())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this is the threaded finder run on the caller's thread.
+    #[cfg(test)]
+    pub(crate) fn is_inline(&self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            matches!(self, Finder::Mt(mt) if mt.is_inline())
         }
         #[cfg(not(feature = "std"))]
         {
@@ -84,7 +111,9 @@ impl Finder {
     /// promise [`MatchFinder::create`] documents. `direct` asks the threaded
     /// finder for no window, the input being a block it will read in place
     /// (`MatchFinderMt::create`); the single-threaded finder always reads
-    /// through its window and ignores it.
+    /// through its window and ignores it. `inline` is
+    /// [`FinderMode::Inline`], for the threaded finder.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -93,6 +122,7 @@ impl Finder {
         keep_add_buffer_after: u32,
         data_limit: u64,
         #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] inline: bool,
     ) -> Result<(), Error> {
         match self {
             Finder::St(mf) => {
@@ -115,20 +145,22 @@ impl Finder {
                 keep_add_buffer_after,
                 data_limit,
                 direct,
+                inline,
             ),
         }
     }
 
     /// What this configuration would allocate, without allocating it.
     ///
-    /// `mt` is `p->mtMode` as `LzmaEnc_Alloc` will compute it, not
-    /// [`Finder::is_mt`]: the estimate is taken before anything is allocated,
-    /// when the finder is still the single-threaded one it was constructed as.
-    /// `direct` is [`Finder::create`]'s: the threaded finder then counts no
-    /// window, and the single-threaded one, which always has one, ignores it.
+    /// `mode` is the finder `LzmaEnc_Alloc` will pick, not the one in use:
+    /// the estimate is taken before anything is allocated, when the finder is
+    /// still the single-threaded one it was constructed as. `direct` is
+    /// [`Finder::create`]'s: the threaded finder, inline or not, then counts
+    /// no window, and the single-threaded one, which always has one, ignores
+    /// it.
     pub(crate) fn mem_usage(
         &mut self,
-        mt: bool,
+        mode: FinderMode,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
@@ -136,7 +168,7 @@ impl Finder {
         #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
     ) -> Result<u64, Error> {
         #[cfg(feature = "std")]
-        if mt {
+        if mode != FinderMode::St {
             return MatchFinderMt::mem_usage(
                 self.cfg(),
                 history_size,
@@ -144,10 +176,11 @@ impl Finder {
                 match_max_len,
                 keep_add_buffer_after,
                 direct,
+                mode == FinderMode::Inline,
             );
         }
         #[cfg(not(feature = "std"))]
-        let _ = mt;
+        let _ = mode;
         self.cfg().mem_usage(
             history_size,
             keep_add_buffer_before,
@@ -200,17 +233,21 @@ impl Finder {
         match self {
             Finder::St(mf) => mf.skip(stream, num),
             #[cfg(feature = "std")]
-            Finder::Mt(mt) => mt.skip(num),
+            Finder::Mt(mt) => mt.skip(stream, num),
         }
     }
 
-    /// C: `IMatchFinder2::GetNumAvailableBytes`.
+    /// C: `IMatchFinder2::GetNumAvailableBytes`. `stream` is read only by
+    /// the inline finder, which fills its next block here.
     #[inline]
-    pub(crate) fn get_num_available_bytes(&mut self) -> u32 {
+    pub(crate) fn get_num_available_bytes(
+        &mut self,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] stream: &mut dyn SeqInStream,
+    ) -> u32 {
         match self {
             Finder::St(mf) => mf.get_num_available_bytes(),
             #[cfg(feature = "std")]
-            Finder::Mt(mt) => mt.get_num_available_bytes(),
+            Finder::Mt(mt) => mt.get_num_available_bytes(stream),
         }
     }
 

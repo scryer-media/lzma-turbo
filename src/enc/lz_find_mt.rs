@@ -993,8 +993,17 @@ struct Common {
     tab: *mut u32,
     /// C: `p->hashBuf`, with `p->btBuf` following it in the same allocation
     /// exactly as `MatchFinderMt_Create` lays it out, and two more words after
-    /// that for `p->failureBuf`.
+    /// that for `p->failureBuf`. Inline, one block of each.
     bufs: *mut u32,
+    /// Where `btBuf` starts in `bufs`, in words: `HASH_BUFFER_SIZE`, or
+    /// `HASH_BLOCK_SIZE` inline.
+    bt_base: usize,
+    /// Where the two `failureBuf` words start in `bufs`.
+    park_base: usize,
+    /// No threads: the caller's thread runs the hash and bt stages a block
+    /// at a time when it needs the next block of matches. See
+    /// [`MatchFinderMt::get_next_block_bt`].
+    inline: bool,
 
     /// C: `mf->hashMask`.
     hash_mask: u32,
@@ -1036,6 +1045,9 @@ impl Common {
             direct: false,
             tab: core::ptr::NonNull::dangling().as_ptr(),
             bufs: core::ptr::NonNull::dangling().as_ptr(),
+            bt_base: 0,
+            park_base: 0,
+            inline: false,
             hash_mask: 0,
             fixed_hash_size: 0,
             son_base: 0,
@@ -1140,10 +1152,10 @@ impl Common {
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_block(&self, offset: usize) -> &mut [u32] {
         // SAFETY: as `hash_block`; `offset` names a whole block of `bt_buf`,
-        // which starts `HASH_BUFFER_SIZE` words into `bufs`.
+        // which starts `bt_base` words into `bufs`.
         unsafe {
             core::slice::from_raw_parts_mut(
-                self.bufs.add(HASH_BUFFER_SIZE + offset),
+                self.bufs.add(self.bt_base + offset),
                 BT_BLOCK_SIZE as usize,
             )
         }
@@ -1157,12 +1169,10 @@ impl Common {
     /// Caller must be the lz thread, the only one that touches them.
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_park(&self) -> &mut [u32] {
-        // SAFETY: `bufs` is `HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2` words long
+        // SAFETY: `bufs` is `park_base + 2` words long
         // (`MatchFinderMt::create`), and no other thread forms a reference
         // to the last two.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE + BT_BUFFER_SIZE), 2)
-        }
+        unsafe { core::slice::from_raw_parts_mut(self.bufs.add(self.park_base), 2) }
     }
 
     /// The block of `bt_buf` the lz thread is reading at `pos`, in
@@ -1175,6 +1185,7 @@ impl Common {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_held(&self, pos: usize) -> (usize, &mut [u32]) {
+        // Inline there is one block, so `pos` is either in it or parked.
         if pos >= BT_BUFFER_SIZE {
             // SAFETY: the caller is the lz thread.
             (BT_BUFFER_SIZE, unsafe { self.bt_park() })
@@ -1196,7 +1207,10 @@ impl Common {
     unsafe fn bt_all(&self) -> &mut [u32] {
         // SAFETY: nothing else is running.
         unsafe {
-            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE), BT_BUFFER_SIZE + 2)
+            core::slice::from_raw_parts_mut(
+                self.bufs.add(self.bt_base),
+                self.park_base + 2 - self.bt_base,
+            )
         }
     }
 }
@@ -1650,6 +1664,29 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
     }
 }
 
+/// One pass of `HashThreadFunc`'s loop on the caller's thread, for the
+/// inline finder: slide the window if it needs it, read, and fill the one
+/// `hash_buf` block. The C's order, without the semaphores or the critical
+/// sections: nothing else runs, and nothing holds the window while this
+/// moves it.
+///
+/// C: the body of the inner `for (;;)` in `HashThreadFunc`
+/// (`C/LzFindMt.c:466-542`).
+fn hash_stage_inline(sh: &MtShared, stream: &mut dyn SeqInStream) -> usize {
+    // SAFETY: inline, the caller's thread is the only one there is, and it
+    // enters the hash thread's cell only here, from the bt stage, which holds
+    // `bt_state` and nothing else.
+    let h = unsafe { &mut *sh.hash_state.get() };
+    // C: `if (MatchFinder_NeedMove(mf)) { ... MatchFinder_MoveBlock(mf); ...
+    // continue; }`, which comes straight back here.
+    while sh.need_move(h) {
+        sh.move_block(h);
+    }
+    sh.read_if_required(h, stream);
+    hash_fill_block(sh, h, 0);
+    0
+}
+
 /// One `hash_buf` block of `HashThreadFunc`'s loop: the heads for the next
 /// run of positions, or the end-of-stream header once the bytes run out.
 fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
@@ -1711,7 +1748,16 @@ fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
 
 /// C: `BtGetMatches`. Fills one `bt_buf` block from the head distances the
 /// hash thread produced, pulling more `hash_buf` blocks as it needs them.
-fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
+///
+/// `next_heads` hands over the next filled `hash_buf` block and returns its
+/// offset: on the bt thread that is `MtSync_GetNextBlock(&p->hashSync)`, and
+/// inline it runs the hash stage for one block ([`hash_stage_inline`]).
+fn bt_get_matches(
+    sh: &MtShared,
+    b: &mut BtState,
+    block_offset: usize,
+    mut next_heads: impl FnMut() -> usize,
+) {
     let c = sh.common();
     let mut num_processed: u32 = 0;
     let mut cur_pos: u32 = 2;
@@ -1737,10 +1783,10 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
         if b.hash_buf_pos == b.hash_buf_pos_limit {
             let avail;
             {
-                let bi = sh.hash_sync.get_next_block();
-                // The window may have slid while `hash_sync.cs` was open.
+                let k = next_heads() as u32;
+                // The window may have slid while `hash_sync.cs` was open, or
+                // inline, while `next_heads` ran the hash stage.
                 sh.apply_bt_shift(b);
-                let k = hash_block_offset(bi) as u32;
                 // SAFETY: `get_next_block` has just handed this block over.
                 let h = unsafe { c.hash_block(k as usize) };
                 if h[0] < 2 {
@@ -1910,7 +1956,9 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     }
     let block_offset = bt_block_offset(global_block_index);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bt_get_matches(sh, b, block_offset);
+        bt_get_matches(sh, b, block_offset, || {
+            hash_block_offset(sh.hash_sync.get_next_block())
+        });
     }));
     if run.is_err() {
         b.failure = true;
@@ -1961,6 +2009,41 @@ fn bt_thread_func(sh: &MtShared) {
 // LZ THREAD - the public face
 // ---------------------------------------------------------------------------
 
+/// The buffer layout and the keep sizes for one mode: `(hash_buf words,
+/// bt_buf words, extra keep before, extra keep after)`.
+///
+/// Threaded, the C's (`MatchFinderMt_Create`, `C/LzFindMt.c:856-879`): two
+/// hash blocks and sixteen bt blocks, and a window kept back by both rings,
+/// because the lz thread may be that far behind the hash thread when it
+/// slides the window.
+///
+/// Inline, one block of each, and the window kept back by one bt block. The
+/// hash stage runs only when the bt stage has used every head it was given,
+/// so it slides the window with the bt stage at its own position, and the lz
+/// stage at most the bt block it is filling behind: fewer than
+/// `BT_BLOCK_SIZE` positions, as every position takes at least one word of
+/// it. The keep after is the C's in both modes: the hash stage hashes up to
+/// a block ahead of what it read, and every position it hashes still needs
+/// `keepAddBufferAfter` bytes behind it, for the same matches as the
+/// single-threaded finder's.
+const fn layout(inline: bool) -> (usize, usize, u32, u32) {
+    if inline {
+        (
+            HASH_BLOCK_SIZE as usize,
+            BT_BLOCK_SIZE as usize,
+            BT_BLOCK_SIZE,
+            HASH_BLOCK_SIZE,
+        )
+    } else {
+        (
+            HASH_BUFFER_SIZE,
+            BT_BUFFER_SIZE,
+            (HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32,
+            HASH_BLOCK_SIZE,
+        )
+    }
+}
+
 /// The threaded match finder.
 ///
 /// C: `CMatchFinderMt` plus the `IMatchFinder2` vtable
@@ -2007,7 +2090,10 @@ impl MatchFinderMt {
 
     /// C: `MatchFinderMt_Create`. `direct` is the C's `directInput`: the
     /// stream is a block [`run_block`] will hand the finder in place, and no
-    /// window is allocated for it.
+    /// window is allocated for it. `inline` asks for no threads: the caller's
+    /// thread runs both producer stages a block at a time, and one block of
+    /// each buffer is allocated (see [`layout`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -2016,10 +2102,19 @@ impl MatchFinderMt {
         keep_add_buffer_after: u32,
         data_limit: u64,
         direct: bool,
+        inline: bool,
     ) -> Result<(), Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
         }
+        if inline {
+            // A pair kept for blocks by an earlier threaded `create` must
+            // not wait on this finder's buffers: an inline one never stops
+            // it.
+            self.retire_threads();
+        }
+        let (hash_words, bt_words, add_before, add_after) = layout(inline);
+        let bufs_len = hash_words + bt_words + 2;
 
         // C: `MatchFinderMt_Create` keeps `hashBuf` once it has it, and
         // `MatchFinder_Create` keeps a window and tables that are long enough.
@@ -2046,18 +2141,17 @@ impl MatchFinderMt {
         self.mfb.hash = core::mem::take(&mut own.tab);
         let mut bufs = core::mem::take(&mut own.bufs);
         self.sh = Some(Arc::clone(&sh));
-        if bufs.len() == HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2 {
+        if bufs.len() == bufs_len {
             // Every word of a hash block and of a bt block is written by the
             // thread that fills it before the thread it is handed to reads it.
             // The two words past `btBuf` are the exception: the lz thread
             // parks on them after a failure.
-            bufs[HASH_BUFFER_SIZE + BT_BUFFER_SIZE..].fill(0);
+            bufs[hash_words + bt_words..].fill(0);
         } else {
             bufs = Vec::new();
-            bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
-                .map_err(|_| Error::Alloc)?;
+            bufs.try_reserve_exact(bufs_len).map_err(|_| Error::Alloc)?;
             crate::enc::huge_pages::advise_vec(&bufs);
-            bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+            bufs.resize(bufs_len, 0);
             #[cfg(test)]
             {
                 self.mfb.allocs += 1;
@@ -2065,10 +2159,10 @@ impl MatchFinderMt {
         }
 
         let before = keep_add_buffer_before
-            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .checked_add(add_before)
             .ok_or(Error::Param)?;
         let after = keep_add_buffer_after
-            .checked_add(HASH_BLOCK_SIZE)
+            .checked_add(add_after)
             .ok_or(Error::Param)?;
         self.mfb.direct_input = direct;
         self.mfb
@@ -2116,6 +2210,9 @@ impl MatchFinderMt {
             direct,
             tab: tab.as_mut_ptr(),
             bufs: bufs.as_mut_ptr(),
+            bt_base: hash_words,
+            park_base: hash_words + bt_words,
+            inline,
             hash_mask: self.mfb.hash_mask,
             fixed_hash_size: self.mfb.fixed_hash_size as usize,
             son_base,
@@ -2146,6 +2243,7 @@ impl MatchFinderMt {
     /// left out with `direct`, as [`MatchFinderMt::create`] leaves it out.
     /// `mfb` is the `CMatchFinder` carrying the settings; nothing is
     /// allocated.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mem_usage(
         mfb: &mut MatchFinder,
         history_size: u32,
@@ -2153,18 +2251,20 @@ impl MatchFinderMt {
         match_max_len: u32,
         keep_add_buffer_after: u32,
         direct: bool,
+        inline: bool,
     ) -> Result<u64, Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
         }
+        let (hash_words, bt_words, add_before, add_after) = layout(inline);
         let before = keep_add_buffer_before
-            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .checked_add(add_before)
             .ok_or(Error::Param)?;
         let after = keep_add_buffer_after
-            .checked_add(HASH_BLOCK_SIZE)
+            .checked_add(add_after)
             .ok_or(Error::Param)?;
         let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
-        Ok(base + (HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2) as u64 * 4)
+        Ok(base + (hash_words + bt_words + 2) as u64 * 4)
     }
 
     /// What this finder has allocated, in bytes: the window, the tables, and
@@ -2194,6 +2294,10 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
     pub(crate) fn init_mt(&self) -> Result<(), Error> {
         let sh = self.shared();
+        if sh.common().inline {
+            // No threads, so no semaphores to count blocks with.
+            return Ok(());
+        }
         sh.hash_sync.init(HASH_NUM_BLOCKS)?;
         sh.bt_sync.init(BT_NUM_BLOCKS)
     }
@@ -2219,6 +2323,12 @@ impl MatchFinderMt {
 
             // C: `MatchFinder_Init_LowHash`.
             c.low_hash().fill(K_EMPTY_HASH_VALUE);
+            if c.inline {
+                // C: `MatchFinder_Init_HighHash`, which the hash thread runs
+                // when it starts (`C/LzFindMt.c:464`); inline the hash stage
+                // is this thread's.
+                c.high_hash()[..=c.hash_mask as usize].fill(K_EMPTY_HASH_VALUE);
+            }
 
             let b = &mut *sh.bt_state.get();
             b.hash_buf_pos = 0;
@@ -2252,7 +2362,17 @@ impl MatchFinderMt {
     /// must never wait on the same sync objects.
     pub(crate) fn stream_handle(&mut self) -> Option<Arc<MtShared>> {
         self.retire_threads();
+        if self.is_inline() {
+            // No threads to start: the encoder hands the stream to the
+            // finder's own calls instead.
+            return None;
+        }
         self.sh.clone()
+    }
+
+    /// Whether this finder runs its stages on the caller's thread.
+    pub(crate) fn is_inline(&self) -> bool {
+        self.sh.as_deref().is_some_and(|sh| sh.common().inline)
     }
 
     /// The handle [`run_block`] needs, with this finder's pair of producer
@@ -2266,7 +2386,9 @@ impl MatchFinderMt {
         let Some(sh) = self.sh.clone() else {
             return Ok(None);
         };
-        if self.threads.is_none() {
+        // Inline, `run_block` only sets the block the hash stage reads; no
+        // thread is started, and its stop finds none running.
+        if self.threads.is_none() && !sh.common().inline {
             // Set before the spawns: the bt thread calls
             // `hash_sync.stop_writing()`, which does nothing unless the flag
             // is already up.
@@ -2352,8 +2474,10 @@ impl MatchFinderMt {
         })
     }
 
-    /// C: `MatchFinderMt_GetNextBlock_Bt`.
-    fn get_next_block_bt(&mut self) -> u32 {
+    /// C: `MatchFinderMt_GetNextBlock_Bt`. Inline, the block is filled here
+    /// instead of waited for: the bt stage runs for one block, running the
+    /// hash stage over `stream` whenever it has used its heads.
+    fn get_next_block_bt(&mut self, stream: &mut dyn SeqInStream) -> u32 {
         let sh = self.shared();
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
@@ -2361,8 +2485,19 @@ impl MatchFinderMt {
         if l.failure_lz_bt {
             l.bt_buf_pos = BT_BUFFER_SIZE;
         } else {
-            let bi = sh.bt_sync.get_next_block();
-            // The window may have slid while `bt_sync.cs` was open.
+            let bi = if c.inline {
+                // SAFETY: inline, this thread is the bt thread too, and holds
+                // no other borrow of `bt_state`. The block it fills is the
+                // one this thread read from last, which it is done with.
+                let b = unsafe { &mut *sh.bt_state.get() };
+                // C: `BtFillBlock` without the lock, `C/LzFindMt.c:740-757`.
+                bt_get_matches(sh, b, 0, || hash_stage_inline(sh, stream));
+                0
+            } else {
+                sh.bt_sync.get_next_block()
+            };
+            // The window may have slid while `bt_sync.cs` was open, or
+            // inline, while the hash stage ran.
             sh.apply_lz_shift(l);
             let base = bt_block_offset(bi);
             // SAFETY: `get_next_block` has just handed this block over, and
@@ -2396,22 +2531,23 @@ impl MatchFinderMt {
 
     /// C: `GET_NEXT_BLOCK_IF_REQUIRED`.
     #[inline]
-    fn next_block_if_required(&mut self) {
+    fn next_block_if_required(&mut self, stream: &mut dyn SeqInStream) {
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &*self.shared().lz_state.get() };
         if l.bt_buf_pos == l.bt_buf_pos_limit {
-            self.get_next_block_bt();
+            self.get_next_block_bt(stream);
         }
     }
 
-    /// C: `MatchFinderMt_GetNumAvailableBytes`.
-    pub(crate) fn get_num_available_bytes(&mut self) -> u32 {
+    /// C: `MatchFinderMt_GetNumAvailableBytes`. `stream` is read only
+    /// inline; threaded, the hash thread holds the input.
+    pub(crate) fn get_num_available_bytes(&mut self, stream: &mut dyn SeqInStream) -> u32 {
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &*self.shared().lz_state.get() };
         if l.bt_buf_pos != l.bt_buf_pos_limit {
             return l.bt_num_avail_bytes;
         }
-        self.get_next_block_bt()
+        self.get_next_block_bt(stream)
     }
 }
 
@@ -2531,6 +2667,17 @@ impl MatchFinderMt {
         let len = bt[bt_pos];
         bt_pos += 1;
 
+        // Inline stands in for the one-thread finder, so its last few
+        // positions follow C `GET_MATCHES_HEADER(minLen)` in LzFind.c: with
+        // fewer than `num_hash_bytes` bytes left there are no matches. The
+        // threads mix hash matches there, as `MatchFinderMt_GetMatches` does.
+        if c.inline && l.bt_num_avail_bytes < c.num_hash_bytes {
+            l.bt_num_avail_bytes -= 1;
+            l.bt_buf_pos = base + bt_pos + len as usize;
+            self.increase_lz_pos();
+            return 0;
+        }
+
         if c.mix == Mix::None {
             let bt_lim = bt_pos + len as usize;
             l.bt_buf_pos = base + bt_lim;
@@ -2584,8 +2731,9 @@ impl MatchFinderMt {
     }
 
     /// C: `MatchFinderMt0_Skip` / `MatchFinderMt2_Skip` / `MatchFinderMt3_Skip`
-    /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair.
-    pub(crate) fn skip(&mut self, mut num: u32) {
+    /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair. `stream` is
+    /// read only inline.
+    pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
         let min_len = match self.shared().common().mix {
             Mix::None => 0,
             Mix::Two => 2,
@@ -2595,7 +2743,7 @@ impl MatchFinderMt {
             Mix::Three | Mix::Four => 3,
         };
         loop {
-            self.next_block_if_required();
+            self.next_block_if_required(stream);
             let sh = self.shared();
             let c = sh.common();
             // SAFETY: the lz thread owns `lz_state` and the low hash, and may
@@ -2781,11 +2929,12 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
+        BT_BLOCK_SIZE, BT_BUFFER_SIZE, HASH_BLOCK_SIZE, HASH_BUFFER_SIZE, MatchFinder,
         MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, run_block, with_threads,
     };
     use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
-    use crate::enc::stream::{SeqInStream, SliceStream};
+    use crate::enc::stream::{NoStream, SeqInStream, SliceStream};
     use crate::enc::{Lzma2Encoder, LzmaEncProps};
     use crate::error::Error;
 
@@ -2874,6 +3023,7 @@ mod tests {
             LZMA_MATCH_LEN_MAX + 1,
             u64::MAX,
             false,
+            false,
         )
         .expect("create");
         mt.init_mt().expect("init_mt");
@@ -2887,9 +3037,9 @@ mod tests {
             given: false,
         };
         let r = with_threads(&sh, &mut input, || {
-            let promised = mt.get_num_available_bytes();
+            let promised = mt.get_num_available_bytes(&mut NoStream);
             assert_eq!(promised as usize, src.len(), "first block's promise");
-            mt.skip(promised);
+            mt.skip(&mut NoStream, promised);
             Ok(mt.failed())
         });
         assert_eq!(r, Ok(true), "the stream panic was not reported");
@@ -3158,18 +3308,30 @@ mod tests {
     /// then `GetMatches` or a `Skip` within what is available - for at most
     /// `calls` positions, everything the finder answers written to `trace`.
     /// With `panics` set it ends in a panic, as a coder that failed would.
-    fn drive(mt: &mut MatchFinderMt, seed: u64, calls: usize, panics: bool, trace: &mut Vec<u32>) {
+    /// `stream` is what an inline finder reads; the threaded one ignores it.
+    fn drive(
+        mt: &mut MatchFinderMt,
+        stream: &mut dyn SeqInStream,
+        seed: u64,
+        calls: usize,
+        panics: bool,
+        trace: &mut Vec<u32>,
+    ) {
         let mut rng = Rng(seed);
         let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
         for _ in 0..calls {
-            let avail = mt.get_num_available_bytes();
-            trace.push(avail);
+            let avail = mt.get_num_available_bytes(stream);
+            // What a coder can see of it: the one-thread finder keeps
+            // `match_max_len + LZMA_MATCH_LEN_MAX + 1` bytes ahead (C
+            // `keepSizeAfter`), and no look-ahead limit in the coder exceeds
+            // that; past it each finder reads the stream in its own steps.
+            trace.push(avail.min(2 * LZMA_MATCH_LEN_MAX + 1));
             if avail == 0 {
                 break;
             }
             if rng.below(4) == 0 {
                 let n = 1 + rng.below(avail.min(40));
-                mt.skip(n);
+                mt.skip(stream, n);
                 trace.push(u32::MAX - n);
             } else {
                 let k = mt.get_matches(&mut d);
@@ -3181,9 +3343,41 @@ mod tests {
         assert!(!panics, "a coder that fails partway through its block");
     }
 
+    /// [`drive`] over the one-thread finder: the same calls from the same
+    /// seed, and the same trace.
+    fn drive_st(mf: &mut MatchFinder, stream: &mut dyn SeqInStream, seed: u64) -> Vec<u32> {
+        let mut rng = Rng(seed);
+        let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
+        let mut trace = Vec::new();
+        loop {
+            let avail = mf.get_num_available_bytes();
+            trace.push(avail.min(2 * LZMA_MATCH_LEN_MAX + 1));
+            if avail == 0 {
+                return trace;
+            }
+            if rng.below(4) == 0 {
+                let n = 1 + rng.below(avail.min(40));
+                mf.skip(stream, n);
+                trace.push(u32::MAX - n);
+            } else {
+                let k = mf.get_matches(stream, &mut d);
+                trace.push(k as u32);
+                trace.extend_from_slice(&d[..k]);
+            }
+            trace.push(u32::from(mf.buf_base[mf.cur() - 1]));
+        }
+    }
+
     /// `create`, `InitMt` and `Init` for one block of `len` bytes, the window
-    /// cut to it as `encode_slice` cuts it, or no window with `direct`.
-    fn prepare(mt: &mut MatchFinderMt, kind: MatchFinderKind, len: usize, direct: bool) {
+    /// cut to it as `encode_slice` cuts it, or no window with `direct`;
+    /// with no threads at all with `inline`.
+    fn prepare(
+        mt: &mut MatchFinderMt,
+        kind: MatchFinderKind,
+        len: usize,
+        direct: bool,
+        inline: bool,
+    ) {
         mt.mfb.kind = kind;
         mt.mfb.num_hash_bytes = match kind {
             MatchFinderKind::Bt2 => 2,
@@ -3202,6 +3396,7 @@ mod tests {
             LZMA_MATCH_LEN_MAX + 1,
             len as u64,
             direct,
+            inline,
         )
         .expect("create");
         mt.init_mt().expect("init_mt");
@@ -3271,24 +3466,24 @@ mod tests {
                 let seed = u64::from(rng.next()) | 1;
                 let what = format!("{kind:?}, block {i}");
 
-                prepare(&mut copied, kind, len, false);
+                prepare(&mut copied, kind, len, false, false);
                 let sh = copied.stream_handle().expect("created");
                 let mut want = Vec::new();
                 let mut input = SliceStream::new(&src);
                 let copied_run = catch_unwind(AssertUnwindSafe(|| {
                     with_threads(&sh, &mut input, || {
-                        drive(&mut copied, seed, calls, panics, &mut want);
+                        drive(&mut copied, &mut NoStream, seed, calls, panics, &mut want);
                         Ok(())
                     })
                 }));
 
-                prepare(&mut direct, kind, len, true);
+                prepare(&mut direct, kind, len, true, false);
                 let sh = direct.block_handle().expect("spawn").expect("created");
                 let mut got = Vec::new();
                 let block = src.clone();
                 let direct_run = catch_unwind(AssertUnwindSafe(|| {
                     run_block(&sh, &block, || {
-                        drive(&mut direct, seed, calls, panics, &mut got);
+                        drive(&mut direct, &mut NoStream, seed, calls, panics, &mut got);
                         Ok(())
                     })
                 }));
@@ -3339,5 +3534,262 @@ mod tests {
             .encode_send(&mut SliceStream::new(&src), &mut want)
             .unwrap();
         assert!(got == want, "reading blocks in place changed the output");
+    }
+
+    /// The inline finder runs the hash and bt stages on the caller's thread a
+    /// block at a time, and stands in for the one-thread finder, so it must
+    /// answer every call as that finder does: through its own window, read from the stream it is handed and
+    /// slid as the stream runs past it, and reading a block in place through
+    /// `run_block`, where no thread is started.
+    ///
+    /// Natively the window slides many times over each input (a small
+    /// dictionary, no data limit), and the high-hash and son tables wrap.
+    /// Under Miri the inputs are small; what it checks is the inline path's
+    /// borrows of the shared state, which the stages now take in turn on one
+    /// thread.
+    #[test]
+    fn the_inline_finder_finds_what_the_one_thread_finder_finds() {
+        // `prepare`'s dictionary, which the direct block is set up with.
+        let (lens, kinds, dict): (&[usize], &[MatchFinderKind], u32) = if cfg!(miri) {
+            (&[0, 1, 700], &[MatchFinderKind::Bt4], 1 << 12)
+        } else {
+            (
+                &[0, 1, 5, 4_000, 300_000, 1_500_000],
+                &[
+                    MatchFinderKind::Bt2,
+                    MatchFinderKind::Bt3,
+                    MatchFinderKind::Bt4,
+                    MatchFinderKind::Bt5,
+                ],
+                1 << 16,
+            )
+        };
+        let setup = |mt: &mut MatchFinderMt, kind: MatchFinderKind, inline: bool| {
+            mt.mfb.kind = kind;
+            mt.mfb.num_hash_bytes = kind.num_hash_bytes();
+            mt.mfb.cut_value = 32;
+            mt.create(
+                dict,
+                K_NUM_OPTS as u32,
+                LZMA_MATCH_LEN_MAX,
+                LZMA_MATCH_LEN_MAX + 1,
+                u64::MAX,
+                false,
+                inline,
+            )
+            .expect("create");
+            mt.init_mt().expect("init_mt");
+            mt.init();
+        };
+
+        let mut rng = Rng(0x1A1E_F1D0_5EED);
+        let mut inline = MatchFinderMt::new();
+        let mut direct = MatchFinderMt::new();
+        for &kind in kinds {
+            for &len in lens {
+                let src = block_bytes(&mut rng, len);
+                let seed = u64::from(rng.next()) | 1;
+                let what = format!("{kind:?}, {len} bytes");
+
+                let mut st = MatchFinder::new();
+                st.kind = kind;
+                st.num_hash_bytes = kind.num_hash_bytes();
+                st.cut_value = 32;
+                st.create(
+                    dict,
+                    K_NUM_OPTS as u32,
+                    LZMA_MATCH_LEN_MAX,
+                    LZMA_MATCH_LEN_MAX + 1,
+                    u64::MAX,
+                )
+                .expect("create");
+                let mut stream = SliceStream::new(&src);
+                st.init(&mut stream);
+                let want = drive_st(&mut st, &mut stream, seed);
+
+                setup(&mut inline, kind, true);
+                assert!(inline.is_inline(), "{what}");
+                assert!(inline.stream_handle().is_none(), "{what}: no threads");
+                let mut got = Vec::new();
+                drive(
+                    &mut inline,
+                    &mut SliceStream::new(&src),
+                    seed,
+                    usize::MAX,
+                    false,
+                    &mut got,
+                );
+                assert!(!inline.failed(), "{what}");
+                assert!(got == want, "{what}: the inline finder found other matches");
+
+                prepare(&mut direct, kind, len, true, true);
+                let sh = direct.block_handle().expect("no spawn").expect("created");
+                let mut got = Vec::new();
+                run_block(&sh, &src, || {
+                    drive(
+                        &mut direct,
+                        &mut NoStream,
+                        seed,
+                        usize::MAX,
+                        false,
+                        &mut got,
+                    );
+                    Ok(())
+                })
+                .expect("direct");
+                drop(sh);
+                assert_eq!(
+                    direct.spawns, 0,
+                    "{what}: the inline finder started a thread"
+                );
+                assert_eq!(direct.windows(), (0, 0), "{what}: the block is still held");
+                assert!(
+                    got == want,
+                    "{what}: the inline finder read the block otherwise"
+                );
+            }
+        }
+    }
+
+    /// The inline finder holds one hash block and one bt block, not the
+    /// threaded finder's rings, and its window keeps one bt block more than
+    /// the single-threaded finder's rather than both rings.
+    #[test]
+    fn the_inline_finder_holds_one_block_of_each_buffer() {
+        let dict = 1u32 << 16;
+        let make = |inline: bool| {
+            let mut mt = MatchFinderMt::new();
+            mt.mfb.kind = MatchFinderKind::Bt4;
+            mt.mfb.num_hash_bytes = 4;
+            mt.mfb.cut_value = 32;
+            mt.create(
+                dict,
+                K_NUM_OPTS as u32,
+                LZMA_MATCH_LEN_MAX,
+                LZMA_MATCH_LEN_MAX + 1,
+                u64::MAX,
+                false,
+                inline,
+            )
+            .expect("create");
+            mt
+        };
+        let threaded = make(false);
+        let inline = make(true);
+        // SAFETY: no thread has been started.
+        let words = |mt: &MatchFinderMt| unsafe { (*mt.shared().own.get()).bufs.len() };
+        assert_eq!(words(&threaded), HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2);
+        assert_eq!(
+            words(&inline),
+            (HASH_BLOCK_SIZE + BT_BLOCK_SIZE) as usize + 2
+        );
+        let (inline_win, _) = inline.windows();
+        let (threaded_win, _) = threaded.windows();
+        assert!(inline_win < threaded_win, "{inline_win} {threaded_win}");
+        let mut est = MatchFinder::new();
+        est.kind = MatchFinderKind::Bt4;
+        est.num_hash_bytes = 4;
+        est.cut_value = 32;
+        let estimate = MatchFinderMt::mem_usage(
+            &mut est,
+            dict,
+            K_NUM_OPTS as u32,
+            LZMA_MATCH_LEN_MAX,
+            LZMA_MATCH_LEN_MAX + 1,
+            false,
+            true,
+        )
+        .expect("estimate");
+        assert!(
+            estimate >= inline.allocated(),
+            "{estimate} {}",
+            inline.allocated()
+        );
+    }
+
+    /// Every coder held to one thread now takes the inline finder, and must
+    /// write the single-threaded finder's bytes: LZMA through a stream, LZMA2
+    /// through a stream, and LZMA2 block coders reading their blocks in
+    /// place. Random windows of a mixed input at random settings, plus the
+    /// shapes that sit on the buffer edges.
+    #[test]
+    fn one_thread_writes_the_single_threaded_finders_bytes() {
+        use crate::enc::LzmaEncoder;
+
+        let mut rng = Rng(0x0E7E_1A7E_B17E);
+        let pool = block_bytes(&mut rng, 3 << 20);
+        let mut cases: Vec<(String, Vec<u8>)> = vec![
+            ("empty".into(), Vec::new()),
+            ("one".into(), vec![0x2A]),
+            ("zeros".into(), vec![0; 300_001]),
+            ("pool".into(), pool.clone()),
+        ];
+        let windows = if cfg!(miri) { 0 } else { 24 };
+        for i in 0..windows {
+            let len = match i % 4 {
+                0 => 1 + rng.below(300) as usize,
+                1 => 60_000 + rng.below(20_000) as usize,
+                2 => 200_000 + rng.below(400_000) as usize,
+                _ => 1_000_000 + rng.below(1 << 20) as usize,
+            };
+            let at = rng.below((pool.len() - len) as u32) as usize;
+            cases.push((format!("window {i} at {at}"), pool[at..at + len].to_vec()));
+        }
+        let kinds = [
+            MatchFinderKind::Bt2,
+            MatchFinderKind::Bt3,
+            MatchFinderKind::Bt4,
+            MatchFinderKind::Bt5,
+        ];
+        for (i, (name, src)) in cases.iter().enumerate() {
+            let kind = kinds[i % kinds.len()];
+            let level = 5 + rng.below(5);
+            let dict = 1u32 << (12 + rng.below(9));
+            let fb = [5u32, 32, 64, 273][rng.below(4) as usize];
+            let props = LzmaEncProps::new()
+                .with_level(level)
+                .with_dict_size(dict)
+                .with_match_finder(kind)
+                .with_fast_bytes(fb)
+                .with_num_threads(1);
+            let what = format!("{name}: {kind:?} level {level} dict {dict} fb {fb}");
+
+            // LZMA through a stream.
+            let mut st = LzmaEncoder::new(&props).unwrap();
+            st.inner.inline_finder = false;
+            let mut want = Vec::new();
+            st.encode(&mut SliceStream::new(src), &mut want).unwrap();
+            assert!(!st.inner.mf.is_inline(), "{what}");
+            let mut inline = LzmaEncoder::new(&props).unwrap();
+            let mut got = Vec::new();
+            inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
+            assert!(inline.inner.mf.is_inline(), "{what}");
+            assert!(got == want, "{what}: LZMA");
+
+            // LZMA2 through a stream, in blocks, and the same blocks coded
+            // in place on block threads.
+            let block = [1u64 << 16, 1 << 18, 3 << 19][rng.below(3) as usize];
+            let mut st = Lzma2Encoder::new(&props).unwrap();
+            st.set_block_size(block);
+            st.sync_coder().unwrap();
+            st.coder.set_inline_finder(false);
+            let mut want = Vec::new();
+            st.encode(&mut SliceStream::new(src), &mut want).unwrap();
+            assert!(!st.coder.finder_is_inline(), "{what}");
+
+            let mut inline = Lzma2Encoder::new(&props).unwrap();
+            inline.set_block_size(block);
+            let mut got = Vec::new();
+            inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
+            assert!(inline.coder.finder_is_inline(), "{what}");
+            assert!(got == want, "{what}: LZMA2 stream, block {block}");
+
+            let mut blocks = Lzma2Encoder::new(&props).unwrap();
+            blocks.set_block_size(block);
+            blocks.set_threads(3);
+            let mut got = Vec::new();
+            blocks.encode_slice(src, &mut got).unwrap();
+            assert!(got == want, "{what}: LZMA2 blocks in place, block {block}");
+        }
     }
 }

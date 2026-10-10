@@ -151,6 +151,18 @@ impl Lzma2EncInt {
         self.enc.check_alloc(UNPACK_SIZE_MAX)
     }
 
+    /// Whether one thread may run the threaded finder inline; see
+    /// [`LzmaEnc::inline_finder`].
+    pub(crate) fn set_inline_finder(&mut self, on: bool) {
+        self.enc.inline_finder = on;
+    }
+
+    /// Whether the finder in use runs inline.
+    #[cfg(test)]
+    pub(crate) fn finder_is_inline(&self) -> bool {
+        self.enc.mf.is_inline()
+    }
+
     /// How many times the match finder has allocated a window or its tables.
     #[cfg(test)]
     pub(crate) fn finder_allocs(&mut self) -> u32 {
@@ -166,7 +178,8 @@ impl Lzma2EncInt {
 /// `std::thread::scope`, so that the borrow is checked - and a stream can only
 /// be handed over when it is [`Send`]. The two impls are what that distinction
 /// costs: one for an input that can be sent, one for an input that cannot and
-/// therefore always uses the single-threaded finder.
+/// therefore never has a finder thread read it; its finder, the
+/// single-threaded or the inline one, reads it on the coding thread.
 pub(crate) trait DriveBlock {
     /// Runs `coder`'s subblock loop over this block.
     ///
@@ -762,7 +775,7 @@ impl Lzma2Encoder {
         let bufs = block + (block >> 10) + 16 + copy;
         let _ = self.sync_coder();
         // A block coder prepares with `mem_prepare_direct`, which only the
-        // threaded finder (and so only `std`) takes up.
+        // threaded and inline finders (and so only `std`) take up.
         let direct = cfg!(feature = "std");
         self.coder.enc.mem_usage_for(direct).saturating_add(bufs)
     }
@@ -1349,8 +1362,9 @@ mod tests {
 
     /// A limit that pays for `n` block coders reading their blocks in place
     /// gives `n` threads, where counting the threaded finder's window and a
-    /// copy of each block gave fewer; and the single-threaded finder's
-    /// estimate, window and input copy included, is what it always was.
+    /// copy of each block gave fewer; the inline finder at one thread counts
+    /// no window either; and the single-threaded finder's estimate, window
+    /// and input copy included, is what it always was.
     #[cfg(feature = "std")]
     #[test]
     fn a_limit_that_fits_n_direct_block_coders_gives_n_threads() {
@@ -1401,14 +1415,21 @@ mod tests {
             );
         }
 
-        // The single-threaded finder reads through a window, and the
-        // estimate is the one it always had.
+        // One finder thread is the inline finder, which reads a block in
+        // place as the threads do, so its estimate counts no window either.
         let props = LzmaEncProps::new()
             .with_dict_size(dict_size)
             .with_num_threads(1);
         let mut enc = Lzma2Encoder::new(&props).unwrap();
         enc.set_block_size(block);
         enc.set_threads(8);
+        let inline = enc.coder.enc.mem_usage_for(true);
+        assert!(inline < enc.coder.enc.mem_usage());
+        assert_eq!(enc.mem_usage_per_thread(), inline + out + block);
+
+        // The single-threaded finder reads through a window, and the
+        // estimate is the one it always had.
+        enc.coder.set_inline_finder(false);
         let old = enc.coder.enc.mem_usage() + out + block;
         assert_eq!(enc.mem_usage_per_thread(), old);
         assert_eq!(enc.coder.enc.mem_usage_for(true), enc.coder.enc.mem_usage());
@@ -1923,13 +1944,13 @@ mod tests {
         /// The window each coder holds, the first thread's first; `None` for
         /// a block thread whose coder has not been built.
         fn windows(enc: &mut Lzma2Encoder) -> Vec<Option<u64>> {
-            let mut held = vec![Some(enc.coder.enc.mf.cfg().allocated())];
+            let mut held = vec![Some(enc.coder.enc.mf.allocated())];
             for slot in &mut enc.block_coders {
                 held.push(
                     slot.get_mut()
                         .unwrap()
                         .as_mut()
-                        .map(|coder| coder.enc.mf.cfg().allocated()),
+                        .map(|coder| coder.enc.mf.allocated()),
                 );
             }
             held
@@ -1966,7 +1987,7 @@ mod tests {
             let cb = fresh.mt_callback(&mut out, 1).unwrap();
             cb.code(0, 0, &src[..block], true).unwrap();
             drop(cb);
-            fresh.coder.enc.mf.cfg().allocated()
+            fresh.coder.enc.mf.allocated()
         };
         assert!(want < large[0].unwrap(), "{want} {large:?}");
 

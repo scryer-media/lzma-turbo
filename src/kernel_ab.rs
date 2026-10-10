@@ -15,6 +15,8 @@
 //! - `LZMA_TURBO_MATCH_RUN`: `scalar`, `w8` (default) or `w16`.
 //! - `LZMA_TURBO_BCJ_SCAN`: `scalar` or `wide` (default).
 //! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
+//! - `LZMA_TURBO_FINDER`: `st` for the C's single-threaded match finder where
+//!   one thread runs a binary tree in normal mode, or `inline` (default).
 //!
 //! The numbers these produced are in `docs/simd-kernels-report.md`.
 
@@ -57,6 +59,13 @@ pub(crate) fn bcj_scan_wide() -> bool {
 pub(crate) fn delta_blocked() -> bool {
     static CACHED: AtomicU8 = AtomicU8::new(UNSET);
     cached(&CACHED, "LZMA_TURBO_DELTA", |v| u8::from(v != "scalar")) == 1
+}
+
+/// Whether one thread runs the threaded match finder's stages inline. `false`
+/// is the single-threaded finder the C takes there.
+pub(crate) fn inline_finder() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_FINDER", |v| u8::from(v != "st")) == 1
 }
 
 const UNSET: u8 = 255;

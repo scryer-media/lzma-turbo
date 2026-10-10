@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.0 - 2026-10-10
+
+- An encoder with one match-finder thread runs the binary-tree levels about
+  twice as fast. Where it used the C's single-threaded finder (a binary tree
+  in normal mode on one thread, which is every level from 5 up by default),
+  it now runs the threaded finder's hash and tree stages itself, a block at a
+  time, on the coding thread. The hash stage takes the heads of a whole block
+  in one pass, so their cache misses overlap instead of each holding up a
+  tree walk: the same instructions run at about twice the instructions per
+  cycle. The output is byte for byte the single-threaded finder's, which the
+  end of the stream needs for the binary tree's last few positions (no
+  matches with fewer bytes left than the hash reads, as `GET_MATCHES_HEADER`
+  has it, where the threaded finder still reports hash matches). The finder
+  holds one hash block and one match block, about 0.8 MiB more; a block
+  coder reads its block in place, as the threaded finder's coders do, so the
+  per-thread memory estimate no longer counts a window for it. The push
+  encoders keep the single-threaded finder, whose look-ahead their queue
+  bound is. Verified, medians of three on an x86-64 Linux host (Alder Lake,
+  one P-core), `.xz` preset 5 on one thread, before and after against
+  `7zz -txz -mmt=1` and `xz -T1`: a 16 MiB payload from 4.70 s to 2.29 s
+  (7-Zip 1.99 s, xz 5.66 s), a 256 MiB payload from 93.0 s to 39.0 s (7-Zip
+  39.0 s, xz 92.3 s), 4 MiB of x86 code from 1.30 s to 1.02 s (7-Zip 0.90 s)
+  and a 9 MiB source tree from 3.30 s to 2.69 s (7-Zip 2.42 s), with peak RSS
+  unchanged within run-to-run noise (117 MiB on the payloads, where 7-Zip
+  holds 188 and 382 MiB).
+
 ## 0.8.0 - 2026-10-09
 
 - The adaptive LZMA2 decoder holds less memory under its own limit. A run

@@ -11,7 +11,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::enc::consts::*;
-use crate::enc::finder::Finder;
+use crate::enc::finder::{Finder, FinderMode};
 use crate::enc::lz_find::MatchFinderKind;
 use crate::enc::price::{
     LenEnc, LenPriceEnc, ProbPrices, init_price_tables, lit_enc_get_price,
@@ -119,6 +119,12 @@ pub(crate) struct LzmaEnc {
     fast_mode: bool,
     /// C: `p->multiThread`.
     multi_thread: bool,
+    /// Whether a binary tree in normal mode held to one thread takes the
+    /// inline finder ([`FinderMode::Inline`]) rather than the C's
+    /// single-threaded one. Always, except for the push encoders, whose
+    /// queue bound is the single-threaded finder's look-ahead, and for the
+    /// tests that compare the two.
+    pub(crate) inline_finder: bool,
     pub(crate) write_end_mark: bool,
     pub(crate) finished: bool,
     need_init: bool,
@@ -194,6 +200,7 @@ impl LzmaEnc {
             lclp: u32::MAX,
             fast_mode: false,
             multi_thread: false,
+            inline_finder: true,
             write_end_mark: false,
             finished: false,
             need_init: true,
@@ -528,7 +535,7 @@ impl LzmaEnc {
     /// C: `ReadMatchDistances`, returning `(len, numPairs)`.
     fn read_match_distances(&mut self, stream: &mut dyn SeqInStream) -> (u32, usize) {
         self.additional_offset += 1;
-        self.num_avail = self.mf.get_num_available_bytes();
+        self.num_avail = self.mf.get_num_available_bytes(stream);
         let num_pairs = self.mf.get_matches(stream, &mut self.matches);
 
         if num_pairs == 0 {
@@ -1511,7 +1518,7 @@ impl LzmaEnc {
         let start_pos32 = now_pos32;
 
         if self.now_pos64 == 0 {
-            if self.mf.get_num_available_bytes() == 0 {
+            if self.mf.get_num_available_bytes(stream) == 0 {
                 return self.flush(now_pos32, out);
             }
             self.read_match_distances(stream);
@@ -1526,7 +1533,7 @@ impl LzmaEnc {
             now_pos32 += 1;
         }
 
-        if self.mf.get_num_available_bytes() != 0 {
+        if self.mf.get_num_available_bytes(stream) != 0 {
             loop {
                 let len = if self.fast_mode {
                     self.get_optimum_fast(stream)
@@ -1732,7 +1739,7 @@ impl LzmaEnc {
                         }
                     }
 
-                    if self.mf.get_num_available_bytes() == 0 {
+                    if self.mf.get_num_available_bytes(stream) == 0 {
                         break;
                     }
                     let processed = now_pos32 - start_pos32;
@@ -1759,15 +1766,30 @@ impl LzmaEnc {
     // Allocation and initialization.
     // -----------------------------------------------------------------------
 
-    /// Whether the threaded match finder is the one this configuration uses.
+    /// Which match finder this configuration uses.
     ///
-    /// C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`.
-    /// Never true without `std`, where there is no threaded finder.
-    fn mt_mode(&mut self) -> bool {
-        cfg!(feature = "std")
-            && self.multi_thread
-            && !self.fast_mode
-            && self.mf.cfg().kind.bt_mode()
+    /// C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`
+    /// (`C/LzmaEnc.c:2705`) picks the threaded finder. Where it does not and
+    /// only the thread count stood in the way, the same finder runs inline,
+    /// on this thread: the binary tree in normal mode is exactly where it is
+    /// legal, and the matches are the single-threaded finder's. Never
+    /// anything but the single-threaded finder without `std`.
+    fn finder_mode(&mut self) -> FinderMode {
+        if !cfg!(feature = "std") || self.fast_mode || !self.mf.cfg().kind.bt_mode() {
+            return FinderMode::St;
+        }
+        if self.multi_thread {
+            return FinderMode::Threaded;
+        }
+        #[cfg(feature = "kernel-ab")]
+        if !crate::kernel_ab::inline_finder() {
+            return FinderMode::St;
+        }
+        if self.inline_finder {
+            FinderMode::Inline
+        } else {
+            FinderMode::St
+        }
     }
 
     /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
@@ -1792,12 +1814,13 @@ impl LzmaEnc {
             }
         }
 
+        let mode = self.finder_mode();
         #[cfg(feature = "std")]
         {
-            if self.mt_mode() {
-                self.mf.make_mt();
-            } else {
+            if mode == FinderMode::St {
                 self.mf.make_st();
+            } else {
+                self.mf.make_mt();
             }
         }
 
@@ -1828,6 +1851,7 @@ impl LzmaEnc {
             LZMA_MATCH_LEN_MAX + 1,
             data_limit,
             direct,
+            mode == FinderMode::Inline,
         )
     }
 
@@ -1844,10 +1868,10 @@ impl LzmaEnc {
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
-        let mt = self.mt_mode();
+        let mode = self.finder_mode();
         self.mf
             .mem_usage(
-                mt,
+                mode,
                 dict_size,
                 before_size,
                 self.num_fast_bytes,
@@ -1874,7 +1898,8 @@ impl LzmaEnc {
     /// allocation sites, not a formula copied from there.
     ///
     /// With `direct`, for an encoder `mem_prepare_direct` prepares: a
-    /// threaded finder then allocates no window, and the estimate counts none.
+    /// threaded or inline finder then allocates no window, and the estimate
+    /// counts none.
     pub(crate) fn mem_usage_for(&mut self, direct: bool) -> u64 {
         self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
         let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;
@@ -1889,11 +1914,11 @@ impl LzmaEnc {
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
-        let mt = self.mt_mode();
+        let mode = self.finder_mode();
         let mf = self
             .mf
             .mem_usage(
-                mt,
+                mode,
                 dict_size,
                 before_size,
                 self.num_fast_bytes,
