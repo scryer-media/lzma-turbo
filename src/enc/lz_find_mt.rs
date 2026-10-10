@@ -87,7 +87,7 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::enc::consts::*;
 use crate::enc::lz_find::MatchFinder;
@@ -1211,7 +1211,9 @@ struct HashState {
     stream_pos: u32,
     /// C: `mf->streamEndWasReached`.
     stream_end_was_reached: bool,
-    /// C: `mf->result`.
+    /// C: `mf->result`, as the hash thread itself reads it. The lz thread
+    /// reads the copy in [`MtShared::read_result`] instead: on a pair kept
+    /// for blocks it asks while this thread may hold `&mut HashState`.
     result: Result<(), Error>,
     /// A panic was caught on this thread: every block from here on is the
     /// end-of-stream header. Not in the C, which has no unwinding.
@@ -1292,6 +1294,11 @@ pub(crate) struct MtShared {
     /// Raised when the hash or bt thread caught a panic. The lz thread reads
     /// it in `CheckErrors`, as the C reads `failure_LZ_BT`.
     thread_failed: AtomicBool,
+    /// C: `mf->result`, published by the hash thread whenever it records an
+    /// error and read by the lz thread in `CheckErrors`. Kept outside
+    /// `hash_state` so that the read never overlaps the hash thread's borrow
+    /// of that cell; the lock orders the write before the read.
+    read_result: Mutex<Result<(), Error>>,
     /// The allocations `Common`'s pointers address. Nothing reads or writes
     /// through this cell while a thread can reach the pointers; it is here so
     /// that the buffers outlive every thread, and so that
@@ -1383,6 +1390,7 @@ impl MtShared {
             bt_shift: AtomicUsize::new(0),
             lz_shift: AtomicUsize::new(0),
             thread_failed: AtomicBool::new(false),
+            read_result: Mutex::new(Ok(())),
             own: UnsafeCell::new(Owned::default()),
         }
     }
@@ -1433,7 +1441,7 @@ impl MtShared {
             // As `MatchFinder::move_block`: a window cut to a promised stream
             // length, and a stream that broke the promise. Ending the stream
             // with an error keeps the copy below inside the window.
-            h.result = Err(Error::InternalFailure);
+            self.fail_read(h, Error::InternalFailure);
             return;
         }
         let offset = h.buffer - c.keep_size_before as usize;
@@ -1509,7 +1517,7 @@ impl MtShared {
             let out = unsafe { core::slice::from_raw_parts_mut(c.win.add(dest), size) };
             match stream.read(out) {
                 Err(e) => {
-                    h.result = Err(e);
+                    self.fail_read(h, e);
                     return;
                 }
                 Ok(0) => {
@@ -1531,6 +1539,13 @@ impl MtShared {
         if self.common().keep_size_after >= h.avail() {
             self.read_block(h, stream);
         }
+    }
+
+    /// C: `mf->result = res`: record a read error, for this thread in
+    /// `h.result` and for the lz thread in `read_result`.
+    fn fail_read(&self, h: &mut HashState, e: Error) {
+        h.result = Err(e);
+        *self.read_result.lock().unwrap_or_else(|p| p.into_inner()) = Err(e);
     }
 
     /// The hash thread caught a panic: end the stream here and tell the lz
@@ -2229,6 +2244,7 @@ impl MatchFinderMt {
         sh.bt_shift.store(0, Ordering::SeqCst);
         sh.lz_shift.store(0, Ordering::SeqCst);
         sh.thread_failed.store(false, Ordering::SeqCst);
+        *sh.read_result.lock().unwrap_or_else(|p| p.into_inner()) = Ok(());
     }
 
     /// The handle [`with_threads`] needs to start a pair of producer threads
@@ -2313,13 +2329,17 @@ impl MatchFinderMt {
         unsafe { self.shared().common().win() }
     }
 
-    /// C: `mf->result`, which the bt and lz threads only ever read after the
-    /// hash thread has stopped.
+    /// C: `mf->result`, as `CheckErrors` reads it.
+    ///
+    /// On a pair kept for blocks the hash thread is still running when the
+    /// encoder asks, so this reads the copy the hash thread publishes in
+    /// `read_result`, never `hash_state`, which that thread may be holding.
     pub(crate) fn result(&self) -> Result<(), Error> {
-        // SAFETY: reading one scalar the hash thread owns. This is called from
-        // `CheckErrors`, after `release_stream` has joined that thread - see
-        // `Finder::result` for where the encoder does it.
-        unsafe { (*self.shared().hash_state.get()).result }
+        *self
+            .shared()
+            .read_result
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// C: `p->matchFinderMt.failure_LZ_BT`, which `CheckErrors` turns into
