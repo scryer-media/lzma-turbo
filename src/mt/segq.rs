@@ -192,6 +192,25 @@ impl SegQueue {
         shed
     }
 
+    /// Gives parked allocations back to the allocator until at least `want`
+    /// bytes are off the charge or none are left, and returns what that took
+    /// off.
+    ///
+    /// The rest stay parked: a run's worth of pieces let go at once is what
+    /// the next run is read into, and shedding all of them for want of one
+    /// piece's room hands the allocator a run's worth to free and a run's
+    /// worth to map and fault in again.
+    pub(crate) fn shed_spare_down(&mut self, want: u64) -> u64 {
+        let mut shed = 0;
+        while shed < want {
+            let Some(buf) = self.spare.pop() else { break };
+            shed += buf.capacity() as u64;
+        }
+        self.held -= shed;
+        self.spare_bytes -= shed;
+        shed
+    }
+
     /// The size the caller reads in: the largest of the last few pieces
     /// taken, or zero before any. See [`RECENT_PIECES`].
     pub(crate) fn piece_size(&self) -> u64 {
