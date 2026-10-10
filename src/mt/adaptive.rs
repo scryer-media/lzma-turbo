@@ -56,10 +56,6 @@ const MIN_BUF_BUDGET: u64 = 1 << 20;
 /// size still spans only a handful of them.
 const PIECE_TARGET: usize = 4 << 20;
 
-/// The least a run pair counts for in the decoder's own bound: two pieces.
-/// See [`Lzma2AdaptiveDecoder::memory_limit`].
-const PAIR_FLOOR: u64 = 2 * PIECE_TARGET as u64;
-
 /// Why [`Lzma2AdaptiveDecoder::drain`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStatus {
@@ -692,8 +688,8 @@ impl Lzma2AdaptiveDecoder {
         self.memory_limit.min(self.pair_bound())
     }
 
-    /// One run pair - its input and its output - for every thread, and two
-    /// pieces. No bound at all before a run has been seen, because there is
+    /// One run pair - its input and its output - for every thread, and one or
+    /// two pieces. No bound at all before a run has been seen, because there is
     /// no pair to count yet; the scan reserve governs that stretch.
     ///
     /// The pieces are what holding input in the caller's pieces costs over
@@ -709,17 +705,22 @@ impl Lzma2AdaptiveDecoder {
     /// own limit with the last run in hand, which would then wait for a
     /// worker to land.
     ///
-    /// A pair is never counted as less than [`PAIR_FLOOR`]: on a stream of
-    /// small runs the bound would otherwise be a few hundred kilobytes, which
-    /// saves nothing worth having and starves the pipeline of the pieces it
-    /// is fed in.
+    /// A pair is never counted as less than two of the caller's pieces: on a
+    /// stream of small runs the bound would otherwise be a few hundred
+    /// kilobytes, which saves nothing worth having and starves the pipeline of
+    /// the pieces it is fed in. The floor is the caller's piece and not a
+    /// fixed size: a thread whose run sits inside one piece still holds that
+    /// whole piece, so a pair counted at less than a piece in and a piece out
+    /// refuses the piece the next run is in while every thread has work, and
+    /// a caller reading in small pieces is held to what its pieces cost
+    /// rather than to a figure written for large ones.
     fn pair_bound(&self) -> u64 {
         let (run_in, run_out) = self.run_pair();
         if run_in == 0 && run_out == 0 {
             return u64::MAX;
         }
-        let pair = run_in.saturating_add(run_out).max(PAIR_FLOOR);
         let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
+        let pair = run_in.saturating_add(run_out).max(piece.saturating_mul(2));
         // The runs already handed out count at their own sizes, and a run
         // landed and waiting its turn holds its slot's output; only the slots
         // with neither are reckoned at the run in hand. Otherwise a stream
@@ -733,21 +734,34 @@ impl Lzma2AdaptiveDecoder {
             .saturating_add(self.outstanding_bytes)
             .saturating_add(self.ready_cap)
             .saturating_add(pair.saturating_mul(idle as u64));
+        // Runs no larger than a piece already count a whole piece of input
+        // each, which covers the piece shared with the run before; what is
+        // left is the one piece the caller is handing over, as 7-Zip keeps one
+        // block's worth of overrun past the runs in hand. Larger runs are held
+        // in a span that starts and ends inside a piece, which costs both.
+        let slack = if run_in <= piece {
+            piece
+        } else {
+            piece.saturating_mul(2)
+        };
         pair.saturating_mul(self.threads as u64)
             .max(in_hand)
-            .saturating_add(piece.saturating_mul(2))
+            .saturating_add(slack)
     }
 
     /// The packed and unpacked size of the run the decoder is reckoning with:
-    /// the one at the front of the backlog, or the last one dispatched if that
-    /// was larger.
+    /// the largest of the runs in the backlog the threads will take next, or
+    /// the last one dispatched if that was larger.
+    ///
+    /// Not the front of the backlog alone: a small run at the front of large
+    /// ones would have the bound fall under the input already held for the
+    /// large ones behind it, and the decoder would refuse to dispatch any of
+    /// them for want of room it had already given away.
     fn run_pair(&self) -> (u64, u64) {
-        let run_out = self
-            .pending
-            .front()
-            .map_or(0, |r| r.unpacked_len)
-            .max(self.last_unpacked);
-        (self.known_run(), run_out)
+        self.pending.iter().take(self.threads).fold(
+            (self.last_packed, self.last_unpacked),
+            |(run_in, run_out), r| (run_in.max(r.packed_len), run_out.max(r.unpacked_len)),
+        )
     }
 
     /// Changes the limit [`Lzma2AdaptiveDecoder::held_bytes`] is kept under,
@@ -1751,7 +1765,18 @@ impl Lzma2AdaptiveDecoder {
             return Ok(Dispatch::Chase);
         }
 
-        let out = self.take_out();
+        let mut out = self.take_out();
+        // The buffer is sized here, on the thread that will free it, rather
+        // than grown by the worker. The allocator keeps the memory a thread
+        // frees in that thread's own arena when another thread allocated it,
+        // so a buffer grown on a worker and dropped here leaves its pages
+        // behind in the worker's arena, which the limit does not see and
+        // nothing reuses. The worker still writes every page, so this moves
+        // the allocation and not the cost of faulting the buffer in.
+        if out.capacity() < unpacked {
+            out = Vec::new();
+            out.try_reserve_exact(unpacked).map_err(|_| Error::Alloc)?;
+        }
         // What the job costs while the worker has it. Its input costs nothing
         // here: the worker was handed references to input the queue is
         // already charged for, and the queue goes on charging for it until

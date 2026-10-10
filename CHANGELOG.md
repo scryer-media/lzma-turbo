@@ -2,6 +2,20 @@
 
 ## 0.8.0 - 2026-10-09
 
+- The adaptive LZMA2 decoder holds less memory under its own limit. A run
+  pair used to count as at least 8 MiB whatever the caller read in, which put
+  the bound at 66 MiB for eight threads on a stream of 1 MiB runs; it now
+  counts as at least two of the caller's pieces, so a caller reading in 4 MiB
+  pieces keeps the bound it had and one reading in 1 MiB pieces is held to
+  about a run pair per thread. The pair is reckoned over the runs the threads
+  take next, not the front run alone, and runs no larger than a piece are
+  allowed one piece of slack beyond the pairs instead of two. Output buffers are sized on the thread
+  that frees them rather than grown on a worker, which kept freed pages in
+  the worker's allocator arena. Verified, medians of three on an x86-64 Linux
+  host, 7z decode of a 1 GiB LZMA2 archive with 256 KiB dictionaries read in
+  1 MiB pieces: peak RSS at eight threads goes from 61-65 MiB to 25 MiB
+  (7-Zip 24-25), and at two threads from 28 MiB to 13 MiB (7-Zip 10.5-11.6), with
+  decode time at or below 7-Zip's on every row.
 - The BCJ2 decoder copies each run of the main stream as one slice. It used
   to store a byte at a time through the call's streams, which kept the output
   position in memory and spent most of the conversion storing it; it now finds
