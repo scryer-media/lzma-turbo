@@ -635,6 +635,7 @@ impl LzmaEnc {
             }
 
             let data = self.mf.cur() - 1;
+            let buf = self.mf.window();
             let mut rep_max_index = 0usize;
 
             // C indexes `reps`, `repLens` and `p->reps` together by `i`.
@@ -642,7 +643,6 @@ impl LzmaEnc {
             for i in 0..LZMA_NUM_REPS {
                 reps[i] = self.reps[i];
                 let data2 = data - reps[i] as usize;
-                let buf = self.mf.window();
                 if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                     rep_lens[i] = 0;
                     continue;
@@ -674,8 +674,10 @@ impl LzmaEnc {
                 return main_len;
             }
 
-            let cur_byte = u32::from(self.mf.window()[data]);
-            let match_byte = u32::from(self.mf.window()[data - reps[0] as usize]);
+            let buf = self.mf.window();
+            let cur_byte = u32::from(buf[data]);
+            let match_byte = u32::from(buf[data - reps[0] as usize]);
+            let prev_byte = buf[data - 1];
 
             last = rep_lens[rep_max_index];
             if last <= main_len as usize {
@@ -692,7 +694,7 @@ impl LzmaEnc {
             let pos_state = position & self.pb_mask;
 
             {
-                let at = self.lit_probs_at(position, self.mf.window()[data - 1]);
+                let at = self.lit_probs_at(position, prev_byte);
                 let probs = &self.lit_probs[at..at + 0x300];
                 self.opt[1].price = price_0(
                     &self.prob_prices,
@@ -912,8 +914,10 @@ impl LzmaEnc {
                 self.opt[cur].reps = reps;
 
                 let data = self.mf.cur() - 1;
-                let cur_byte = u32::from(self.mf.window()[data]);
-                let match_byte = u32::from(self.mf.window()[data - reps[0] as usize]);
+                let buf = self.mf.window();
+                let cur_byte = u32::from(buf[data]);
+                let match_byte = u32::from(buf[data - reps[0] as usize]);
+                let prev_byte = buf[data - 1];
 
                 let pos_state = position & self.pb_mask;
 
@@ -936,7 +940,7 @@ impl LzmaEnc {
                 {
                     lit_price = 0;
                 } else {
-                    let at = self.lit_probs_at(position, self.mf.window()[data - 1]);
+                    let at = self.lit_probs_at(position, prev_byte);
                     let probs = &self.lit_probs[at..at + 0x300];
                     lit_price += if is_lit_state(state) {
                         lit_enc_get_price(probs, cur_byte, &self.prob_prices)
@@ -992,7 +996,6 @@ impl LzmaEnc {
                 // ---------- LIT : REP_0 ----------
                 if !next_is_lit && lit_price != 0 && match_byte != cur_byte && num_avail_full > 2 {
                     let data2 = data - reps[0] as usize;
-                    let buf = self.mf.window();
                     if buf[data + 1] == buf[data2 + 1] && buf[data + 2] == buf[data2 + 2] {
                         let mut limit = self.num_fast_bytes + 1;
                         if limit > num_avail_full {
@@ -1029,14 +1032,12 @@ impl LzmaEnc {
                 for rep_index in 0..LZMA_NUM_REPS {
                     let data2 = data - reps[rep_index] as usize;
                     {
-                        let buf = self.mf.window();
                         if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                             continue;
                         }
                     }
                     let mut len = 2u32;
                     {
-                        let buf = self.mf.window();
                         while len < num_avail
                             && buf[data + len as usize] == buf[data2 + len as usize]
                         {
@@ -1082,16 +1083,13 @@ impl LzmaEnc {
                     }
                     len2 += 2;
                     if len2 <= limit && {
-                        let buf = self.mf.window();
                         buf[data + len2 as usize - 2] == buf[data2 + len2 as usize - 2]
                             && buf[data + len2 as usize - 1] == buf[data2 + len2 as usize - 1]
                     } {
                         let state2 = u32::from(K_REP_NEXT_STATES[state as usize]);
                         let mut pos_state2 = (position + len) & self.pb_mask;
-                        let lit_at = self.lit_probs_at(
-                            position + len,
-                            self.mf.window()[data + len as usize - 1],
-                        );
+                        let lit_at =
+                            self.lit_probs_at(position + len, buf[data + len as usize - 1]);
                         base += self.rep_len_enc.get_price_len(pos_state, len)
                             + price_0(
                                 &self.prob_prices,
@@ -1099,8 +1097,8 @@ impl LzmaEnc {
                             )
                             + lit_enc_matched_get_price(
                                 &self.lit_probs[lit_at..lit_at + 0x300],
-                                u32::from(self.mf.window()[data + len as usize]),
-                                u32::from(self.mf.window()[data2 + len as usize]),
+                                u32::from(buf[data + len as usize]),
+                                u32::from(buf[data2 + len as usize]),
                                 &self.prob_prices,
                             );
 
@@ -1109,7 +1107,6 @@ impl LzmaEnc {
                         base += self.get_price_rep_0(state2, pos_state2);
 
                         {
-                            let buf = self.mf.window();
                             while len2 < limit
                                 && buf[data + len2 as usize] == buf[data2 + len2 as usize]
                             {
@@ -1196,13 +1193,11 @@ impl LzmaEnc {
                             }
                             len2 += 2;
                             if len2 <= limit && {
-                                let buf = self.mf.window();
                                 buf[data + len2 as usize - 2] == buf[data2 + len2 as usize - 2]
                                     && buf[data + len2 as usize - 1]
                                         == buf[data2 + len2 as usize - 1]
                             } {
                                 {
-                                    let buf = self.mf.window();
                                     while len2 < limit
                                         && buf[data + len2 as usize] == buf[data2 + len2 as usize]
                                     {
@@ -1213,18 +1208,16 @@ impl LzmaEnc {
 
                                 let state2 = u32::from(K_MATCH_NEXT_STATES[state as usize]);
                                 let mut pos_state2 = (position + len) & self.pb_mask;
-                                let lit_at = self.lit_probs_at(
-                                    position + len,
-                                    self.mf.window()[data + len as usize - 1],
-                                );
+                                let lit_at =
+                                    self.lit_probs_at(position + len, buf[data + len as usize - 1]);
                                 base += price_0(
                                     &self.prob_prices,
                                     self.is_match[state2 as usize][pos_state2 as usize],
                                 );
                                 base += lit_enc_matched_get_price(
                                     &self.lit_probs[lit_at..lit_at + 0x300],
-                                    u32::from(self.mf.window()[data + len as usize]),
-                                    u32::from(self.mf.window()[data2 + len as usize]),
+                                    u32::from(buf[data + len as usize]),
+                                    u32::from(buf[data2 + len as usize]),
                                     &self.prob_prices,
                                 );
 
@@ -1558,15 +1551,16 @@ impl LzmaEnc {
                     self.is_match[self.state as usize][pos_state as usize] = prob;
 
                     let data = self.mf.cur() - self.additional_offset as usize;
-                    let at = self.lit_probs_at(now_pos32, self.mf.window()[data - 1]);
-                    let cur_byte = u32::from(self.mf.window()[data]);
+                    let buf = self.mf.window();
+                    let at = self.lit_probs_at(now_pos32, buf[data - 1]);
+                    let cur_byte = u32::from(buf[data]);
                     let state = self.state;
                     self.state = u32::from(K_LITERAL_NEXT_STATES[state as usize]);
                     if is_lit_state(state) {
                         self.rc
                             .lit_encode(&mut self.lit_probs[at..at + 0x300], cur_byte, out);
                     } else {
-                        let match_byte = u32::from(self.mf.window()[data - self.reps[0] as usize]);
+                        let match_byte = u32::from(buf[data - self.reps[0] as usize]);
                         self.rc.lit_encode_matched(
                             &mut self.lit_probs[at..at + 0x300],
                             cur_byte,

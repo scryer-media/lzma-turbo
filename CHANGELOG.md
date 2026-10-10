@@ -46,6 +46,15 @@
   on a heavily loaded Apple
   Silicon host: preset 1 from 3.90 s to 2.91 s on one thread and preset 3
   from 4.96 s to 3.82 s.
+- The optimal parser and the literal coder read the window through one
+  borrow per position instead of fetching it from the match finder at every
+  byte they compare. The output is unchanged byte for byte. It takes 1.7% of
+  the encoder's instructions out at preset 5, and the cycles follow by about
+  half a percent. Supported, interleaved pairs of one binary on an x86-64
+  Linux host (Alder Lake, one P-core), `.xz` preset 5 on one thread: on a
+  16 MiB payload, 18.02G to 17.70G instructions and 9.20G to 9.15G cycles
+  (seven pairs); on 64 MiB, 73.24G to 71.97G instructions and 40.02G to
+  39.80G cycles (two pairs).
 
 ## 0.8.0 - 2026-10-09
 
