@@ -32,12 +32,15 @@
   threaded finder's hash stage does for the binary tree, and the coder reads
   them back. The run stops at the finder's next limit check, so the window
   and the tables are what the C leaves at every point it can see them, and
-  the output is unchanged byte for byte; the finder holds 16 KiB more.
-  Supported, three interleaved runs of one binary on an Apple Silicon host
-  that was heavily loaded throughout, so CPU time rather than wall time,
-  `.xz` of a 16 MiB payload: preset 1 from 3.90 s to 2.91 s on one thread
-  and 3.39 s to 2.47 s on two, preset 3 from 4.96 s to 3.82 s on one thread
-  and 4.29 s to 3.16 s on two.
+  the output is unchanged byte for byte; the finder holds 16 KiB more. It
+  pays where the tables miss the cache. Verified, medians of three
+  interleaved runs of one binary on an x86-64 Linux host (Alder Lake,
+  P-cores), CPU time for `.xz` of a 16 MiB payload: preset 3 from 4.18 s to
+  2.97 s on one thread and from 3.80 s to 2.86 s on two; preset 1, whose
+  tables mostly stay in cache there, from 1.62 s to 1.60 s on one thread
+  and from 2.03 s to 1.87 s on two. Supported, on a heavily loaded Apple
+  Silicon host: preset 1 from 3.90 s to 2.91 s on one thread and preset 3
+  from 4.96 s to 3.82 s.
 
 ## 0.8.0 - 2026-10-09
 
