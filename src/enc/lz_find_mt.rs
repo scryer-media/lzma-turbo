@@ -486,6 +486,12 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
 /// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
+// On x86-64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
+// one is the tests' and other targets'.
+#[cfg_attr(
+    all(feature = "asm", target_arch = "x86_64", not(feature = "kernel-ab")),
+    allow(dead_code)
+)]
 fn get_matches_spec_n_2(
     win: &[u8],
     len_limit_0: usize,
@@ -757,6 +763,52 @@ fn get_matches_spec_n_2(
         }
     }
     Some((di, pos))
+}
+
+/// The tree walk the bt thread runs: the register-shaped kernel in
+/// [`crate::enc::bt_kernel`] on x86-64 with the `asm` feature, where it is the
+/// SDK's `LzFindOpt.asm` shape, and [`get_matches_spec_n_2`] elsewhere. The
+/// two give the same answer and effects (`the_register_walk_is_the_checked_walk_on_any_tables`).
+/// With `kernel-ab`, `LZMA_TURBO_TREE_KERNEL` picks one at run time.
+type TreeWalk = fn(
+    &[u8],
+    usize,
+    u32,
+    usize,
+    &mut [u32],
+    u32,
+    &mut [u32],
+    usize,
+    usize,
+    &[u32],
+    usize,
+    usize,
+    usize,
+    u32,
+    u32,
+) -> Option<(usize, u32)>;
+
+#[inline(always)]
+fn tree_walk() -> TreeWalk {
+    #[cfg(feature = "kernel-ab")]
+    {
+        if crate::kernel_ab::tree_kernel_reg() {
+            crate::enc::bt_kernel::get_matches_spec_n_2_reg
+        } else {
+            get_matches_spec_n_2
+        }
+    }
+    #[cfg(all(not(feature = "kernel-ab"), feature = "asm", target_arch = "x86_64"))]
+    {
+        crate::enc::bt_kernel::get_matches_spec_n_2_reg
+    }
+    #[cfg(all(
+        not(feature = "kernel-ab"),
+        not(all(feature = "asm", target_arch = "x86_64"))
+    ))]
+    {
+        get_matches_spec_n_2
+    }
 }
 
 /// [`get_matches_spec_n_2`] as it was with every access bounds-checked: the
@@ -1840,7 +1892,7 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
             // the cyclic size plus that and more; so afterwards
             // `cyclic_buffer_size <= b.buffer`. Normalisation only lowers
             // `pos`, to exactly `cyclic_buffer_size`.
-            match get_matches_spec_n_2(
+            match tree_walk()(
                 win,
                 b.buffer + len_limit as usize - 1,
                 pos,
@@ -2913,6 +2965,7 @@ mod tests {
     }
 
     /// One call's arguments.
+    #[derive(Clone)]
     struct Case {
         win: Vec<u8>,
         len_limit_0: usize,
@@ -3128,6 +3181,69 @@ mod tests {
             let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 walk(&c, get_matches_spec_n_2)
             }));
+            assert!(refused.is_err(), "condition {name} was not tested");
+        }
+    }
+
+    /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
+    /// every access checked, on the same generated tables and under the same
+    /// conditions: the same answer, the same tree, the same matches. It runs
+    /// in the same Miri job as the slice kernel's test, so every raw-pointer
+    /// access it makes is checked there too.
+    #[test]
+    fn the_register_walk_is_the_checked_walk_on_any_tables() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut walked, mut refused) = (0_u32, 0_u32);
+        for case_no in 0..WALK_CASES {
+            let c = case(&mut rng);
+            let want = walk(&c, get_matches_spec_n_2_checked);
+            let got = walk(&c, crate::enc::bt_kernel::get_matches_spec_n_2_reg);
+            assert!(got == want, "case {case_no}");
+            if want.0.is_some() {
+                walked += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        assert!(
+            walked > WALK_CASES / 30 && refused > WALK_CASES / 30,
+            "{walked} walked, {refused} refused"
+        );
+    }
+
+    /// The register walk refuses each of the five broken conditions before it
+    /// touches anything, as the slice walk does.
+    #[test]
+    fn the_register_walk_refuses_what_it_cannot_vouch_for() {
+        let mut rng = Rng(11);
+        let base = loop {
+            let c = case(&mut rng);
+            if c.cyclic >= 16 && c.hsize - c.hi >= 2 {
+                break c;
+            }
+        };
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        assert_eq!(walk(&base, reg), walk(&base, get_matches_spec_n_2_checked));
+        type Break = (&'static str, fn(&mut Case));
+        let breaks: [Break; 6] = [
+            ("heads", |c| c.heads.truncate(c.hsize - 1)),
+            ("A", |c| c.cbp = c.cyclic - (c.hsize - c.hi) as u32 + 1),
+            ("B", |c| c.son.truncate(2 * c.cyclic as usize - 1)),
+            ("C", |c| c.max_len_0 = c.len_limit_0 - c.cur + 1),
+            ("D", |c| {
+                c.win.truncate(c.len_limit_0 + (c.hsize - c.hi) - 1)
+            }),
+            ("E", |c| {
+                c.cyclic = (c.cur + 2 + (c.hsize - c.hi)) as u32;
+                c.son = vec![0; 2 * c.cyclic as usize];
+                c.cbp = 0;
+                c.pos = c.cur as u32 + 2;
+            }),
+        ];
+        for (name, break_it) in breaks {
+            let mut c = base.clone();
+            break_it(&mut c);
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&c, reg)));
             assert!(refused.is_err(), "condition {name} was not tested");
         }
     }

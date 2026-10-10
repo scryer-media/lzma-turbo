@@ -15,6 +15,8 @@
 //! - `LZMA_TURBO_MATCH_RUN`: `scalar`, `w8` (default) or `w16`.
 //! - `LZMA_TURBO_BCJ_SCAN`: `scalar` or `wide` (default).
 //! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
+//! - `LZMA_TURBO_TREE_KERNEL`: `slice` or `reg`, the bt thread's tree walk
+//!   (the default is what the build ships: `reg` on x86-64 with `asm`).
 //!
 //! The numbers these produced are in `docs/simd-kernels-report.md`.
 
@@ -57,6 +59,17 @@ pub(crate) fn bcj_scan_wide() -> bool {
 pub(crate) fn delta_blocked() -> bool {
     static CACHED: AtomicU8 = AtomicU8::new(UNSET);
     cached(&CACHED, "LZMA_TURBO_DELTA", |v| u8::from(v != "scalar")) == 1
+}
+
+/// Whether the bt thread walks the tree with the register-shaped kernel in
+/// `enc::bt_kernel` (`true`) or the slice kernel in `enc::lz_find_mt`.
+pub(crate) fn tree_kernel_reg() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_TREE_KERNEL", |v| match v {
+        "slice" => 0,
+        "reg" => 1,
+        _ => u8::from(cfg!(all(feature = "asm", target_arch = "x86_64"))),
+    }) == 1
 }
 
 const UNSET: u8 = 255;
