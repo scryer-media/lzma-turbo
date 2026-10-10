@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.0 - 2026-10-10
+
+- The threaded match finder walks its binary tree in the shape of the SDK's
+  x86-64 assembly (`LzFindOpt.asm`) on x86-64 builds with the `asm` feature.
+  The walk is kept out of line and works from a cursor pointer and one tree
+  base pointer, wrapping the cyclic position with a borrow as the assembly
+  does, where the slice walk, inlined into the bt thread's loop, spilled each
+  node's link value to the stack and read it back to form the next node's
+  distance, putting a store-forwarding delay on the walk's chain of dependent
+  loads. The output is byte-identical to the slice walk, which a differential
+  test checks over random tables and windows; other targets keep the slice
+  walk. Verified, medians of three, 7z encode of a 256 MiB payload at level 5
+  against 7-Zip 26.03 (ratio = 7-Zip's time over ours): on Sapphire Rapids
+  four threads go from 0.79 to 0.86 and two from 0.80 to 0.90; on Zen 4 four
+  threads go from 0.78 to 0.88 and two from 0.84 to 0.95; a 64 MiB x86 code
+  payload through BCJ2 at four threads goes from 0.90 to 0.96 and from 0.93
+  to 0.98. One thread does not use the threaded finder and moves only within
+  noise. The bt thread's instructions fall by about a fifth and its cycles by
+  a tenth. The walk allocates nothing; peak memory stays within the spread
+  the old walk shows from run to run (327-383 MiB at four threads, 108 MiB
+  at two).
+
 ## 0.8.0 - 2026-10-09
 
 - The adaptive LZMA2 decoder holds less memory under its own limit. A run
