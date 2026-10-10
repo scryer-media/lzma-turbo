@@ -296,6 +296,7 @@ enum Heads {
     H5b,
 }
 
+#[cfg(test)]
 #[inline]
 fn ui16(p: &[u8], i: usize) -> u32 {
     u32::from(p[i]) | (u32::from(p[i + 1]) << 8)
@@ -303,6 +304,7 @@ fn ui16(p: &[u8], i: usize) -> u32 {
 
 /// C: `GetUi24hi_from32(p)`, the top three bytes of a little-endian 32-bit
 /// load.
+#[cfg(test)]
 #[inline]
 fn ui24hi(p: &[u8], i: usize) -> u32 {
     u32::from(p[i + 1]) | (u32::from(p[i + 2]) << 8) | (u32::from(p[i + 3]) << 16)
@@ -315,46 +317,103 @@ fn ui24hi(p: &[u8], i: usize) -> u32 {
 /// — the same "insert and report the previous head" step the single-threaded
 /// finder does inline, lifted out so that it can run a block ahead.
 ///
-/// The C's `USE_GetHeads_LOCAL_CRC` builds per-call copies of the byte table
-/// with `hashMask` already folded in. That is a strength reduction, not a
+/// The shape is the C's: one loop per kind, chosen once per call
+/// (`C/LzFindMt.c:304-317`, `GetHeads_DECL` / `GetHeads_LOOP`), and for the
+/// kinds that mix in more than one byte of the table, per-call copies of the
+/// byte table with `hashMask` already folded in (`USE_GetHeads_LOCAL_CRC`,
+/// `:372-437`), so that the loop does two or three loads and xors per byte and
+/// nothing else to form the value. That is a strength reduction, not a
 /// different value: every term it leaves unmasked is at most 24 bits and
 /// `hashMask` always has its low 16 (`bigHash`: 24) bits set, so masking the
-/// terms and masking the sum agree. The masks are written where the C puts
-/// them so the two can be read against each other.
+/// terms and masking the sum agree. `H3` masks the sum, as the C's
+/// `DEF_GetHeads(3, ...)` does (`:322`).
+///
+/// # Panics
+///
+/// If `p` is shorter than the bytes the heads hash, `heads.len()` plus the
+/// kind's bytes less one, or a value indexes past `hash`: the reads the
+/// per-byte loop makes are the ones an indexed loop would check, tested once.
 fn get_heads(
     kind: Heads,
     p: &[u8],
-    mut pos: u32,
+    pos: u32,
     hash: &mut [u32],
     mask: u32,
     heads: &mut [u32],
     crc: &[u32; 256],
 ) {
-    for (i, head) in heads.iter_mut().enumerate() {
-        let value = match kind {
-            Heads::H2 => ui16(p, i),
-            Heads::H3 => (crc[usize::from(p[i])] ^ ui16(p, i + 1)) & mask,
-            Heads::H3b => ui16(p, i) ^ (u32::from(p[i + 2]) << 16),
-            Heads::H4 => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ui16(p, i + 1)
-            }
-            Heads::H4b => (crc[usize::from(p[i])] & mask) ^ ui24hi(p, i),
-            Heads::H5 => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_2) & mask)
-                    ^ ui16(p, i + 1)
-            }
-            Heads::H5b => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ui24hi(p, i)
-            }
-        } as usize;
-        *head = pos.wrapping_sub(hash[value]);
-        hash[value] = pos;
+    let masked = |shift: u32| -> [u32; 256] { core::array::from_fn(|i| (crc[i] << shift) & mask) };
+    match kind {
+        Heads::H2 => heads_loop::<2>(p, pos, hash, heads, |w| ui16w(w[0], w[1])),
+        Heads::H3 => heads_loop::<3>(p, pos, hash, heads, |w| {
+            (crc[usize::from(w[0])] ^ ui16w(w[1], w[2])) & mask
+        }),
+        Heads::H3b => heads_loop::<3>(p, pos, hash, heads, |w| {
+            ui16w(w[0], w[1]) ^ (u32::from(w[2]) << 16)
+        }),
+        Heads::H4 => {
+            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+            heads_loop::<4>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])] ^ c1[usize::from(w[3])] ^ ui16w(w[1], w[2])
+            });
+        }
+        Heads::H4b => {
+            let c0 = masked(0);
+            heads_loop::<4>(p, pos, hash, heads, |w| c0[usize::from(w[0])] ^ ui24hiw(w));
+        }
+        Heads::H5 => {
+            let (c0, c1, c2) = (
+                masked(0),
+                masked(K_LZ_HASH_CRC_SHIFT_1),
+                masked(K_LZ_HASH_CRC_SHIFT_2),
+            );
+            heads_loop::<5>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])]
+                    ^ c1[usize::from(w[3])]
+                    ^ c2[usize::from(w[4])]
+                    ^ ui16w(w[1], w[2])
+            });
+        }
+        Heads::H5b => {
+            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+            heads_loop::<5>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])] ^ c1[usize::from(w[4])] ^ ui24hiw(w)
+            });
+        }
+    }
+}
+
+/// C: `GetUi16` of two bytes in address order.
+#[inline(always)]
+fn ui16w(b0: u8, b1: u8) -> u32 {
+    u32::from(b0) | (u32::from(b1) << 8)
+}
+
+/// C: `GetUi24hi_from32`, over the four bytes of a window.
+#[inline(always)]
+fn ui24hiw<const N: usize>(w: &[u8; N]) -> u32 {
+    u32::from(w[1]) | (u32::from(w[2]) << 8) | (u32::from(w[3]) << 16)
+}
+
+/// C: `GetHeads_LOOP(v)`, with `value` as `v` over the `N` bytes at each
+/// position.
+#[inline(always)]
+fn heads_loop<const N: usize>(
+    p: &[u8],
+    mut pos: u32,
+    hash: &mut [u32],
+    heads: &mut [u32],
+    value: impl Fn(&[u8; N]) -> u32,
+) {
+    assert!(
+        heads.is_empty() || p.len() >= heads.len() + N - 1,
+        "the window ends before the last hashed byte"
+    );
+    for (w, head) in p.windows(N).zip(heads.iter_mut()) {
+        let w: &[u8; N] = w.try_into().expect("a window of N bytes");
+        let v = value(w) as usize;
+        *head = pos.wrapping_sub(hash[v]);
+        hash[v] = pos;
         pos = pos.wrapping_add(1);
     }
 }
@@ -2825,6 +2884,47 @@ pub(crate) fn with_threads<T>(
     })
 }
 
+/// The indexed loop `get_heads` replaced, kept as the reference its
+/// differential test checks it against.
+#[cfg(test)]
+fn get_heads_indexed(
+    kind: Heads,
+    p: &[u8],
+    mut pos: u32,
+    hash: &mut [u32],
+    mask: u32,
+    heads: &mut [u32],
+    crc: &[u32; 256],
+) {
+    for (i, head) in heads.iter_mut().enumerate() {
+        let value = match kind {
+            Heads::H2 => ui16(p, i),
+            Heads::H3 => (crc[usize::from(p[i])] ^ ui16(p, i + 1)) & mask,
+            Heads::H3b => ui16(p, i) ^ (u32::from(p[i + 2]) << 16),
+            Heads::H4 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H4b => (crc[usize::from(p[i])] & mask) ^ ui24hi(p, i),
+            Heads::H5 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_2) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H5b => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui24hi(p, i)
+            }
+        } as usize;
+        *head = pos.wrapping_sub(hash[value]);
+        hash[value] = pos;
+        pos = pos.wrapping_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -2833,7 +2933,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, run_block, with_threads,
+        Heads, MatchFinderMt, get_heads, get_heads_indexed, get_matches_spec_n_2,
+        get_matches_spec_n_2_checked, run_block, with_threads,
     };
     use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
@@ -2962,6 +3063,66 @@ mod tests {
         fn below(&mut self, n: u32) -> u32 {
             self.next() % n
         }
+    }
+
+    /// The hash thread's loop, one kind per call, against the indexed loop
+    /// it replaced: the same heads and the same table, on windows with few
+    /// distinct bytes (so that values repeat and heads point back into the
+    /// run) and with many, from a table that already holds positions.
+    #[test]
+    fn get_heads_matches_the_indexed_loop() {
+        const KINDS: [(Heads, usize, bool); 7] = [
+            (Heads::H2, 2, false),
+            (Heads::H3, 3, false),
+            (Heads::H3b, 3, true),
+            (Heads::H4, 4, false),
+            (Heads::H4b, 4, true),
+            (Heads::H5, 5, false),
+            (Heads::H5b, 5, true),
+        ];
+        let mut rng = Rng(0x5EED_4EAD_5000_0001);
+        let crc: [u32; 256] = core::array::from_fn(|_| rng.next());
+        for (kind, bytes, big) in KINDS {
+            let cases = if big { 2 } else { 12 };
+            for case_no in 0..cases {
+                // C: `hashMask` keeps its low 16 bits set, and 24 for the
+                // `bigHash` kinds that mix in an unmasked 24-bit value.
+                let mask: u32 = if big {
+                    0x00FF_FFFF
+                } else {
+                    (1 << (16 + rng.below(7))) - 1
+                };
+                let n = rng.below(3000) as usize;
+                let alphabet = if case_no % 2 == 0 { 3 } else { 256 };
+                let p: Vec<u8> = (0..n + bytes - 1 + rng.below(3) as usize)
+                    .map(|_| rng.below(alphabet) as u8)
+                    .collect();
+                let pos = rng.next();
+                let mut hash = vec![0_u32; mask as usize + 1];
+                for _ in 0..64 {
+                    let at = rng.below(mask + 1) as usize;
+                    hash[at] = rng.next();
+                }
+                let mut want_hash = hash.clone();
+                let mut heads = vec![0_u32; n];
+                let mut want = vec![0_u32; n];
+                get_heads(kind, &p, pos, &mut hash, mask, &mut heads, &crc);
+                get_heads_indexed(kind, &p, pos, &mut want_hash, mask, &mut want, &crc);
+                assert!(heads == want, "{kind:?} case {case_no}: heads differ");
+                assert!(hash == want_hash, "{kind:?} case {case_no}: tables differ");
+            }
+        }
+    }
+
+    /// A window that ends before the last byte a head hashes is refused, as
+    /// the indexed loop refused it.
+    #[test]
+    #[should_panic(expected = "the window ends before the last hashed byte")]
+    fn get_heads_refuses_a_short_window() {
+        let crc = [0_u32; 256];
+        let mut hash = vec![0_u32; 1 << 16];
+        let mut heads = vec![0_u32; 8];
+        get_heads(Heads::H4, &[0; 10], 1, &mut hash, 0xFFFF, &mut heads, &crc);
     }
 
     /// One call's arguments.
