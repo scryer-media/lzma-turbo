@@ -1852,8 +1852,16 @@ impl LzmaEnc {
                 before_size,
                 self.num_fast_bytes,
                 LZMA_MATCH_LEN_MAX + 1,
+                false,
             )
             .map(|_| ())
+    }
+
+    /// [`Self::mem_usage_for`] for an encoder prepared to read through its
+    /// window.
+    #[cfg(test)]
+    pub(crate) fn mem_usage(&mut self) -> u64 {
+        self.mem_usage_for(false)
     }
 
     /// What one encoder of this configuration is estimated to need, in bytes:
@@ -1864,7 +1872,10 @@ impl LzmaEnc {
     /// C: 7-Zip computes the same quantity outside `C/` to reduce the block
     /// thread count to a memory budget; the arithmetic here is this port's own
     /// allocation sites, not a formula copied from there.
-    pub(crate) fn mem_usage(&mut self) -> u64 {
+    ///
+    /// With `direct`, for an encoder `mem_prepare_direct` prepares: a
+    /// threaded finder then allocates no window, and the estimate counts none.
+    pub(crate) fn mem_usage_for(&mut self, direct: bool) -> u64 {
         self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
         let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;
 
@@ -1887,6 +1898,7 @@ impl LzmaEnc {
                 before_size,
                 self.num_fast_bytes,
                 LZMA_MATCH_LEN_MAX + 1,
+                direct,
             )
             .unwrap_or(0);
         mf.saturating_add(lit_probs)

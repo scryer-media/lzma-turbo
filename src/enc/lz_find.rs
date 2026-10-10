@@ -550,13 +550,15 @@ impl MatchFinder {
     }
 
     /// What [`MatchFinder::create`] would allocate for this configuration, in
-    /// bytes: the window plus the hash and son tables.
+    /// bytes: the window, unless `window` is false (C: `directInput`, which
+    /// creates none), plus the hash and son tables.
     pub(crate) fn mem_usage(
         &mut self,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        window: bool,
     ) -> Result<u64, Error> {
         let plan = self.plan(
             history_size,
@@ -565,7 +567,12 @@ impl MatchFinder {
             keep_add_buffer_after,
             u64::MAX,
         )?;
-        Ok(u64::from(plan.block_size) + (plan.num_refs as u64) * 4)
+        let window = if window {
+            u64::from(plan.block_size)
+        } else {
+            0
+        };
+        Ok(window + (plan.num_refs as u64) * 4)
     }
 
     /// What this finder has allocated, in bytes: the window and the tables.

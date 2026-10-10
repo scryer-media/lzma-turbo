@@ -2127,14 +2127,17 @@ impl MatchFinderMt {
 
     /// What [`MatchFinderMt::create`] would allocate for this configuration,
     /// in bytes: `hashBuf` and `btBuf`, and the window and tables of a
-    /// `MatchFinder_Create` given the two enlarged keep sizes. `mfb` is the
-    /// `CMatchFinder` carrying the settings; nothing is allocated.
+    /// `MatchFinder_Create` given the two enlarged keep sizes, the window
+    /// left out with `direct`, as [`MatchFinderMt::create`] leaves it out.
+    /// `mfb` is the `CMatchFinder` carrying the settings; nothing is
+    /// allocated.
     pub(crate) fn mem_usage(
         mfb: &mut MatchFinder,
         history_size: u32,
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        direct: bool,
     ) -> Result<u64, Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
@@ -2145,7 +2148,7 @@ impl MatchFinderMt {
         let after = keep_add_buffer_after
             .checked_add(HASH_BLOCK_SIZE)
             .ok_or(Error::Param)?;
-        let base = mfb.mem_usage(history_size, before, match_max_len, after)?;
+        let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
         Ok(base + (HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2) as u64 * 4)
     }
 

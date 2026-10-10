@@ -124,6 +124,8 @@ impl Finder {
     /// `mt` is `p->mtMode` as `LzmaEnc_Alloc` will compute it, not
     /// [`Finder::is_mt`]: the estimate is taken before anything is allocated,
     /// when the finder is still the single-threaded one it was constructed as.
+    /// `direct` is [`Finder::create`]'s: the threaded finder then counts no
+    /// window, and the single-threaded one, which always has one, ignores it.
     pub(crate) fn mem_usage(
         &mut self,
         mt: bool,
@@ -131,6 +133,7 @@ impl Finder {
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
     ) -> Result<u64, Error> {
         #[cfg(feature = "std")]
         if mt {
@@ -140,6 +143,7 @@ impl Finder {
                 keep_add_buffer_before,
                 match_max_len,
                 keep_add_buffer_after,
+                direct,
             );
         }
         #[cfg(not(feature = "std"))]
@@ -149,6 +153,7 @@ impl Finder {
             keep_add_buffer_before,
             match_max_len,
             keep_add_buffer_after,
+            true,
         )
     }
 

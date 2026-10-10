@@ -734,32 +734,60 @@ impl Lzma2Encoder {
     /// finder's window and reference tables, the encoder's literal probability
     /// arrays, and the block's output buffer — not a formula taken from
     /// 7-Zip's C++.
+    ///
+    /// It follows what a block thread allocates. A block coder reads its
+    /// block in place, so with the threaded match finder there is no window
+    /// to count, only its tables and hand-off buffers; the single-threaded
+    /// finder reads through a window, which is counted. The figure is the
+    /// one for [`Lzma2Encoder::encode_mt`], whose block threads each hold a
+    /// copy of the block they read from the stream;
+    /// [`Lzma2Encoder::encode_slice`] hands them the caller's slice instead,
+    /// and is reduced against this figure less that copy.
     #[must_use]
     pub fn mem_usage_per_thread(&mut self) -> u64 {
+        self.block_thread_mem(true)
+    }
+
+    /// [`Lzma2Encoder::mem_usage_per_thread`], with the block's input copy
+    /// counted only when `copies_input`: `MtCoder` makes one for a stream
+    /// and none for a slice.
+    fn block_thread_mem(&mut self, copies_input: bool) -> u64 {
         let block = match self.block_size() {
             BLOCK_SIZE_SOLID => u64::from(self.dict_size()),
             other => other,
         };
         // C: `destBlockSize` in `Lzma2Enc_Encode2`, plus the block's own copy
-        // of the input that `MtCoder` holds.
-        let bufs = block + (block >> 10) + 16 + block;
+        // of the input that `MtCoder` holds when it reads a stream.
+        let copy = if copies_input { block } else { 0 };
+        let bufs = block + (block >> 10) + 16 + copy;
         let _ = self.sync_coder();
-        self.coder.enc.mem_usage().saturating_add(bufs)
+        // A block coder prepares with `mem_prepare_direct`, which only the
+        // threaded finder (and so only `std`) takes up.
+        let direct = cfg!(feature = "std");
+        self.coder.enc.mem_usage_for(direct).saturating_add(bufs)
     }
 
     /// The thread count after the memory limit and the number of blocks have
-    /// been applied.
+    /// been applied, for [`Lzma2Encoder::encode_mt`];
+    /// [`Lzma2Encoder::encode_slice`] can fit one block's input copy more
+    /// per thread under the same limit.
     ///
     /// C: `numBlockThreads_Reduced`.
     #[must_use]
     pub fn threads_reduced(&mut self) -> usize {
+        self.threads_reduced_for(true)
+    }
+
+    /// [`Lzma2Encoder::threads_reduced`] against
+    /// [`Self::block_thread_mem`]`(copies_input)`.
+    fn threads_reduced_for(&mut self, copies_input: bool) -> usize {
         if self.block_size() == BLOCK_SIZE_SOLID {
             // C: a solid block is one block, so it is one thread.
             return 1;
         }
         let mut t = self.split_threads().1;
         if self.mem_limit != u64::MAX {
-            let per = self.mem_usage_per_thread().max(1);
+            let per = self.block_thread_mem(copies_input).max(1);
             let fits = (self.mem_limit / per) as usize;
             t = t.min(fits.max(1));
         }
@@ -868,7 +896,7 @@ impl Lzma2Encoder {
         self.sync_coder()?;
         #[cfg(feature = "std")]
         {
-            let threads = self.threads_reduced();
+            let threads = self.threads_reduced_for(false);
             if threads > 1 {
                 return self.encode_slice_mt(src, out, threads);
             }
@@ -1269,15 +1297,14 @@ mod tests {
     }
 
     /// The estimate covers what a block's coder really allocates, with and
-    /// without the threaded match finder, whose `hashBuf` and `btBuf` and
-    /// wider window it has to count. The allocation is read off the buffers
-    /// the coder holds after `Lzma2EncInt_InitStream` has prepared it.
+    /// without the threaded match finder: the coder is prepared as a block
+    /// thread prepares it, reading its block in place, so the threaded finder
+    /// has its `hashBuf` and `btBuf` and no window, and the single-threaded
+    /// one its window. The allocation is read off the buffers the coder holds
+    /// once prepared.
     #[test]
     fn the_estimate_bounds_what_a_block_coder_allocates() {
-        // C: `kHashBufferSize + kBtBufferSize`, in `u32` words.
-        const MT_BUFS: u64 = ((1 << 17) * 2 + (1 << 16) * 16) * 4;
         for dict_size in [1u32 << 16, 1 << 20, 1 << 23] {
-            let mut per_finder = [0u64; 2];
             for mf_threads in [1u32, 2] {
                 let props = LzmaEncProps::new()
                     .with_dict_size(dict_size)
@@ -1288,10 +1315,18 @@ mod tests {
                 let what = format!("dict {dict_size}, {mf_threads} finder threads");
 
                 let block = enc.block_size();
-                let per = enc.mem_usage_per_thread();
-                let estimate = enc.coder.enc.mem_usage();
-                assert_eq!(per, estimate + block + (block >> 10) + 16 + block, "{what}");
+                let direct = cfg!(feature = "std");
+                let estimate = enc.coder.enc.mem_usage_for(direct);
+                let out = block + (block >> 10) + 16;
+                assert_eq!(enc.mem_usage_per_thread(), estimate + out + block, "{what}");
+                assert_eq!(enc.block_thread_mem(false), estimate + out, "{what}");
 
+                #[cfg(feature = "std")]
+                enc.coder
+                    .enc
+                    .mem_prepare_direct(block, UNPACK_SIZE_MAX)
+                    .unwrap();
+                #[cfg(not(feature = "std"))]
                 enc.coder.enc.prepare(UNPACK_SIZE_MAX).unwrap();
                 let allocated = enc.coder.enc.allocated();
                 assert_eq!(
@@ -1308,15 +1343,75 @@ mod tests {
                     estimate - allocated < 1 << 12,
                     "{what}: estimated {estimate}, allocated {allocated}"
                 );
-                per_finder[mf_threads as usize - 1] = per;
-            }
-            if cfg!(feature = "std") {
-                assert!(
-                    per_finder[1] >= per_finder[0] + MT_BUFS,
-                    "dict {dict_size}: {per_finder:?}"
-                );
             }
         }
+    }
+
+    /// A limit that pays for `n` block coders reading their blocks in place
+    /// gives `n` threads, where counting the threaded finder's window and a
+    /// copy of each block gave fewer; and the single-threaded finder's
+    /// estimate, window and input copy included, is what it always was.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_limit_that_fits_n_direct_block_coders_gives_n_threads() {
+        let dict_size = 1u32 << 20;
+        let block = u64::from(dict_size) * 4;
+        let out = block + (block >> 10) + 16;
+        for n in [2usize, 3, 5] {
+            let props = LzmaEncProps::new()
+                .with_dict_size(dict_size)
+                .with_num_threads(2);
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_block_size(block);
+            enc.set_threads(8);
+            enc.set_data_size(block * 16);
+
+            // What one block coder holds once it has coded a block in place.
+            let held = {
+                let mut probe = Lzma2Encoder::new(&props).unwrap();
+                probe.set_block_size(block);
+                probe.sync_coder().unwrap();
+                probe
+                    .coder
+                    .enc
+                    .mem_prepare_direct(block, UNPACK_SIZE_MAX)
+                    .unwrap();
+                assert!(probe.coder.enc.mf.is_mt());
+                probe.coder.enc.allocated()
+            };
+            let per_slice = enc.block_thread_mem(false);
+            assert!(per_slice >= held + out, "{per_slice} for {held} + {out}");
+            assert!(per_slice - (held + out) < 1 << 12, "{per_slice} for {held}");
+
+            enc.set_mem_limit(per_slice * n as u64);
+            assert_eq!(enc.threads_reduced_for(false), n, "{n} slice coders");
+            // The stream path also holds each block's copy, so the same
+            // limit fits fewer of its coders.
+            assert!(enc.threads_reduced() < n, "{n} stream coders");
+            let per_stream = enc.mem_usage_per_thread();
+            enc.set_mem_limit(per_stream * n as u64);
+            assert_eq!(enc.threads_reduced(), n, "{n} stream coders");
+
+            // The old figure, the window as well and a copy of the block,
+            // fits fewer than `n` under the limit that pays for `n`.
+            let old = enc.coder.enc.mem_usage() + out + block;
+            assert!(
+                per_slice * (n as u64) / old < n as u64,
+                "{n}: {old} against {per_slice}"
+            );
+        }
+
+        // The single-threaded finder reads through a window, and the
+        // estimate is the one it always had.
+        let props = LzmaEncProps::new()
+            .with_dict_size(dict_size)
+            .with_num_threads(1);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        enc.set_block_size(block);
+        enc.set_threads(8);
+        let old = enc.coder.enc.mem_usage() + out + block;
+        assert_eq!(enc.mem_usage_per_thread(), old);
+        assert_eq!(enc.coder.enc.mem_usage_for(true), enc.coder.enc.mem_usage());
     }
 
     /// The thread count also comes down to the number of blocks there are.

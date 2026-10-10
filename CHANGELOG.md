@@ -41,6 +41,14 @@
   ones that order the node. No `unsafe` is involved and the output is
   unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
   with one thread and threaded.
+- `Lzma2Encoder::mem_usage_per_thread` and `threads_reduced` follow what a
+  block thread allocates. A block coder with the threaded match finder reads
+  its block in place and has no window, so the window is no longer counted
+  for it; `encode_slice` hands its block threads the caller's slice, so it is
+  reduced against the estimate without a copy of each block, which
+  `encode_mt` still holds and counts. Under the same memory limit a threaded
+  binary-tree encode therefore runs more block threads than before. The
+  single-threaded finder's estimate, window and copy included, is unchanged.
 - `Lzma2Encoder` builds its encoder once. A block size or a thread split that
   changes the settings in force used to build a second one in place of the
   one `new` had made; the settings are now applied to that one, as
