@@ -26,6 +26,14 @@
   caller's own `memory_limit` is still never exceeded, and no further input
   is taken while the decoder is over the bound. A test feeds that state and
   asserts the fourth claim, which the accounting before this refused.
+  Measured, n=1 screen on an x86-64 Linux host (Alder Lake, eight P-core
+  threads), sevenz-turbo's decode bench over a 2 GiB archive of 128 MiB runs
+  under its governor at a four-thread ceiling: 16.61 s becomes 14.39 s
+  against 14.29 s fixed at four. Peak RSS rises with it, from 1156 to 1285
+  MiB, because the input read ahead for the wider offer is now put to work
+  rather than left waiting; a caller that states its ceiling (sevenz-turbo's
+  `Lzma2Handle::set_max_threads`) reads ahead no further and is at 1030 MiB
+  against 1036 MiB fixed.
 
 ## 0.8.0 - 2026-10-09
 
