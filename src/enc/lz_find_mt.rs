@@ -3193,8 +3193,10 @@ mod tests {
         };
         mt.mfb.cut_value = 32;
         mt.mfb.expected_data_size = len as u64;
+        // Under Miri the tables are kept small: every stream fills them.
+        let dict = if cfg!(miri) { 1 << 12 } else { 1 << 16 };
         mt.create(
-            1 << 16,
+            dict,
             K_NUM_OPTS as u32,
             LZMA_MATCH_LEN_MAX,
             LZMA_MATCH_LEN_MAX + 1,
@@ -3226,7 +3228,7 @@ mod tests {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         let (len, kinds): (usize, &[MatchFinderKind]) = if cfg!(miri) {
-            (1_000, &[MatchFinderKind::Bt4])
+            (300, &[MatchFinderKind::Bt4])
         } else {
             (
                 300_000,
@@ -3238,8 +3240,10 @@ mod tests {
                 ],
             )
         };
-        // (block length, calls before the block ends, whether it panics)
-        let schedule = [
+        // (block length, calls before the block ends, whether it panics).
+        // Under Miri, one block for each way a block can end, with a full
+        // block after the panic to show the kept pair still works.
+        let full: &[(usize, usize, bool)] = &[
             (len, usize::MAX, false),
             (len, 0, false),
             (len, 1, false),
@@ -3250,6 +3254,13 @@ mod tests {
             (0, usize::MAX, false),
             (len / 5 + 3, usize::MAX, false),
         ];
+        let small: &[(usize, usize, bool)] = &[
+            (len, 0, false),
+            (len / 3 + 7, 37, false),
+            (len / 2, 61, true),
+            (len, usize::MAX, false),
+        ];
+        let schedule = if cfg!(miri) { small } else { full };
 
         let mut rng = Rng(0xD1EC_7B10_C4ED);
         let mut direct = MatchFinderMt::new();
@@ -3305,7 +3316,7 @@ mod tests {
         // And the encoder: block coders that read their blocks in place write
         // what the stream path, which copies them into the window, writes.
         let (len, block) = if cfg!(miri) {
-            (1_500, 600)
+            (600, 300)
         } else {
             (400_000, 1 << 16)
         };
