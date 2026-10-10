@@ -24,7 +24,9 @@
   39.0 s, xz 92.3 s), 4 MiB of x86 code from 1.30 s to 1.02 s (7-Zip 0.90 s)
   and a 9 MiB source tree from 3.30 s to 2.69 s (7-Zip 2.42 s), with peak RSS
   unchanged within run-to-run noise (117 MiB on the payloads, where 7-Zip
-  holds 188 and 382 MiB).
+  holds 188 and 382 MiB). On Zen 4 the same rows go from 4.09 s to 2.41 s
+  (7-Zip 1.87 s), 79.0 s to 43.5 s (7-Zip 41.9 s, xz 101.3 s), 0.98 s to
+  0.81 s (7-Zip 0.69 s) and 2.74 s to 2.24 s (7-Zip 1.89 s), verified.
 - The hash-chain levels (0 to 4) take each position's chain head a run of
   positions ahead. The C looks each head up in the big hash as it reaches
   the position, so every lookup is a cache miss the chain walk waits on;
@@ -38,7 +40,10 @@
   P-cores), CPU time for `.xz` of a 16 MiB payload: preset 3 from 4.18 s to
   2.97 s on one thread and from 3.80 s to 2.86 s on two; preset 1, whose
   tables mostly stay in cache there, from 1.62 s to 1.60 s on one thread
-  and from 2.03 s to 1.87 s on two. Supported, on a heavily loaded Apple
+  and from 2.03 s to 1.87 s on two. On Zen 4, verified the same way:
+  preset 1 from 1.48 s to 1.36 s on one thread and from 1.38 s to 1.27 s on
+  two, preset 3 from 2.11 s to 1.78 s and from 2.25 s to 1.81 s. Supported,
+  on a heavily loaded Apple
   Silicon host: preset 1 from 3.90 s to 2.91 s on one thread and preset 3
   from 4.96 s to 3.82 s.
 
