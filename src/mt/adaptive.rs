@@ -49,6 +49,12 @@ const OUT_STEP_ST: usize = 1 << 20;
 /// stream a page at a time.
 const MIN_BUF_BUDGET: u64 = 1 << 20;
 
+/// The least a caller's piece is counted as when the bound and the input
+/// budget are reckoned in pieces: the stream's own piece size governs, and
+/// this only keeps a stream fed in tiny pieces from being bound to a few of
+/// them.
+const MIN_PIECE: u64 = 64 << 10;
+
 /// The size a copied input piece is cut to when the budget allows more.
 ///
 /// Small enough that the pieces of a stream are all the same size and so
@@ -713,13 +719,15 @@ impl Lzma2AdaptiveDecoder {
     /// whole piece, so a pair counted at less than a piece in and a piece out
     /// refuses the piece the next run is in while every thread has work, and
     /// a caller reading in small pieces is held to what its pieces cost
-    /// rather than to a figure written for large ones.
+    /// rather than to a figure written for large ones. The slack is the same
+    /// piece, so a caller reading in 256 KiB pieces, as 7-Zip reads, is
+    /// allowed the 256 KiB of overrun 7-Zip keeps and not a mebibyte.
     fn pair_bound(&self) -> u64 {
         let (run_in, run_out) = self.run_pair();
         if run_in == 0 && run_out == 0 {
             return u64::MAX;
         }
-        let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
+        let piece = self.segs.piece_size().max(MIN_PIECE);
         let pair = run_in.saturating_add(run_out).max(piece.saturating_mul(2));
         // The runs already handed out count at their own sizes, and a run
         // landed and waiting its turn holds its slot's output; only the slots
@@ -1061,10 +1069,12 @@ impl Lzma2AdaptiveDecoder {
     /// over whole does not - it is the caller's own buffer - and a copy takes
     /// one parked buffer of however many there are, so once the piece is in,
     /// what is still parked is held on top of it. It is spare capacity and
-    /// nothing else, and it goes rather than take the decoder past the limit.
+    /// nothing else, and as much of it as would take the decoder past the
+    /// limit goes; the rest is what the next pieces are read into.
     fn fit_parked_input(&mut self) {
-        if self.segs.spare_bytes() > 0 && self.held_bytes() > self.limit() {
-            self.segs.shed_spare();
+        let over = self.held_bytes().saturating_sub(self.limit());
+        if self.segs.spare_bytes() > 0 && over > 0 {
+            self.segs.shed_spare_down(over);
         }
     }
 
@@ -1162,7 +1172,12 @@ impl Lzma2AdaptiveDecoder {
         let unknown = run_in == 0 && run_out == 0;
         // A run's packed bytes are not quite enough to claim it: the scanner
         // has to see where the next run starts before it will say the last one
-        // is complete, so the floor carries a header's worth beyond it.
+        // is complete, so the floor carries a header's worth beyond it. Input
+        // comes in the caller's pieces, so a header's worth is one piece. A
+        // fixed mebibyte here was a mebibyte of read-ahead over a bound whose
+        // slack is a 256 KiB piece: the input took the room the next run's
+        // output needed, and a two-thread decode of 1 MiB runs waited on its
+        // workers with a complete run in hand for half its wall time.
         //
         // And it carries what is charged but cannot be decoded - the front of
         // the piece the cursor is inside, and the pieces a worker has not let
@@ -1176,7 +1191,7 @@ impl Lzma2AdaptiveDecoder {
             .segs
             .dead_bytes()
             .saturating_add(run_in)
-            .saturating_add(MIN_BUF_BUDGET);
+            .saturating_add(self.segs.piece_size().max(MIN_PIECE));
         // Once the runs are known the limit is at most a pair per thread (see
         // `pair_bound`), so what the outputs are not owed is the input's: a
         // pair per thread is in plus out, and the outs are counted. Before
@@ -1460,10 +1475,23 @@ impl Lzma2AdaptiveDecoder {
         // What a piece the stream is past may be kept for, and in how many
         // buffers: the same allowance the output pool works to, so that
         // recycling never sits on a large part of the limit it would otherwise
-        // be dispatching with.
-        let piece = self.segs.piece_size().max(MIN_BUF_BUDGET);
-        let room = (self.limit() / 8).min(piece.saturating_mul(self.threads as u64 + 2));
-        self.segs.set_park_budget(room, self.threads + 2);
+        // be dispatching with. Within that, as much as a run's input: a run
+        // landing lets go of that many pieces at once and the next run is
+        // read into as many, as 7-Zip reads each block into a thread's chain
+        // of links kept from the block before. Kept to a few pieces, the rest
+        // went back to the allocator and the next run faulted its input in
+        // afresh.
+        let piece = self.segs.piece_size().max(MIN_PIECE);
+        let (run_in, _) = self.run_pair();
+        let room = (self.limit() / 8).min(
+            piece
+                .saturating_mul(self.threads as u64 + 2)
+                .max(run_in.saturating_add(piece)),
+        );
+        let slots = usize::try_from(room / piece)
+            .unwrap_or(usize::MAX)
+            .max(self.threads + 2);
+        self.segs.set_park_budget(room, slots);
         self.segs.retain_from(self.cursor_in);
     }
 
@@ -1849,12 +1877,20 @@ impl Lzma2AdaptiveDecoder {
         if after.saturating_add(self.dispatch_cost(run.unpacked_len)) > self.limit() {
             return false;
         }
+        // Over the limit by this much with everything parked still held.
+        let over = self
+            .held_bytes()
+            .saturating_add(self.dispatch_cost(run.unpacked_len))
+            .saturating_sub(self.limit());
         if let Some(last) = self.spare_out.pop() {
             self.spare_out.clear();
             self.spare_out.push(last);
         }
+        let outputs = self.spare_cap - keep;
         self.spare_cap = keep;
-        self.segs.shed_spare();
+        // Parked input goes only as far as the run needs: the rest is what
+        // the next pieces are read into.
+        self.segs.shed_spare_down(over.saturating_sub(outputs));
         true
     }
 
@@ -2454,7 +2490,9 @@ mod tests {
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
         assert_eq!(d.spare_cap, 0);
         assert!(d.spare_out.is_empty());
-        assert_eq!(d.segs.spare_bytes(), 0);
+        // The output buffers let go of cover the run, so the parked input,
+        // which the next pieces are read into, is kept.
+        assert!(d.segs.spare_bytes() > 0);
         assert!(d.held_bytes() <= d.memory_limit);
     }
 
