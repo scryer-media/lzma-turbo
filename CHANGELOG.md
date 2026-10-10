@@ -2,6 +2,38 @@
 
 ## 0.8.0 - 2026-10-09
 
+- The adaptive LZMA2 decoder holds less memory under its own limit. A run
+  pair used to count as at least 8 MiB whatever the caller read in, which put
+  the bound at 66 MiB for eight threads on a stream of 1 MiB runs; it now
+  counts as at least two of the caller's pieces, so a caller reading in 4 MiB
+  pieces keeps the bound it had and one reading in small pieces is held to
+  about a run pair per thread. The pair is reckoned over the runs the threads
+  take next, not the front run alone, and the slack beyond the pairs and the
+  floor of the buffer budget are the caller's piece (never under 64 KiB)
+  rather than a fixed mebibyte, which took the next run's output room from a
+  caller reading in small pieces and stalled it. Input parked for reuse is
+  budgeted to one run's input and a piece, capped at an eighth of the limit;
+  going over the limit sheds only the overshoot instead of every parked
+  piece, and released pieces are read into again instead of being faulted in
+  as fresh zero pages. Output buffers are sized on the thread that frees them
+  rather than grown on a worker, which kept freed pages in the worker's
+  allocator arena. Verified, medians of three on an x86-64 Linux host, 7z
+  decode of a 1 GiB LZMA2 archive with 256 KiB dictionaries read in 256 KiB
+  pieces: peak RSS at eight threads goes from 61-65 MiB to 23.3-23.4 MiB
+  (7-Zip 23.8-25.0), and at two threads from 28 MiB to 10.2-10.7 MiB (7-Zip
+  10.6-11.4), with decode time within half a percent of 7-Zip's or better on
+  every row; a 2 GiB archive decoded on four threads goes from 14.5 s and
+  1046 MiB to 14.2 s and 1036 MiB (7-Zip 14.1 s, 1036 MiB).
+- The BCJ2 decoder copies each run of the main stream as one slice. It used
+  to store a byte at a time through the call's streams, which kept the output
+  position in memory and spent most of the conversion storing it; it now finds
+  the byte that ends the run and copies up to it. The output is unchanged
+  (`bcj2_parity` against the SDK, and a test that cuts the output and the main
+  stream at, just before and just after a branch byte). Verified, median of
+  five on an x86-64 Linux host: converting a 64 MiB x86 payload takes 68.6 ms,
+  down from 82.8 ms. Verified, median of seven on an x86-64 Windows host: a
+  one-thread 7z BCJ2 decode goes from 0.97 to 0.99 of 7-Zip's time with its
+  filter thread off.
 - The threaded match finder's binary-tree walk tests the one byte at the
   current match length before it scans, as the SDK's `GetMatchesSpecN_2` does.
   Most nodes of a walk differ at that byte, so they now cost two byte loads
@@ -9,6 +41,14 @@
   ones that order the node. No `unsafe` is involved and the output is
   unchanged: the same bytes on the differential corpus at levels 1, 5 and 9,
   with one thread and threaded.
+- `Lzma2Encoder::mem_usage_per_thread` and `threads_reduced` follow what a
+  block thread allocates. A block coder with the threaded match finder reads
+  its block in place and has no window, so the window is no longer counted
+  for it; `encode_slice` hands its block threads the caller's slice, so it is
+  reduced against the estimate without a copy of each block, which
+  `encode_mt` still holds and counts. Under the same memory limit a threaded
+  binary-tree encode therefore runs more block threads than before. The
+  single-threaded finder's estimate, window and copy included, is unchanged.
 - `Lzma2Encoder` builds its encoder once. A block size or a thread split that
   changes the settings in force used to build a second one in place of the
   one `new` had made; the settings are now applied to that one, as
@@ -35,6 +75,26 @@
   longer makes the whole window and son table resident, and an encoder built
   for each small stream skips a fill the size of its tables. Output is
   unchanged. CI checks the allocation under Miri.
+- On Linux the encoder advises transparent huge pages
+  (`madvise(MADV_HUGEPAGE)`) for its large buffers - the match finder's
+  window, hash and son tables, the threaded finder's buffers and each block
+  thread's input - as the SDK's `BigAlloc` does for the same buffers. Only
+  the whole 2 MiB pages inside each buffer are advised; the allocation is
+  unchanged, the advice is best-effort and a kernel that refuses it changes
+  nothing, and no other system is touched. The tree walk misses the cache on
+  nearly every node, and huge pages take the TLB miss off each of those.
+  Verified, median of three on an x86-64 Linux host with transparent huge
+  pages in `madvise` mode, a 256 MiB level-5 two-block-thread encode (four
+  threads): 13.51 s, down from 14.70 s (1.09x), user CPU 51.1 s from 55.0 s;
+  the output is byte-identical.
+- A block thread's threaded match finder starts its hash and tree threads for
+  its first block and keeps them for every block after, as the SDK keeps the
+  threads `MatchFinderMt_Create` starts, where it started and joined a pair
+  for each block. The block is handed to the kept pair rather than to a
+  fresh one. Verified, median of three on the same host and encode: 13.74 s
+  against 13.55 s before (0.99x, inside the run-to-run spread of the before
+  arm, 13.26-14.20 s), so it is not a speed change at eight blocks a stream;
+  the output is byte-identical.
 - The match finder keeps a window that is already long enough instead of
   allocating again whenever the size differs, so an encoder used for inputs of
   different sizes allocates for the largest once.

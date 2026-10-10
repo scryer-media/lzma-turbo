@@ -394,13 +394,20 @@ impl Bcj2Dec {
                 // test it, and stop on the same byte, and the amount consumed
                 // from the main stream is taken from how far `dest` moved, so
                 // one byte-at-a-time loop is the same function.
+                //
+                // The loop here only looks: it finds the byte that stops the
+                // run, within what both the main stream and `dest` have, and
+                // the run up to and including it is then copied as one slice.
+                // Storing through `s` a byte at a time costs a store of
+                // `dest_pos` per byte, which is most of the conversion.
                 let main = s.bufs[STREAM_MAIN];
+                let start = s.dest_pos;
+                let n = main.len().min(s.dest.len() - start);
+                let src = &main[..n];
                 let mut copied = 0usize;
                 let mut found = false;
-                while copied != main.len() && s.dest_pos != s.dest.len() {
-                    let b = u32::from(main[copied]);
-                    s.dest[s.dest_pos] = b as u8;
-                    s.dest_pos += 1;
+                while copied != n {
+                    let b = u32::from(src[copied]);
                     copied += 1;
                     v = (v << 24) | b;
                     if is_branch_byte(b) || is_long_jump(v) {
@@ -408,6 +415,8 @@ impl Bcj2Dec {
                         break;
                     }
                 }
+                s.dest[start..start + copied].copy_from_slice(&src[..copied]);
+                s.dest_pos = start + copied;
                 s.bufs[STREAM_MAIN] = &main[copied..];
                 self.ip = self.ip.wrapping_add(copied as u32);
 
@@ -1198,6 +1207,82 @@ mod tests {
                 d += st.dest_pos;
             }
             assert_eq!(out, src, "chunk {chunk}");
+        }
+    }
+
+    /// A run of the main stream is copied up to the byte that stops it, so the
+    /// edges that matter are an output window or a main-stream slice ending
+    /// inside a long run, exactly on the branch byte that ends one, or just
+    /// after it. Every cut from a few bytes before each branch byte to a few
+    /// after is tried, against the output and against the main stream, and
+    /// the bytes must come out the same as one call.
+    #[test]
+    fn a_cut_at_or_near_a_branch_byte_changes_nothing() {
+        let mut src = vec![0x90u8; 1000];
+        let call_at = src.len();
+        src.push(0xE8);
+        src.extend_from_slice(&0x0000_1234u32.to_le_bytes());
+        src.extend_from_slice(&[0x90; 700]);
+        let long_jump_at = src.len() + 1;
+        src.extend_from_slice(&[0x0F, 0x84]);
+        src.extend_from_slice(&0x0000_0040u32.to_le_bytes());
+        src.extend_from_slice(&[0x90; 300]);
+        let s = encode_to_streams(&src);
+        assert!(!s.call.is_empty(), "the call should have been converted");
+        assert_eq!(
+            decode_to_vec(&s.main, &s.call, &s.jump, &s.rc, src.len()).expect("decode"),
+            src
+        );
+
+        // Where each branch byte sits in the main stream: before the call
+        // nothing has been taken out, and the call's four bytes went to the
+        // call stream.
+        let main_cuts = [call_at, long_jump_at - 4];
+        let out_cuts = [call_at, long_jump_at];
+        let near = |at: usize| at.saturating_sub(3)..=at + 3;
+        // What is left of each stream after a call, as the tails of the
+        // whole streams, so that the next call borrows them afresh.
+        fn rest_of(s: &Bcj2Streams, left: [usize; NUM_STREAMS]) -> [&[u8]; NUM_STREAMS] {
+            let whole: [&[u8]; NUM_STREAMS] = [&s.main, &s.call, &s.jump, &s.rc];
+            core::array::from_fn(|k| &whole[k][whole[k].len() - left[k]..])
+        }
+
+        // The output window ends near a branch byte; the streams are whole.
+        for &at in &out_cuts {
+            for cut in near(at) {
+                let mut out = vec![0u8; src.len()];
+                let mut dec = Bcj2Dec::new();
+                let mut st = Bcj2DecStreams::new(&s.main, &s.call, &s.jump, &s.rc, &mut out[..cut]);
+                dec.decode(&mut st).expect("decode");
+                assert_eq!(st.dest_pos, cut, "a window of {cut} should be filled");
+                let left = st.bufs.map(<[u8]>::len);
+                let [m, c, j, r] = rest_of(&s, left);
+                let mut st = Bcj2DecStreams::new(m, c, j, r, &mut out[cut..]);
+                dec.decode(&mut st).expect("decode");
+                assert_eq!(cut + st.dest_pos, src.len());
+                assert_eq!(out, src, "output cut at {cut}");
+            }
+        }
+
+        // The main stream ends near a branch byte; the output is whole.
+        for &at in &main_cuts {
+            for cut in near(at) {
+                let mut out = vec![0u8; src.len()];
+                let mut dec = Bcj2Dec::new();
+                let mut st = Bcj2DecStreams::new(&s.main[..cut], &s.call, &s.jump, &s.rc, &mut out);
+                dec.decode(&mut st).expect("decode");
+                assert!(
+                    st.bufs[STREAM_MAIN].is_empty(),
+                    "main cut at {cut} not all taken"
+                );
+                let (mut left, done) = (st.bufs.map(<[u8]>::len), st.dest_pos);
+                left[STREAM_MAIN] = s.main.len() - cut;
+                let [m, c, j, r] = rest_of(&s, left);
+                let mut st = Bcj2DecStreams::new(m, c, j, r, &mut out[done..]);
+                dec.decode(&mut st).expect("decode");
+                assert_eq!(done + st.dest_pos, src.len());
+                assert_eq!(out, src, "main cut at {cut}");
+            }
         }
     }
 

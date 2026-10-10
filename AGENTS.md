@@ -22,9 +22,15 @@ port rules and what was left out are in `docs/encoder.md`.
 3. `unsafe` is allowed where the C relies on the margin invariant, and
    elsewhere only where CI verifies it: a differential test against a checked
    version of the same code, run natively in the ordinary suite and under Miri
-   in a CI job that `ci-complete` requires. Two cases exist today, both
+   in a CI job that `ci-complete` requires. Three cases exist today, all
    verified by the `unchecked-kernel-miri` job: the threaded match finder's
-   tree walk, and the match finder's zeroed allocation (`zeroed_vec`). Every `unsafe` block carries a `// SAFETY:` comment stating the
+   tree walk, the match finder's zeroed allocation (`zeroed_vec`), and the
+   threaded finder's direct-input hand-off (`run_block`), whose test reads
+   the same blocks through it and through the copying window path. An FFI
+   advice call whose only soundness condition is its range, such as
+   `madvise_hugepage` in `src/enc/huge_pages.rs`, is verified instead by the
+   range tests and a native Linux test of the real call on a filled buffer,
+   both in the ordinary suite: Miri has no `madvise`. Every `unsafe` block carries a `// SAFETY:` comment stating the
    invariant that makes it sound and which check established it.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only

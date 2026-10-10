@@ -81,7 +81,10 @@ impl Finder {
     }
 
     /// C: `MatchFinder_Create` or `MatchFinderMt_Create`. `data_limit` is the
-    /// promise [`MatchFinder::create`] documents.
+    /// promise [`MatchFinder::create`] documents. `direct` asks the threaded
+    /// finder for no window, the input being a block it will read in place
+    /// (`MatchFinderMt::create`); the single-threaded finder always reads
+    /// through its window and ignores it.
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -89,15 +92,21 @@ impl Finder {
         match_max_len: u32,
         keep_add_buffer_after: u32,
         data_limit: u64,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
     ) -> Result<(), Error> {
         match self {
-            Finder::St(mf) => mf.create(
-                history_size,
-                keep_add_buffer_before,
-                match_max_len,
-                keep_add_buffer_after,
-                data_limit,
-            ),
+            Finder::St(mf) => {
+                // A finder switched back from the threaded one keeps the
+                // flag that one was last created with.
+                mf.direct_input = false;
+                mf.create(
+                    history_size,
+                    keep_add_buffer_before,
+                    match_max_len,
+                    keep_add_buffer_after,
+                    data_limit,
+                )
+            }
             #[cfg(feature = "std")]
             Finder::Mt(mt) => mt.create(
                 history_size,
@@ -105,6 +114,7 @@ impl Finder {
                 match_max_len,
                 keep_add_buffer_after,
                 data_limit,
+                direct,
             ),
         }
     }
@@ -114,6 +124,8 @@ impl Finder {
     /// `mt` is `p->mtMode` as `LzmaEnc_Alloc` will compute it, not
     /// [`Finder::is_mt`]: the estimate is taken before anything is allocated,
     /// when the finder is still the single-threaded one it was constructed as.
+    /// `direct` is [`Finder::create`]'s: the threaded finder then counts no
+    /// window, and the single-threaded one, which always has one, ignores it.
     pub(crate) fn mem_usage(
         &mut self,
         mt: bool,
@@ -121,6 +133,7 @@ impl Finder {
         keep_add_buffer_before: u32,
         match_max_len: u32,
         keep_add_buffer_after: u32,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
     ) -> Result<u64, Error> {
         #[cfg(feature = "std")]
         if mt {
@@ -130,6 +143,7 @@ impl Finder {
                 keep_add_buffer_before,
                 match_max_len,
                 keep_add_buffer_after,
+                direct,
             );
         }
         #[cfg(not(feature = "std"))]
@@ -139,6 +153,7 @@ impl Finder {
             keep_add_buffer_before,
             match_max_len,
             keep_add_buffer_after,
+            true,
         )
     }
 
@@ -220,17 +235,45 @@ impl Finder {
         }
     }
 
-    /// The handle the threaded finder's producer threads are started from.
+    /// The handle a stream's pair of producer threads is started from, by
+    /// [`crate::enc::lz_find_mt::with_threads`].
     ///
     /// C: there is no analogue - the C's threads are created once in
-    /// `MatchFinderMt_Create` and live until the encoder is destroyed. Here
-    /// they are scoped to one block, so the caller that owns the input for
-    /// that block is the one that starts them.
+    /// `MatchFinderMt_Create` and live until the encoder is destroyed. On the
+    /// stream path they are scoped to the stream, so the caller that owns the
+    /// input is the one that starts them.
     #[cfg(feature = "std")]
-    pub(crate) fn mt_handle(&self) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
+    pub(crate) fn mt_handle(
+        &mut self,
+    ) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
         match self {
             Finder::St(_) => None,
-            Finder::Mt(mt) => mt.shared_handle().cloned(),
+            Finder::Mt(mt) => mt.stream_handle(),
+        }
+    }
+
+    /// The handle [`crate::enc::lz_find_mt::run_block`] runs a block with,
+    /// the finder's pair of producer threads running and kept for the next.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if a thread cannot be started.
+    #[cfg(feature = "std")]
+    pub(crate) fn mt_block_handle(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>>, Error> {
+        match self {
+            Finder::St(_) => Ok(None),
+            Finder::Mt(mt) => mt.block_handle(),
+        }
+    }
+
+    /// How many pairs of producer threads the finder has started for blocks.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn mt_spawns(&self) -> u32 {
+        match self {
+            Finder::St(_) => 0,
+            Finder::Mt(mt) => mt.spawns,
         }
     }
 

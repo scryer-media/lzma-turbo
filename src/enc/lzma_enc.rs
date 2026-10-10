@@ -1772,7 +1772,7 @@ impl LzmaEnc {
 
     /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
     /// promise for this stream.
-    fn alloc(&mut self, keep_window_size: u32, data_limit: u64) -> Result<(), Error> {
+    fn alloc(&mut self, keep_window_size: u32, data_limit: u64, direct: bool) -> Result<(), Error> {
         {
             let lclp = self.lc + self.lp;
             if self.lit_probs.is_empty() || self.lclp != lclp {
@@ -1827,6 +1827,7 @@ impl LzmaEnc {
             self.num_fast_bytes,
             LZMA_MATCH_LEN_MAX + 1,
             data_limit,
+            direct,
         )
     }
 
@@ -1851,8 +1852,16 @@ impl LzmaEnc {
                 before_size,
                 self.num_fast_bytes,
                 LZMA_MATCH_LEN_MAX + 1,
+                false,
             )
             .map(|_| ())
+    }
+
+    /// [`Self::mem_usage_for`] for an encoder prepared to read through its
+    /// window.
+    #[cfg(test)]
+    pub(crate) fn mem_usage(&mut self) -> u64 {
+        self.mem_usage_for(false)
     }
 
     /// What one encoder of this configuration is estimated to need, in bytes:
@@ -1863,7 +1872,10 @@ impl LzmaEnc {
     /// C: 7-Zip computes the same quantity outside `C/` to reduce the block
     /// thread count to a memory budget; the arithmetic here is this port's own
     /// allocation sites, not a formula copied from there.
-    pub(crate) fn mem_usage(&mut self) -> u64 {
+    ///
+    /// With `direct`, for an encoder `mem_prepare_direct` prepares: a
+    /// threaded finder then allocates no window, and the estimate counts none.
+    pub(crate) fn mem_usage_for(&mut self, direct: bool) -> u64 {
         self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
         let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;
 
@@ -1886,6 +1898,7 @@ impl LzmaEnc {
                 before_size,
                 self.num_fast_bytes,
                 LZMA_MATCH_LEN_MAX + 1,
+                direct,
             )
             .unwrap_or(0);
         mf.saturating_add(lit_probs)
@@ -1959,7 +1972,7 @@ impl LzmaEnc {
     }
 
     /// C: `LzmaEnc_AllocAndInit`.
-    fn alloc_and_init(&mut self, keep_window_size: u32) -> Result<(), Error> {
+    fn alloc_and_init(&mut self, keep_window_size: u32, direct: bool) -> Result<(), Error> {
         let mut i = (K_END_POS_MODEL_INDEX / 2) as usize;
         while (i as u32) < K_DIC_LOG_SIZE_MAX {
             if self.dict_size <= (1u32 << i) {
@@ -1975,7 +1988,7 @@ impl LzmaEnc {
         self.need_init = true;
         // The promise is for this stream alone.
         let data_limit = core::mem::replace(&mut self.data_limit, u64::MAX);
-        self.alloc(keep_window_size, data_limit)?;
+        self.alloc(keep_window_size, data_limit, direct)?;
         self.init_state();
         self.init_prices();
         Ok(())
@@ -1984,20 +1997,55 @@ impl LzmaEnc {
     /// C: `LzmaEnc_Prepare` / `LzmaEnc_PrepareForLzma2`. The stream itself is
     /// passed to [`Self::code_one_block`] rather than stored.
     pub(crate) fn prepare(&mut self, keep_window_size: u32) -> Result<(), Error> {
-        self.alloc_and_init(keep_window_size)
+        self.alloc_and_init(keep_window_size, false)
     }
 
     /// C: `LzmaEnc_MemPrepare`, whose `MatchFinder_SET_DIRECT_INPUT_BUF` also
     /// sets `expectedDataSize` from the source length.
     pub(crate) fn mem_prepare(&mut self, src_len: u64, keep_window_size: u32) -> Result<(), Error> {
         self.set_data_size(src_len);
-        self.alloc_and_init(keep_window_size)
+        self.alloc_and_init(keep_window_size, false)
+    }
+
+    /// [`Self::mem_prepare`] with the C's `directInput` as well: a threaded
+    /// finder allocates no window, and reads the block in place once
+    /// [`crate::enc::lz_find_mt::run_block`] hands it over. The caller must
+    /// code the block through `run_block` whenever
+    /// [`Self::mt_block_handle`] gives it a handle.
+    #[cfg(feature = "std")]
+    pub(crate) fn mem_prepare_direct(
+        &mut self,
+        src_len: u64,
+        keep_window_size: u32,
+    ) -> Result<(), Error> {
+        self.set_data_size(src_len);
+        self.alloc_and_init(keep_window_size, true)
     }
 
     /// The threaded match finder's handle, when one is in use.
     #[cfg(feature = "std")]
-    pub(crate) fn mt_handle(&self) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
+    pub(crate) fn mt_handle(
+        &mut self,
+    ) -> Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>> {
         self.mf.mt_handle()
+    }
+
+    /// The threaded match finder's handle for one block, its threads running.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Alloc`] if a thread cannot be started.
+    #[cfg(feature = "std")]
+    pub(crate) fn mt_block_handle(
+        &mut self,
+    ) -> Result<Option<alloc::sync::Arc<crate::enc::lz_find_mt::MtShared>>, Error> {
+        self.mf.mt_block_handle()
+    }
+
+    /// How many pairs of producer threads the finder has started for blocks.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn mt_spawns(&self) -> u32 {
+        self.mf.mt_spawns()
     }
 
     /// C: `LzmaEnc_GetCurBuf`, as an offset into the match finder's window.
