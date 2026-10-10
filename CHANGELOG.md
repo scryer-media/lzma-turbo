@@ -21,6 +21,19 @@
   a tenth. The walk allocates nothing; peak memory stays within the spread
   the old walk shows from run to run (327-383 MiB at four threads, 108 MiB
   at two).
+- The threaded match finder's hash thread runs one loop per hash kind,
+  chosen once per block as the SDK's `GetHeads` family is, over byte tables
+  with the hash mask folded in. The single loop it replaces matched on the
+  kind at every position, which x86-64 builds compiled to a jump-table
+  dispatch per position with each byte read bounds-checked. The heads and
+  the hash table are unchanged, which a differential test checks for every
+  kind. Verified on Zen 4 by fixed-period counts over 48 MiB at level 5 with
+  two finder threads: the hash thread retires 0.81G user instructions
+  instead of 1.87G, about 16 a position against 7-Zip 26.03's 19. The hash
+  thread is not the critical path, so wall time moves within noise (single
+  runs of a 256 MiB 7z encode at level 5: four threads 0.88 to 0.89 of
+  7-Zip's speed, two threads 0.96 both times), while the encode's user CPU
+  time falls by about 6% at both thread counts.
 
 ## 0.8.0 - 2026-10-09
 
