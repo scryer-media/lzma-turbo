@@ -28,24 +28,24 @@ fn interior(addr: usize, len: usize) -> Option<(usize, usize)> {
 }
 
 /// Advise the huge pages inside `[addr, addr + len)` through `call`, which
-/// is given a start and a length and returns what `madvise` returns. Whatever
-/// it returns is ignored: the advice never fails the allocation it is for.
-/// Returns whether `call` was made.
-fn advise_with(addr: usize, len: usize, call: impl FnOnce(usize, usize) -> i32) -> bool {
-    match interior(addr, len) {
-        Some((start, length)) => {
-            let _ = call(start, length);
-            true
-        }
-        None => false,
-    }
+/// is given a start and a length and returns what `madvise` returns. Returns
+/// that, or `None` when there was nothing to advise and `call` was not made.
+fn advise_with(addr: usize, len: usize, call: impl FnOnce(usize, usize) -> i32) -> Option<i32> {
+    interior(addr, len).map(|(start, length)| call(start, length))
+}
+
+/// [`advise_vec`], with what `madvise` returned.
+fn advise_vec_result<T>(v: &alloc::vec::Vec<T>) -> Option<i32> {
+    let len = v.capacity().saturating_mul(core::mem::size_of::<T>());
+    advise_with(v.as_ptr() as usize, len, madvise_hugepage)
 }
 
 /// Advise huge pages for the whole of `v`'s allocation, its spare capacity
 /// included, so a buffer advised before it is filled is faulted in huge pages.
+/// Whatever the kernel answers is ignored: the advice never fails the
+/// allocation it is for.
 pub(crate) fn advise_vec<T>(v: &alloc::vec::Vec<T>) {
-    let len = v.capacity().saturating_mul(core::mem::size_of::<T>());
-    advise_with(v.as_ptr() as usize, len, madvise_hugepage);
+    let _ = advise_vec_result(v);
 }
 
 #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
@@ -63,7 +63,10 @@ fn madvise_hugepage(start: usize, length: usize) -> i32 {
     // the range: it only lets the kernel back it with huge pages. The range
     // is page-aligned (`interior` aligns it to 2 MiB) and lies inside the
     // caller's allocation; a range the kernel will not advise comes back as
-    // an error, which `advise_with` ignores.
+    // an error, which `advise_vec` ignores. Miri has no `madvise`, so the
+    // range is verified by `the_advice_covers_only_whole_huge_pages_inside_the_buffer`
+    // and the call itself, natively, by
+    // `the_kernel_takes_the_advice_and_the_bytes_are_unchanged`.
     unsafe { madvise(start as *mut core::ffi::c_void, length, MADV_HUGEPAGE) }
 }
 
@@ -110,11 +113,11 @@ mod tests {
                 seen = Some((s, l));
                 ret
             });
-            assert!(made);
+            assert_eq!(made, Some(ret));
             assert_eq!(seen, Some((2 * HUGE_PAGE, 4 << 20)));
         }
         let made = advise_with(16, 4096, |_, _| panic!("a small buffer is never advised"));
-        assert!(!made);
+        assert_eq!(made, None);
     }
 
     /// The real advice on real buffers - empty, small, and large and still
@@ -130,5 +133,44 @@ mod tests {
         advise_vec(&big);
         big.resize(3 << 20, 9);
         assert!(big.iter().all(|&w| w == 9));
+    }
+
+    /// The real `madvise` on a filled buffer above the threshold: the range
+    /// it is given lies inside the allocation and on huge-page boundaries,
+    /// the kernel accepts it, and every byte is what it was. A kernel without
+    /// transparent huge pages has no such advice to take, and the test stops
+    /// there, after the bytes have been checked.
+    #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
+    #[test]
+    fn the_kernel_takes_the_advice_and_the_bytes_are_unchanged() {
+        let pattern = |i: usize| (i.wrapping_mul(31) ^ (i >> 11)) as u8;
+        let len = 6 << 20;
+        let mut buf: alloc::vec::Vec<u8> = (0..len).map(pattern).collect();
+        let addr = buf.as_ptr() as usize;
+        let cap = buf.capacity();
+        let (start, length) = interior(addr, cap).expect("6 MiB holds a whole huge page");
+        assert!(start >= addr && start + length <= addr + cap);
+        assert_eq!(start % HUGE_PAGE, 0);
+        assert_eq!(length % HUGE_PAGE, 0);
+
+        let ret = advise_vec_result(&buf);
+        let err = std::io::Error::last_os_error();
+        assert!(buf.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+        // And through the path the encoder takes, the buffer still usable.
+        advise_vec(&buf);
+        buf[len - 1] ^= 0xFF;
+        assert_eq!(buf[len - 1], pattern(len - 1) ^ 0xFF);
+        assert!(
+            buf[..len - 1]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == pattern(i))
+        );
+
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            std::eprintln!("skipped: this kernel has no transparent huge pages");
+            return;
+        }
+        assert_eq!(ret, Some(0), "madvise(MADV_HUGEPAGE) refused: {err}");
     }
 }
