@@ -16,6 +16,16 @@
   unchanged (`tests/adaptive.rs` decodes the same stream with hand-back on
   while widening, and checks that read-ahead at or below the ceiling leaves
   `memory_limit` as it was).
+- A thread under the ceiling is no longer kept idle by input read ahead
+  behind the run it would take. When the read-ahead or the ceiling came down,
+  input already held for the wider read-ahead counted against the next
+  dispatch, so a caller that widened from three threads reading ahead for six
+  to four reading ahead for four had its fourth claim refused until a run
+  landed: one of four threads idle for a whole run's decode. Under the pair
+  bound an idle thread now discounts the input held behind its run; the
+  caller's own `memory_limit` is still never exceeded, and no further input
+  is taken while the decoder is over the bound. A test feeds that state and
+  asserts the fourth claim, which the accounting before this refused.
 
 ## 0.8.0 - 2026-10-09
 

@@ -1909,8 +1909,36 @@ impl Lzma2AdaptiveDecoder {
     /// costs on top of what is already held is only what the one it will reuse
     /// does not already cover, because that is parked capacity, counted where
     /// it sits, and dispatch moves it rather than allocating more.
+    ///
+    /// Under the caller's limit, always. Under the pair bound, a thread under
+    /// the ceiling with no run is not kept idle by input read ahead behind the
+    /// run it would take: that input was taken under a bound that counted it,
+    /// for a read-ahead or a ceiling that has since come down, and it is
+    /// handed out a run at a time as threads come free whether this run goes
+    /// or not. Counted against the run, it left one thread of four idle for a
+    /// whole run's decode each time a caller widened past the read-ahead it
+    /// had asked for. Nothing more is taken in until the decoder is back under
+    /// the bound, so what is held over it is input already held and never
+    /// more.
     fn room_for(&self, run: Lzma2Run) -> bool {
-        self.held_bytes() + self.dispatch_cost(run.unpacked_len) <= self.limit()
+        self.room_with(self.held_bytes(), run)
+    }
+
+    /// [`Self::room_for`], with `held` in place of what is held now.
+    fn room_with(&self, held: u64, run: Lzma2Run) -> bool {
+        let after = held.saturating_add(self.dispatch_cost(run.unpacked_len));
+        if after <= self.limit() {
+            return true;
+        }
+        if after > self.memory_limit {
+            return false;
+        }
+        let landed = self.ready.len() + usize::from(self.part.is_some());
+        if self.outstanding + landed >= self.threads {
+            return false;
+        }
+        let behind: u64 = self.pending.iter().skip(1).map(|r| r.packed_len).sum();
+        after.saturating_sub(behind) <= self.pair_bound()
     }
 
     /// Gives back the parked capacity a dispatch of `run` would not reuse, if
@@ -1930,8 +1958,7 @@ impl Lzma2AdaptiveDecoder {
         if unused == 0 {
             return false;
         }
-        let after = self.held_bytes() - unused;
-        if after.saturating_add(self.dispatch_cost(run.unpacked_len)) > self.limit() {
+        if !self.room_with(self.held_bytes() - unused, run) {
             return false;
         }
         // Over the limit by this much with everything parked still held.
