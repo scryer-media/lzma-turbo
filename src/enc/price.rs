@@ -13,6 +13,11 @@ use crate::enc::stream::SeqOutStream;
 /// C: `CProbPrice ProbPrices[kBitModelTotal >> kNumMoveReducingBits]`.
 pub(crate) type ProbPrices = [u32; (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize];
 
+/// A probability is below `kBitModelTotal`, so its price index already fits
+/// [`ProbPrices`]; masking it says so to the compiler, which then drops the
+/// bounds check from every price lookup. The mask never changes an index.
+const PP_MASK: usize = (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize - 1;
+
 /// C: `LzmaEnc_InitPriceTables`.
 pub(crate) fn init_price_tables() -> ProbPrices {
     let mut prices: ProbPrices = [0; (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize];
@@ -38,19 +43,19 @@ pub(crate) fn init_price_tables() -> ProbPrices {
 #[inline]
 pub(crate) fn price(pp: &ProbPrices, prob: u16, bit: u32) -> u32 {
     let masked = u32::from(prob) ^ (0u32.wrapping_sub(bit) & (K_BIT_MODEL_TOTAL - 1));
-    pp[(masked >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[(masked >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `GET_PRICEa_0(prob)`.
 #[inline]
 pub(crate) fn price_0(pp: &ProbPrices, prob: u16) -> u32 {
-    pp[(u32::from(prob) >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[(u32::from(prob) >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `GET_PRICEa_1(prob)`.
 #[inline]
 pub(crate) fn price_1(pp: &ProbPrices, prob: u16) -> u32 {
-    pp[((u32::from(prob) ^ (K_BIT_MODEL_TOTAL - 1)) >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[((u32::from(prob) ^ (K_BIT_MODEL_TOTAL - 1)) >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `LitEnc_GetPrice`.
