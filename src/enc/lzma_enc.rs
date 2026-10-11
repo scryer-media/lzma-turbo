@@ -119,6 +119,13 @@ pub(crate) struct LzmaEnc {
     fast_mode: bool,
     /// C: `p->multiThread`.
     multi_thread: bool,
+    /// Whether this stream's caller can hand the threaded finder's threads
+    /// their input. The C's `MatchFinderMt_Create` starts them for every
+    /// `mtMode` encoder (`C/LzFindMt.c:875`), so `mtMode` there always has
+    /// threads to drive; here a stream that is not `Send` cannot be given to
+    /// them, and an encoder coding one must not pick that finder. True except
+    /// while such a stream is coded.
+    pub(crate) finder_threads: bool,
     /// Whether a binary tree in normal mode held to one thread takes the
     /// inline finder ([`FinderMode::Inline`]) rather than the C's
     /// single-threaded one. Always, except for the push encoders, whose
@@ -200,6 +207,7 @@ impl LzmaEnc {
             lclp: u32::MAX,
             fast_mode: false,
             multi_thread: false,
+            finder_threads: true,
             inline_finder: true,
             write_end_mark: false,
             finished: false,
@@ -1772,7 +1780,10 @@ impl LzmaEnc {
         if !cfg!(feature = "std") || self.fast_mode || !self.mf.cfg().kind.bt_mode() {
             return FinderMode::St;
         }
-        if self.multi_thread {
+        // The threaded finder only where its threads can be given the
+        // input; otherwise the one-thread choice below, whose matches the
+        // C's `mtMode = 0` encoder finds.
+        if self.multi_thread && self.finder_threads {
             return FinderMode::Threaded;
         }
         #[cfg(feature = "kernel-ab")]

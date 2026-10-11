@@ -55,6 +55,51 @@
   16 MiB payload, 18.02G to 17.70G instructions and 9.20G to 9.15G cycles
   (seven pairs); on 64 MiB, 73.24G to 71.97G instructions and 40.02G to
   39.80G cycles (two pairs).
+- A one-thread encoder's inline match finder leaves its hash and match
+  blocks to the allocator's zeroed pages instead of filling them. Each block
+  is written before it is read, so a stream shorter than a block never
+  touches the rest, and small streams no longer pay the 0.75 MiB the fill
+  made resident. The output and the instruction count are unchanged.
+  Supported, peak RSS of a 3 KiB stream on an x86-64 Linux host, smallest of
+  four runs: 7808 KiB before, 7020 KiB after, against 6944 KiB with the
+  single-threaded finder the inline one replaced.
+- `Lzma2Encoder::set_props` and `LzmaEncoder::set_props` give a used
+  encoder new settings, as `LzmaEnc_SetProps` does, so that a writer of many
+  streams can keep one encoder where it built one per stream, as 7-Zip's 7z
+  writer keeps one coder per write and gives it each folder's settings. The
+  next stream is byte for byte what a new encoder with those settings
+  writes, and the match finder keeps its window and tables while they are
+  long enough for the new settings, as `MatchFinder_Create` keeps them. An
+  encoder that moves between the inline and the single-threaded finder now
+  keeps the window, the tables and the hand-off buffers across the switch,
+  as the C's one `MFB` and its `hashBuf` stay put whichever finder
+  `LzmaEnc_Alloc` picks; before, each switch freed them and allocated again.
+  Verified, medians of three on an x86-64 Linux host (Alder Lake, one
+  P-core), 2000 streams of 50 to 100 KiB at levels 5, 6, 7 and 9 through
+  `encode_send`, identical output in every mode: a new encoder per stream
+  takes 9.67 s and 25,112 KiB peak RSS; one encoder given each stream's
+  settings takes 9.34 s and 21,668 KiB, against 21,036 KiB for a single
+  stream.
+- `Lzma2Encoder::set_data_limit` promises that each stream supplies at most
+  that many bytes, so the streamed encoders size the window to the input as
+  `encode_slice` sizes it to its slice. The output is unchanged byte for
+  byte; a stream that supplies more fails rather than being read past the
+  promise. Verified on the same host and streams: a new encoder per stream
+  with the limit set takes 9.60 s and 23,284 KiB, and one encoder with new
+  settings and the limit 9.45 s and 21,720 KiB.
+
+### Fixed
+
+- `Lzma2Encoder::encode`, `LzmaEncoder::encode` and
+  `LzmaEncoder::encode_sized` no longer hang when the settings ask for two
+  match-finder threads (`LzmaEncProps::with_num_threads(2)`). These take a
+  stream that is not `Send`, which the threaded finder's threads cannot be
+  given, yet they picked that finder and then waited for blocks no thread
+  would fill. The C starts the threads in `MatchFinderMt_Create` for every
+  encoder that picks the threaded finder, so it always has them to drive;
+  these paths now take the finder one thread drives and write what one
+  finder thread writes. `encode_send` and `encode_sized_send` still start
+  the threads. Verified by tests on both encoders.
 
 ## 0.8.0 - 2026-10-09
 

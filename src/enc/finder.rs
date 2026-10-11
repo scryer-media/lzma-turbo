@@ -61,12 +61,17 @@ impl Finder {
         }
     }
 
-    /// Switches back to the single-threaded finder.
+    /// Switches back to the single-threaded finder, keeping the settings and
+    /// the window and table the threaded one allocated.
+    ///
+    /// C: the `else` arm of `LzmaEnc_Alloc`, whose `MatchFinder_Create`
+    /// works on the same `MFB` the threaded finder did.
     #[cfg(feature = "std")]
     pub(crate) fn make_st(&mut self) {
-        if let Finder::Mt(mt) = self {
-            let mfb = core::mem::replace(&mut mt.mfb, MatchFinder::new());
-            *self = Finder::St(mfb);
+        if matches!(self, Finder::Mt(_))
+            && let Finder::Mt(mt) = core::mem::replace(self, Finder::St(MatchFinder::new()))
+        {
+            *self = Finder::St(mt.into_st());
         }
     }
 

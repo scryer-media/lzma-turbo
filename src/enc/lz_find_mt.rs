@@ -2073,6 +2073,37 @@ impl Drop for MatchFinderMt {
 }
 
 impl MatchFinderMt {
+    /// The `CMatchFinder` this finder was configured through, holding the
+    /// window and table this finder last allocated, for
+    /// [`crate::enc::finder::Finder::make_st`], and the hand-off buffers
+    /// parked in it. The threads are stopped.
+    ///
+    /// C: there is one `MFB` for both finders (`C/LzmaEnc.c:494`), so the
+    /// single-threaded `MatchFinder_Create` (`C/LzmaEnc.c:2761`) finds the
+    /// window and table the threaded one left and keeps them while they are
+    /// long enough (`C/LzFind.c:394`, `C/LzFind.c:479`).
+    pub(crate) fn into_st(mut self) -> MatchFinder {
+        self.retire_threads();
+        let mut mfb = core::mem::replace(&mut self.mfb, MatchFinder::new());
+        if let Some(sh) = self.sh.take() {
+            // SAFETY: as for `own` in `create`: the threads of a block pair
+            // were joined just above, a stream's are joined when its stream
+            // ends, and nothing else holds `sh`.
+            let own = unsafe {
+                *sh.common.get() = Common::empty();
+                &mut *sh.own.get()
+            };
+            if mfb.buf_base.is_empty() {
+                mfb.buf_base = core::mem::take(&mut own.win);
+            }
+            if mfb.hash.is_empty() {
+                mfb.hash = core::mem::take(&mut own.tab);
+            }
+            mfb.mt_bufs = core::mem::take(&mut own.bufs);
+        }
+        mfb
+    }
+
     /// C: `MatchFinderMt_Construct`.
     pub(crate) fn new() -> Self {
         MatchFinderMt {
@@ -2137,9 +2168,21 @@ impl MatchFinderMt {
             *sh.common.get() = Common::empty();
             &mut *sh.own.get()
         };
-        self.mfb.buf_base = core::mem::take(&mut own.win);
-        self.mfb.hash = core::mem::take(&mut own.tab);
+        // A finder [`crate::enc::finder::Finder::make_mt`] has just made
+        // holds nothing in `sh` yet, and its `mfb` holds what the
+        // single-threaded finder allocated: those are kept, as the C's one
+        // `MFB` keeps them whichever finder `LzmaEnc_Alloc` picks
+        // (`C/LzmaEnc.c:494`, `C/LzFindMt.c:872`).
+        if !own.win.is_empty() {
+            self.mfb.buf_base = core::mem::take(&mut own.win);
+        }
+        if !own.tab.is_empty() {
+            self.mfb.hash = core::mem::take(&mut own.tab);
+        }
         let mut bufs = core::mem::take(&mut own.bufs);
+        if bufs.is_empty() {
+            bufs = core::mem::take(&mut self.mfb.mt_bufs);
+        }
         self.sh = Some(Arc::clone(&sh));
         if bufs.len() == bufs_len {
             // Every word of a hash block and of a bt block is written by the
@@ -2148,10 +2191,14 @@ impl MatchFinderMt {
             // parks on them after a failure.
             bufs[hash_words + bt_words..].fill(0);
         } else {
-            bufs = Vec::new();
-            bufs.try_reserve_exact(bufs_len).map_err(|_| Error::Alloc)?;
-            crate::enc::huge_pages::advise_vec(&bufs);
-            bufs.resize(bufs_len, 0);
+            // Zeroed by the allocator, not by a fill: a block is written
+            // before it is read, so a stream shorter than a block leaves the
+            // rest of it untouched and never resident. The inline finder's
+            // one block of each is about 0.75 MiB that a small stream would
+            // otherwise pay in full.
+            // The old buffers go first, so the two are never held at once.
+            drop(core::mem::take(&mut bufs));
+            bufs = crate::enc::lz_find::zeroed_vec(bufs_len)?;
             #[cfg(test)]
             {
                 self.mfb.allocs += 1;

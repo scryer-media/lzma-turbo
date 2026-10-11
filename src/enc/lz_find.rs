@@ -86,7 +86,7 @@ impl MatchFinderKind {
 /// # Safety
 ///
 /// Implement only for types for which all-zero bytes are a valid value.
-unsafe trait Zeroable: Copy {}
+pub(crate) unsafe trait Zeroable: Copy {}
 // SAFETY: integers are valid for every bit pattern, zero included.
 unsafe impl Zeroable for u8 {}
 // SAFETY: as above.
@@ -102,7 +102,7 @@ unsafe impl Zeroable for u32 {}
 /// without touching them, so a stream smaller than the dictionary never makes
 /// the rest of the tables resident, and a finder built per small stream
 /// skips a fill the size of its tables. `resize(len, 0)` wrote every byte.
-fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
+pub(crate) fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     if len == 0 || core::mem::size_of::<T>() == 0 {
         return Ok(Vec::new());
     }
@@ -184,6 +184,15 @@ pub(crate) struct MatchFinder {
     /// Whether the heads are taken ahead (see [`MatchFinder::take_head`]).
     /// Only `kernel-ab` and the tests that compare the two turn it off.
     pub(crate) hc_heads: bool,
+
+    /// The threaded finder's hand-off buffers while this finder is the one
+    /// in use, so that a later switch back finds them.
+    ///
+    /// C: `CMatchFinderMt::hashBuf`, which lives in the `CLzmaEnc` whatever
+    /// finder `LzmaEnc_Alloc` picks (`C/LzmaEnc.c:435`) and is allocated
+    /// once (`C/LzFindMt.c:863`).
+    #[cfg(feature = "std")]
+    pub(crate) mt_bufs: Vec<u32>,
 
     /// How many buffers this finder has allocated since it was made: the
     /// window, the tables, and for the threaded finder its two hand-off
@@ -283,6 +292,8 @@ impl MatchFinder {
             heads_at: 0,
             heads_end: 0,
             hc_heads: true,
+            #[cfg(feature = "std")]
+            mt_bufs: Vec::new(),
             #[cfg(test)]
             allocs: 0,
         }
@@ -601,7 +612,11 @@ impl MatchFinder {
     /// What this finder has allocated, in bytes: the window and the tables.
     #[cfg(test)]
     pub(crate) fn allocated(&self) -> u64 {
-        self.buf_base.len() as u64 + (self.hash.len() + self.heads.len()) as u64 * 4
+        #[cfg(feature = "std")]
+        let mt_bufs = self.mt_bufs.len();
+        #[cfg(not(feature = "std"))]
+        let mt_bufs = 0;
+        self.buf_base.len() as u64 + (self.hash.len() + self.heads.len() + mt_bufs) as u64 * 4
     }
 
     /// C: `MatchFinder_Create`.
