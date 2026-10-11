@@ -34,6 +34,40 @@
   runs of a 256 MiB 7z encode at level 5: four threads 0.88 to 0.89 of
   7-Zip's speed, two threads 0.96 both times), while the encode's user CPU
   time falls by about 6% at both thread counts.
+- `Lzma2AdaptiveDecoder` gains two setters for a caller that widens the
+  decode while it runs. `set_read_ahead(threads)` keeps room under the pair
+  bound for one more run's input for each thread the caller reads ahead for
+  beyond the ceiling in force, and nothing more; without it the bound refused
+  the input a caller had read ahead to decide whether to widen, so on a
+  stream of large runs it saw one run of backlog at most and widened a thread
+  at a time. `set_hand_back_waits(true)` makes a drain return
+  `DrainStatus::Progress` where it would otherwise block for a worker, so the
+  caller can apply a wider ceiling while it waits instead of after the next
+  run lands, and finish with `wait_for_worker` when it has nothing to listen
+  for. Both are off by default; what is decoded, and in what order, is
+  unchanged (`tests/adaptive.rs` decodes the same stream with hand-back on
+  while widening, and checks that read-ahead at or below the ceiling leaves
+  `memory_limit` as it was).
+- A thread under the ceiling is no longer kept idle by input read ahead
+  behind the run it would take. When the read-ahead or the ceiling came down,
+  input already held for the wider read-ahead counted against the next
+  dispatch, so a caller that widened from three threads reading ahead for six
+  to four reading ahead for four had its fourth claim refused until a run
+  landed: one of four threads idle for a whole run's decode. Under the pair
+  bound an idle thread now discounts the input held behind its run; the
+  caller's own `memory_limit` is still never exceeded, and no further input
+  is taken while the decoder is over the bound. A test feeds that state and
+  asserts the fourth claim, which the accounting before this refused.
+  Measured, n=1 screen on an x86-64 Linux host (Alder Lake, eight P-core
+  threads), sevenz-turbo's decode bench over a 2 GiB archive of 128 MiB runs
+  under its governor at a four-thread ceiling: 16.61 s becomes 14.39 s
+  against 14.29 s fixed at four. Peak RSS rises with it, from 1156 to 1285
+  MiB, because the input read ahead for the wider offer is now put to work
+  rather than left waiting; a caller that states its ceiling (sevenz-turbo's
+  `Lzma2Handle::set_max_threads`) reads ahead no further and is at 1030 MiB
+  against 1036 MiB fixed. Final, n=3 on the same host with the setter:
+  14.17-14.42 s at 1030-1079 MiB against 14.10-14.14 s at 1036 MiB fixed,
+  where the decode before this fix took 16.59-16.69 s at 1156 MiB.
 
 ## 0.8.0 - 2026-10-09
 

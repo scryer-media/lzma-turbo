@@ -786,6 +786,156 @@ fn waiting_for_a_worker_takes_in_a_finished_run() {
 }
 
 #[test]
+fn handing_waits_back_decodes_the_same_stream_while_the_caller_widens() {
+    // A caller that waits where it can also widen: the whole stream is in,
+    // so every drain that would have waited on a worker hands the wait back
+    // instead, and the caller answers each one with a thread more and then
+    // the wait itself. Each turn either produces output, widens or waits on
+    // a worker, so the loop is bounded by the runs and the widening.
+    let names = ["text.p1.xz", "mixed.p1.xz", "rand.p1.xz", "text.p1.xz"];
+    let (prop, packed, plain) = multi_run(&names, 4);
+
+    for limit in [u64::MAX, packed.len() as u64 / 2] {
+        let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(1, limit)).expect("props");
+        dec.set_hand_back_waits(true);
+        let mut sink = Sink::default();
+        let mut pos = 0usize;
+        let mut drains = 0usize;
+        loop {
+            if pos < packed.len() {
+                pos += dec.feed(&packed[pos..]).expect("feed");
+                if pos == packed.len() {
+                    dec.end_of_input();
+                }
+            }
+            drains += 1;
+            assert!(
+                drains < 100_000,
+                "limit={limit}: the drain loop did not converge"
+            );
+            let before = sink.order.len();
+            let status = dec.drain(|o, b| sink.put(o, b)).expect("drain");
+            if status == DrainStatus::Finished {
+                break;
+            }
+            if sink.order.len() != before {
+                continue;
+            }
+            if dec.threads() < 4 {
+                dec.set_threads(dec.threads() + 1);
+            }
+            dec.wait_for_worker();
+        }
+        assert_eq!(sink.bytes(), plain, "limit={limit}");
+        assert!(
+            !dec.wait_for_worker(),
+            "limit={limit}: a run outlived the finished stream"
+        );
+    }
+}
+
+#[test]
+fn reading_ahead_past_the_ceiling_is_room_for_input_and_nothing_below_it() {
+    // The bound the decoder works to grows by a run's input for each thread
+    // read ahead for beyond the ceiling, and a read-ahead at or under the
+    // ceiling leaves it where it was.
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 4);
+    let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(2, u64::MAX)).expect("props");
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        pos += dec.feed(&packed[pos..]).expect("feed");
+    }
+    // A run has to have been scanned for there to be a pair to count.
+    dec.drain_upto(0, |_, _| {}).expect("scan");
+    let at_ceiling = dec.memory_limit();
+    assert_ne!(at_ceiling, u64::MAX, "no run was scanned");
+    dec.set_read_ahead(1);
+    assert_eq!(
+        dec.memory_limit(),
+        at_ceiling,
+        "a read-ahead under the ceiling"
+    );
+    dec.set_read_ahead(2);
+    assert_eq!(
+        dec.memory_limit(),
+        at_ceiling,
+        "a read-ahead at the ceiling"
+    );
+    dec.set_read_ahead(6);
+    assert!(
+        dec.memory_limit() > at_ceiling,
+        "no room for the runs read ahead"
+    );
+    dec.cancel();
+}
+
+#[test]
+fn a_thread_under_the_ceiling_is_not_kept_idle_by_input_read_ahead() {
+    // Three threads reading ahead for six hold more input than four threads
+    // reading ahead for four are allowed. Widened to four, the fourth thread
+    // takes the next run at once rather than waiting for a run to land: what
+    // stands in its way is input already held behind that run. Nothing is
+    // handed to the sink before the fourth claim, so a run that lands first
+    // still holds its slot's output, and the claim is the same whichever
+    // runs the workers have finished.
+    let runs: Vec<_> = (0..8)
+        .map(|i| copy_run(&pseudo_random(1 << 20, 0x5eed + i)))
+        .collect();
+    let (packed, plain) = join_runs(&runs);
+    let mut dec = Lzma2AdaptiveDecoder::new(0x10, &opts(3, u64::MAX)).expect("props");
+    dec.set_read_ahead(6);
+    // Six runs, what three threads reading ahead for six hold, and the first
+    // byte of the seventh, which closes the sixth.
+    let first_six: usize = runs[..6].iter().map(|r| r.packed.len()).sum();
+    let mut pos = 0usize;
+    while pos <= first_six {
+        let end = (pos + (64 << 10)).min(first_six + 1);
+        let took = dec.feed(&packed[pos..end]).expect("feed");
+        assert_ne!(took, 0, "input refused at {pos}");
+        pos += took;
+    }
+    for _ in 0..4 {
+        dec.drain_upto(0, |_, _| panic!("handed bytes over"))
+            .expect("drain");
+    }
+    assert_eq!(dec.runs_claimed(), 3, "three threads");
+    let limit_at_three = dec.memory_limit();
+
+    dec.set_threads(4);
+    dec.set_read_ahead(4);
+    assert!(
+        dec.held_bytes() + dec.dispatch_cost(1 << 20) > dec.memory_limit(),
+        "the read-ahead does not crowd the fourth thread out"
+    );
+    assert!(dec.memory_limit() < limit_at_three);
+    dec.drain_upto(0, |_, _| panic!("handed bytes over"))
+        .expect("drain");
+    assert_eq!(dec.runs_claimed(), 4, "the fourth thread waited");
+    dec.drain_upto(0, |_, _| panic!("handed bytes over"))
+        .expect("drain");
+    assert_eq!(
+        dec.runs_claimed(),
+        4,
+        "a fifth run went out on four threads"
+    );
+
+    let mut out = Vec::new();
+    loop {
+        if pos < packed.len() {
+            pos += dec.feed(&packed[pos..]).expect("feed");
+            if pos == packed.len() {
+                dec.end_of_input();
+            }
+        }
+        match dec.drain(|_, b| out.extend_from_slice(b)).expect("drain") {
+            DrainStatus::Finished => break,
+            DrainStatus::Progress | DrainStatus::NeedsMoreInput => {}
+        }
+    }
+    assert!(out == plain, "the decode differs");
+}
+
+#[test]
 fn waiting_for_a_worker_returns_after_cancel() {
     let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 4);
     let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(4, u64::MAX)).expect("props");

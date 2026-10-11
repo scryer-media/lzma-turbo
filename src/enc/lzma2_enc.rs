@@ -1528,6 +1528,75 @@ mod tests {
         }
     }
 
+    /// A bare total is split as the SDK's own code splits it, at 1, 2, 3, 4,
+    /// 8 and 18 threads, for every kind of finder and for the finder counts
+    /// that a finder can use (none, one and two named).
+    ///
+    /// `reference` is a transcription of the C, not of `split_threads`: the
+    /// `t1` / `t2` / `t3` head of `Lzma2EncProps_Normalize` (`Lzma2Enc.c`,
+    /// `t1n` from a normalize of a copy, then the `t3 > 0 && t2 <= 0` arm),
+    /// the `numThreads` default of `LzmaEncProps_Normalize` (`LzmaEnc.c`,
+    /// `(btMode && algo) ? 2 : 1`) that the second normalize applies to a `t1`
+    /// still unset, and `LzmaEnc_SetProps`' `multiThread = numThreads > 1`,
+    /// which is what the finder thread count means to the coder.
+    #[test]
+    fn a_bare_total_is_split_by_the_reference_rule() {
+        use crate::enc::MatchFinderKind;
+
+        fn reference(props: &LzmaEncProps, total: usize) -> (usize, usize) {
+            let mut normal = *props;
+            normal.normalize();
+            let t1n = if props.num_threads >= 0 {
+                props.num_threads
+            } else if normal.bt_mode != 0 && normal.algo != 0 {
+                2
+            } else {
+                1
+            };
+            let mut t1 = props.num_threads;
+            let t3 = total as i32;
+            let mut t2 = t3 / t1n;
+            if t2 == 0 {
+                t1 = 1;
+                t2 = t3;
+            }
+            let t2 = (t2 as usize).min(THREADS_LIMIT);
+            let t1 = if t1 < 0 { t1n } else { t1 };
+            let finder = if t1 > 1 && normal.bt_mode != 0 && normal.algo != 0 {
+                2
+            } else {
+                1
+            };
+            (finder, t2)
+        }
+
+        let tree = LzmaEncProps::new().with_level(5);
+        let chain = tree.with_match_finder(MatchFinderKind::Hc4);
+        let fast = LzmaEncProps::new().with_level(1);
+        let fast_tree = fast.with_match_finder(MatchFinderKind::Bt4);
+        let cases = [
+            ("tree", tree),
+            ("tree, one named", tree.with_num_threads(1)),
+            ("tree, two named", tree.with_num_threads(2)),
+            ("chain", chain),
+            ("chain, one named", chain.with_num_threads(1)),
+            ("fast", fast),
+            ("fast, one named", fast.with_num_threads(1)),
+            ("fast tree", fast_tree),
+        ];
+        for (name, props) in cases {
+            for total in [1usize, 2, 3, 4, 8, 18] {
+                let mut enc = Lzma2Encoder::new(&props).unwrap();
+                enc.set_total_threads(total);
+                assert_eq!(
+                    enc.split_threads(),
+                    reference(&props, total),
+                    "{name}, a total of {total}"
+                );
+            }
+        }
+    }
+
     /// A total alone writes what its split writes when the caller names it:
     /// one solid block where one block coder is all it comes to, the automatic
     /// block size where it comes to more.
