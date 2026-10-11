@@ -86,7 +86,7 @@ impl MatchFinderKind {
 /// # Safety
 ///
 /// Implement only for types for which all-zero bytes are a valid value.
-unsafe trait Zeroable: Copy {}
+pub(crate) unsafe trait Zeroable: Copy {}
 // SAFETY: integers are valid for every bit pattern, zero included.
 unsafe impl Zeroable for u8 {}
 // SAFETY: as above.
@@ -102,7 +102,7 @@ unsafe impl Zeroable for u32 {}
 /// without touching them, so a stream smaller than the dictionary never makes
 /// the rest of the tables resident, and a finder built per small stream
 /// skips a fill the size of its tables. `resize(len, 0)` wrote every byte.
-fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
+pub(crate) fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     if len == 0 || core::mem::size_of::<T>() == 0 {
         return Ok(Vec::new());
     }
@@ -123,6 +123,10 @@ fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     crate::enc::huge_pages::advise_vec(&v);
     Ok(v)
 }
+
+/// How many chain heads the hash-chain finder takes ahead: 16 KiB, which
+/// stays in the level-one data cache while the coder reads it back.
+const HC_HEADS: usize = 1 << 12;
 
 /// C: `CMatchFinder`.
 pub(crate) struct MatchFinder {
@@ -170,6 +174,25 @@ pub(crate) struct MatchFinder {
     pub(crate) num_refs: usize,
 
     pub(crate) expected_data_size: u64,
+
+    /// The hash-chain finders' heads, taken a run of positions ahead:
+    /// `heads[at..end]` are the chain heads of `pos` onwards, and the big
+    /// hash already holds those positions. Empty for a binary tree.
+    heads: Vec<u32>,
+    heads_at: usize,
+    heads_end: usize,
+    /// Whether the heads are taken ahead (see [`MatchFinder::take_head`]).
+    /// Only `kernel-ab` and the tests that compare the two turn it off.
+    pub(crate) hc_heads: bool,
+
+    /// The threaded finder's hand-off buffers while this finder is the one
+    /// in use, so that a later switch back finds them.
+    ///
+    /// C: `CMatchFinderMt::hashBuf`, which lives in the `CLzmaEnc` whatever
+    /// finder `LzmaEnc_Alloc` picks (`C/LzmaEnc.c:435`) and is allocated
+    /// once (`C/LzFindMt.c:863`).
+    #[cfg(feature = "std")]
+    pub(crate) mt_bufs: Vec<u32>,
 
     /// How many buffers this finder has allocated since it was made: the
     /// window, the tables, and for the threaded finder its two hand-off
@@ -265,6 +288,12 @@ impl MatchFinder {
             crc,
             num_refs: 0,
             expected_data_size: u64::MAX,
+            heads: Vec::new(),
+            heads_at: 0,
+            heads_end: 0,
+            hc_heads: true,
+            #[cfg(feature = "std")]
+            mt_bufs: Vec::new(),
             #[cfg(test)]
             allocs: 0,
         }
@@ -572,13 +601,22 @@ impl MatchFinder {
         } else {
             0
         };
-        Ok(window + (plan.num_refs as u64) * 4)
+        let heads = if self.kind.bt_mode() {
+            0
+        } else {
+            HC_HEADS as u64 * 4
+        };
+        Ok(window + (plan.num_refs as u64) * 4 + heads)
     }
 
     /// What this finder has allocated, in bytes: the window and the tables.
     #[cfg(test)]
     pub(crate) fn allocated(&self) -> u64 {
-        self.buf_base.len() as u64 + self.hash.len() as u64 * 4
+        #[cfg(feature = "std")]
+        let mt_bufs = self.mt_bufs.len();
+        #[cfg(not(feature = "std"))]
+        let mt_bufs = 0;
+        self.buf_base.len() as u64 + (self.hash.len() + self.heads.len() + mt_bufs) as u64 * 4
     }
 
     /// C: `MatchFinder_Create`.
@@ -618,6 +656,18 @@ impl MatchFinder {
             {
                 self.allocs += 1;
             }
+        }
+
+        self.heads_at = 0;
+        self.heads_end = 0;
+        #[cfg(feature = "kernel-ab")]
+        {
+            self.hc_heads = crate::kernel_ab::hc_heads();
+        }
+        if self.kind.bt_mode() {
+            self.heads = Vec::new();
+        } else if self.heads.is_empty() {
+            self.heads = vec![0; HC_HEADS];
         }
 
         // C 22.02: "we don't reallocate buffer, if old size is enough"
@@ -702,6 +752,8 @@ impl MatchFinder {
 
     /// C: `MatchFinder_Init`.
     pub(crate) fn init(&mut self, stream: &mut dyn SeqInStream) {
+        self.heads_at = 0;
+        self.heads_end = 0;
         self.init_high_hash();
         self.init_low_hash();
         self.init_4();
@@ -1054,10 +1106,9 @@ impl MatchFinder {
         let pos = self.pos;
         let mut d2 = pos - self.hash[h2 as usize];
         let d3 = pos - self.hash[K_FIX3_HASH_SIZE + h3 as usize];
-        let cur_match = self.hash[K_FIX4_HASH_SIZE + hv as usize];
+        let cur_match = self.take_head(pos, cur, K_FIX4_HASH_SIZE, hv);
         self.hash[h2 as usize] = pos;
         self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
-        self.hash[K_FIX4_HASH_SIZE + hv as usize] = pos;
         let mmm = self.set_mmm();
         let mut max_len = 3u32;
         let mut d = 0usize;
@@ -1117,10 +1168,9 @@ impl MatchFinder {
         let pos = self.pos;
         let mut d2 = pos - self.hash[h2 as usize];
         let d3 = pos - self.hash[K_FIX3_HASH_SIZE + h3 as usize];
-        let cur_match = self.hash[K_FIX5_HASH_SIZE + hv as usize];
+        let cur_match = self.take_head(pos, cur, K_FIX5_HASH_SIZE, hv);
         self.hash[h2 as usize] = pos;
         self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
-        self.hash[K_FIX5_HASH_SIZE + hv as usize] = pos;
         let mmm = self.set_mmm();
         let mut max_len = 4u32;
         let mut d = 0usize;
@@ -1308,10 +1358,9 @@ impl MatchFinder {
                 } else {
                     K_FIX5_HASH_SIZE
                 };
-                let cur_match = self.hash[fix + hv as usize];
+                let cur_match = self.take_head(pos, cur, fix, hv);
                 self.hash[h2 as usize] = pos;
                 self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
-                self.hash[fix + hv as usize] = pos;
 
                 cur += 1;
                 pos += 1;
@@ -1478,6 +1527,65 @@ impl MatchFinder {
 
         self.hash[ptr0] = K_EMPTY_HASH_VALUE;
         self.hash[ptr1] = K_EMPTY_HASH_VALUE;
+    }
+
+    /// The chain head of `pos` (at `cur` in the window, its big-hash value
+    /// `hv`), with `pos` entered in the big hash at `fix + hv`: what the C's
+    /// hash-chain `GetMatches` and `Skip` read and write there.
+    ///
+    /// The C does this a position at a time, so each head is a load from a
+    /// table of megabytes that the chain walk then depends on. Here the heads
+    /// of a run of positions are taken in one loop first, as the threaded
+    /// finder's hash stage does (C: `GetHeads_LOOP` in `LzFindMt.c`), so
+    /// those loads do not wait on one another or on a chain walk. The run
+    /// never passes `pos_limit`: up to there `len_limit` stays what it is, so
+    /// every position in the run is one the coder hashes, the bytes the hash
+    /// reads are in the window, and the run is used up before
+    /// `check_limits` moves the window or normalizes the tables. Taken in
+    /// order, the heads and the table are the ones the C's lookups leave.
+    #[inline]
+    fn take_head(&mut self, pos: u32, cur: usize, fix: usize, hv: u32) -> u32 {
+        if !self.hc_heads {
+            let at = fix + hv as usize;
+            let head = self.hash[at];
+            self.hash[at] = pos;
+            return head;
+        }
+        if self.heads_at == self.heads_end {
+            self.fill_heads(pos, cur, fix);
+        }
+        let head = self.heads[self.heads_at];
+        self.heads_at += 1;
+        head
+    }
+
+    /// Takes the heads of `pos` onwards, as many as fit in `heads` and do
+    /// not pass `pos_limit`. See [`MatchFinder::take_head`].
+    #[cold]
+    #[inline(never)]
+    fn fill_heads(&mut self, mut pos: u32, cur: usize, fix: usize) {
+        let n = ((self.pos_limit - pos) as usize).min(self.heads.len());
+        // `K_FIX5_HASH_SIZE` is `K_FIX4_HASH_SIZE`, so the kind says which.
+        let five = self.kind == MatchFinderKind::Hc5;
+        let (crc, mask) = (&self.crc, self.hash_mask);
+        let win = &self.buf_base[cur..cur + n + 3 + usize::from(five)];
+        let (heads, table) = (&mut self.heads[..n], &mut self.hash[fix..]);
+        for (i, head) in heads.iter_mut().enumerate() {
+            let b = &win[i..];
+            // C: `HASH4_CALC` / `HASH5_CALC`, the big-hash value only.
+            let mut temp = crc[usize::from(b[0])] ^ u32::from(b[1]);
+            temp ^= u32::from(b[2]) << 8;
+            temp ^= crc[usize::from(b[3])] << K_LZ_HASH_CRC_SHIFT_1;
+            if five {
+                temp ^= crc[usize::from(b[4])] << K_LZ_HASH_CRC_SHIFT_2;
+            }
+            let at = (temp & mask) as usize;
+            *head = table[at];
+            table[at] = pos;
+            pos += 1;
+        }
+        self.heads_at = 0;
+        self.heads_end = n;
     }
 
     /// C: `Hc_GetMatchesSpec`. Walks the hash chain; "(lenLimit > maxLen)".

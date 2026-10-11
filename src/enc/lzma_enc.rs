@@ -11,7 +11,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::enc::consts::*;
-use crate::enc::finder::Finder;
+use crate::enc::finder::{Finder, FinderMode};
 use crate::enc::lz_find::MatchFinderKind;
 use crate::enc::price::{
     LenEnc, LenPriceEnc, ProbPrices, init_price_tables, lit_enc_get_price,
@@ -119,6 +119,19 @@ pub(crate) struct LzmaEnc {
     fast_mode: bool,
     /// C: `p->multiThread`.
     multi_thread: bool,
+    /// Whether this stream's caller can hand the threaded finder's threads
+    /// their input. The C's `MatchFinderMt_Create` starts them for every
+    /// `mtMode` encoder (`C/LzFindMt.c:875`), so `mtMode` there always has
+    /// threads to drive; here a stream that is not `Send` cannot be given to
+    /// them, and an encoder coding one must not pick that finder. True except
+    /// while such a stream is coded.
+    pub(crate) finder_threads: bool,
+    /// Whether a binary tree in normal mode held to one thread takes the
+    /// inline finder ([`FinderMode::Inline`]) rather than the C's
+    /// single-threaded one. Always, except for the push encoders, whose
+    /// queue bound is the single-threaded finder's look-ahead, and for the
+    /// tests that compare the two.
+    pub(crate) inline_finder: bool,
     pub(crate) write_end_mark: bool,
     pub(crate) finished: bool,
     need_init: bool,
@@ -194,6 +207,8 @@ impl LzmaEnc {
             lclp: u32::MAX,
             fast_mode: false,
             multi_thread: false,
+            finder_threads: true,
+            inline_finder: true,
             write_end_mark: false,
             finished: false,
             need_init: true,
@@ -528,7 +543,7 @@ impl LzmaEnc {
     /// C: `ReadMatchDistances`, returning `(len, numPairs)`.
     fn read_match_distances(&mut self, stream: &mut dyn SeqInStream) -> (u32, usize) {
         self.additional_offset += 1;
-        self.num_avail = self.mf.get_num_available_bytes();
+        self.num_avail = self.mf.get_num_available_bytes(stream);
         let num_pairs = self.mf.get_matches(stream, &mut self.matches);
 
         if num_pairs == 0 {
@@ -628,6 +643,7 @@ impl LzmaEnc {
             }
 
             let data = self.mf.cur() - 1;
+            let buf = self.mf.window();
             let mut rep_max_index = 0usize;
 
             // C indexes `reps`, `repLens` and `p->reps` together by `i`.
@@ -635,7 +651,6 @@ impl LzmaEnc {
             for i in 0..LZMA_NUM_REPS {
                 reps[i] = self.reps[i];
                 let data2 = data - reps[i] as usize;
-                let buf = self.mf.window();
                 if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                     rep_lens[i] = 0;
                     continue;
@@ -667,8 +682,10 @@ impl LzmaEnc {
                 return main_len;
             }
 
-            let cur_byte = u32::from(self.mf.window()[data]);
-            let match_byte = u32::from(self.mf.window()[data - reps[0] as usize]);
+            let buf = self.mf.window();
+            let cur_byte = u32::from(buf[data]);
+            let match_byte = u32::from(buf[data - reps[0] as usize]);
+            let prev_byte = buf[data - 1];
 
             last = rep_lens[rep_max_index];
             if last <= main_len as usize {
@@ -685,7 +702,7 @@ impl LzmaEnc {
             let pos_state = position & self.pb_mask;
 
             {
-                let at = self.lit_probs_at(position, self.mf.window()[data - 1]);
+                let at = self.lit_probs_at(position, prev_byte);
                 let probs = &self.lit_probs[at..at + 0x300];
                 self.opt[1].price = price_0(
                     &self.prob_prices,
@@ -905,8 +922,10 @@ impl LzmaEnc {
                 self.opt[cur].reps = reps;
 
                 let data = self.mf.cur() - 1;
-                let cur_byte = u32::from(self.mf.window()[data]);
-                let match_byte = u32::from(self.mf.window()[data - reps[0] as usize]);
+                let buf = self.mf.window();
+                let cur_byte = u32::from(buf[data]);
+                let match_byte = u32::from(buf[data - reps[0] as usize]);
+                let prev_byte = buf[data - 1];
 
                 let pos_state = position & self.pb_mask;
 
@@ -929,7 +948,7 @@ impl LzmaEnc {
                 {
                     lit_price = 0;
                 } else {
-                    let at = self.lit_probs_at(position, self.mf.window()[data - 1]);
+                    let at = self.lit_probs_at(position, prev_byte);
                     let probs = &self.lit_probs[at..at + 0x300];
                     lit_price += if is_lit_state(state) {
                         lit_enc_get_price(probs, cur_byte, &self.prob_prices)
@@ -985,7 +1004,6 @@ impl LzmaEnc {
                 // ---------- LIT : REP_0 ----------
                 if !next_is_lit && lit_price != 0 && match_byte != cur_byte && num_avail_full > 2 {
                     let data2 = data - reps[0] as usize;
-                    let buf = self.mf.window();
                     if buf[data + 1] == buf[data2 + 1] && buf[data + 2] == buf[data2 + 2] {
                         let mut limit = self.num_fast_bytes + 1;
                         if limit > num_avail_full {
@@ -1022,14 +1040,12 @@ impl LzmaEnc {
                 for rep_index in 0..LZMA_NUM_REPS {
                     let data2 = data - reps[rep_index] as usize;
                     {
-                        let buf = self.mf.window();
                         if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                             continue;
                         }
                     }
                     let mut len = 2u32;
                     {
-                        let buf = self.mf.window();
                         while len < num_avail
                             && buf[data + len as usize] == buf[data2 + len as usize]
                         {
@@ -1075,16 +1091,13 @@ impl LzmaEnc {
                     }
                     len2 += 2;
                     if len2 <= limit && {
-                        let buf = self.mf.window();
                         buf[data + len2 as usize - 2] == buf[data2 + len2 as usize - 2]
                             && buf[data + len2 as usize - 1] == buf[data2 + len2 as usize - 1]
                     } {
                         let state2 = u32::from(K_REP_NEXT_STATES[state as usize]);
                         let mut pos_state2 = (position + len) & self.pb_mask;
-                        let lit_at = self.lit_probs_at(
-                            position + len,
-                            self.mf.window()[data + len as usize - 1],
-                        );
+                        let lit_at =
+                            self.lit_probs_at(position + len, buf[data + len as usize - 1]);
                         base += self.rep_len_enc.get_price_len(pos_state, len)
                             + price_0(
                                 &self.prob_prices,
@@ -1092,8 +1105,8 @@ impl LzmaEnc {
                             )
                             + lit_enc_matched_get_price(
                                 &self.lit_probs[lit_at..lit_at + 0x300],
-                                u32::from(self.mf.window()[data + len as usize]),
-                                u32::from(self.mf.window()[data2 + len as usize]),
+                                u32::from(buf[data + len as usize]),
+                                u32::from(buf[data2 + len as usize]),
                                 &self.prob_prices,
                             );
 
@@ -1102,7 +1115,6 @@ impl LzmaEnc {
                         base += self.get_price_rep_0(state2, pos_state2);
 
                         {
-                            let buf = self.mf.window();
                             while len2 < limit
                                 && buf[data + len2 as usize] == buf[data2 + len2 as usize]
                             {
@@ -1189,13 +1201,11 @@ impl LzmaEnc {
                             }
                             len2 += 2;
                             if len2 <= limit && {
-                                let buf = self.mf.window();
                                 buf[data + len2 as usize - 2] == buf[data2 + len2 as usize - 2]
                                     && buf[data + len2 as usize - 1]
                                         == buf[data2 + len2 as usize - 1]
                             } {
                                 {
-                                    let buf = self.mf.window();
                                     while len2 < limit
                                         && buf[data + len2 as usize] == buf[data2 + len2 as usize]
                                     {
@@ -1206,18 +1216,16 @@ impl LzmaEnc {
 
                                 let state2 = u32::from(K_MATCH_NEXT_STATES[state as usize]);
                                 let mut pos_state2 = (position + len) & self.pb_mask;
-                                let lit_at = self.lit_probs_at(
-                                    position + len,
-                                    self.mf.window()[data + len as usize - 1],
-                                );
+                                let lit_at =
+                                    self.lit_probs_at(position + len, buf[data + len as usize - 1]);
                                 base += price_0(
                                     &self.prob_prices,
                                     self.is_match[state2 as usize][pos_state2 as usize],
                                 );
                                 base += lit_enc_matched_get_price(
                                     &self.lit_probs[lit_at..lit_at + 0x300],
-                                    u32::from(self.mf.window()[data + len as usize]),
-                                    u32::from(self.mf.window()[data2 + len as usize]),
+                                    u32::from(buf[data + len as usize]),
+                                    u32::from(buf[data2 + len as usize]),
                                     &self.prob_prices,
                                 );
 
@@ -1511,7 +1519,7 @@ impl LzmaEnc {
         let start_pos32 = now_pos32;
 
         if self.now_pos64 == 0 {
-            if self.mf.get_num_available_bytes() == 0 {
+            if self.mf.get_num_available_bytes(stream) == 0 {
                 return self.flush(now_pos32, out);
             }
             self.read_match_distances(stream);
@@ -1526,7 +1534,7 @@ impl LzmaEnc {
             now_pos32 += 1;
         }
 
-        if self.mf.get_num_available_bytes() != 0 {
+        if self.mf.get_num_available_bytes(stream) != 0 {
             loop {
                 let len = if self.fast_mode {
                     self.get_optimum_fast(stream)
@@ -1551,15 +1559,16 @@ impl LzmaEnc {
                     self.is_match[self.state as usize][pos_state as usize] = prob;
 
                     let data = self.mf.cur() - self.additional_offset as usize;
-                    let at = self.lit_probs_at(now_pos32, self.mf.window()[data - 1]);
-                    let cur_byte = u32::from(self.mf.window()[data]);
+                    let buf = self.mf.window();
+                    let at = self.lit_probs_at(now_pos32, buf[data - 1]);
+                    let cur_byte = u32::from(buf[data]);
                     let state = self.state;
                     self.state = u32::from(K_LITERAL_NEXT_STATES[state as usize]);
                     if is_lit_state(state) {
                         self.rc
                             .lit_encode(&mut self.lit_probs[at..at + 0x300], cur_byte, out);
                     } else {
-                        let match_byte = u32::from(self.mf.window()[data - self.reps[0] as usize]);
+                        let match_byte = u32::from(buf[data - self.reps[0] as usize]);
                         self.rc.lit_encode_matched(
                             &mut self.lit_probs[at..at + 0x300],
                             cur_byte,
@@ -1732,7 +1741,7 @@ impl LzmaEnc {
                         }
                     }
 
-                    if self.mf.get_num_available_bytes() == 0 {
+                    if self.mf.get_num_available_bytes(stream) == 0 {
                         break;
                     }
                     let processed = now_pos32 - start_pos32;
@@ -1759,15 +1768,33 @@ impl LzmaEnc {
     // Allocation and initialization.
     // -----------------------------------------------------------------------
 
-    /// Whether the threaded match finder is the one this configuration uses.
+    /// Which match finder this configuration uses.
     ///
-    /// C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`.
-    /// Never true without `std`, where there is no threaded finder.
-    fn mt_mode(&mut self) -> bool {
-        cfg!(feature = "std")
-            && self.multi_thread
-            && !self.fast_mode
-            && self.mf.cfg().kind.bt_mode()
+    /// C: `p->mtMode = (p->multiThread && !p->fastMode && (MFB.btMode != 0))`
+    /// (`C/LzmaEnc.c:2705`) picks the threaded finder. Where it does not and
+    /// only the thread count stood in the way, the same finder runs inline,
+    /// on this thread: the binary tree in normal mode is exactly where it is
+    /// legal, and the matches are the single-threaded finder's. Never
+    /// anything but the single-threaded finder without `std`.
+    fn finder_mode(&mut self) -> FinderMode {
+        if !cfg!(feature = "std") || self.fast_mode || !self.mf.cfg().kind.bt_mode() {
+            return FinderMode::St;
+        }
+        // The threaded finder only where its threads can be given the
+        // input; otherwise the one-thread choice below, whose matches the
+        // C's `mtMode = 0` encoder finds.
+        if self.multi_thread && self.finder_threads {
+            return FinderMode::Threaded;
+        }
+        #[cfg(feature = "kernel-ab")]
+        if !crate::kernel_ab::inline_finder() {
+            return FinderMode::St;
+        }
+        if self.inline_finder {
+            FinderMode::Inline
+        } else {
+            FinderMode::St
+        }
     }
 
     /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
@@ -1792,12 +1819,13 @@ impl LzmaEnc {
             }
         }
 
+        let mode = self.finder_mode();
         #[cfg(feature = "std")]
         {
-            if self.mt_mode() {
-                self.mf.make_mt();
-            } else {
+            if mode == FinderMode::St {
                 self.mf.make_st();
+            } else {
+                self.mf.make_mt();
             }
         }
 
@@ -1828,6 +1856,7 @@ impl LzmaEnc {
             LZMA_MATCH_LEN_MAX + 1,
             data_limit,
             direct,
+            mode == FinderMode::Inline,
         )
     }
 
@@ -1844,10 +1873,10 @@ impl LzmaEnc {
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
-        let mt = self.mt_mode();
+        let mode = self.finder_mode();
         self.mf
             .mem_usage(
-                mt,
+                mode,
                 dict_size,
                 before_size,
                 self.num_fast_bytes,
@@ -1874,7 +1903,8 @@ impl LzmaEnc {
     /// allocation sites, not a formula copied from there.
     ///
     /// With `direct`, for an encoder `mem_prepare_direct` prepares: a
-    /// threaded finder then allocates no window, and the estimate counts none.
+    /// threaded or inline finder then allocates no window, and the estimate
+    /// counts none.
     pub(crate) fn mem_usage_for(&mut self, direct: bool) -> u64 {
         self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
         let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;
@@ -1889,11 +1919,11 @@ impl LzmaEnc {
         if before_size + dict_size < keep_window_size {
             before_size = keep_window_size - dict_size;
         }
-        let mt = self.mt_mode();
+        let mode = self.finder_mode();
         let mf = self
             .mf
             .mem_usage(
-                mt,
+                mode,
                 dict_size,
                 before_size,
                 self.num_fast_bytes,
