@@ -122,6 +122,46 @@ impl<S: SeqInStream + ?Sized> SeqInStream for LimitedSeqInStream<'_, S> {
     }
 }
 
+/// The input of a stream its caller promised would supply at most `left`
+/// more bytes ([`crate::enc::Lzma2Encoder::set_data_limit`]). The window is
+/// sized to that promise, so a stream that breaks it is refused with
+/// [`Error::Param`] rather than read past: once `left` bytes have come
+/// through, the next read asks the real stream for one byte, and the end of
+/// the stream is the only answer that passes.
+///
+/// C: none; the C's window never depends on the input's length.
+pub(crate) struct CappedInStream<'s, S: SeqInStream + ?Sized> {
+    inner: &'s mut S,
+    left: u64,
+}
+
+impl<'s, S: SeqInStream + ?Sized> CappedInStream<'s, S> {
+    pub(crate) fn new(inner: &'s mut S, limit: u64) -> Self {
+        CappedInStream { inner, left: limit }
+    }
+}
+
+impl<S: SeqInStream + ?Sized> SeqInStream for CappedInStream<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(Error::Param),
+            };
+        }
+        let n = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let got = self.inner.read(&mut buf[..n])?;
+        self.left -= got as u64;
+        Ok(got)
+    }
+}
+
 /// A stream that is never read.
 ///
 /// The threaded match finder takes the real input over for the length of a

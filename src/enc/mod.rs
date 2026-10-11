@@ -5,6 +5,17 @@
 //! the optimal parser) and `C/Lzma2Enc.c` (LZMA2 chunking). See
 //! `docs/encoder.md` for what was left out and how parity is tested.
 
+// The register-shaped tree walk: what the bt thread runs on x86-64 with
+// `asm`, the other arm of `kernel-ab`, and under test everywhere.
+#[cfg(all(
+    feature = "std",
+    any(
+        test,
+        feature = "kernel-ab",
+        all(feature = "asm", target_arch = "x86_64")
+    )
+))]
+mod bt_kernel;
 mod consts;
 mod finder;
 mod huge_pages;
@@ -73,6 +84,19 @@ impl LzmaEncoder {
         Ok(LzmaEncoder { inner })
     }
 
+    /// C: `LzmaEnc_SetProps` on an encoder that has been used: `props` in
+    /// place of the settings it was built with. The next stream is written
+    /// byte for byte as a new encoder with these settings would write it,
+    /// and the match finder keeps its window and tables while they are large
+    /// enough for them, as the C's `MatchFinder_Create` keeps them.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaEncoder::new`], with the encoder left as it was.
+    pub fn set_props(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
+        self.inner.set_props(props)
+    }
+
     /// The five LZMA property bytes a decoder needs for this setting.
     ///
     /// C: `LzmaEnc_WriteProperties`.
@@ -91,7 +115,10 @@ impl LzmaEncoder {
     ///
     /// C: `LzmaEnc_Encode`. Whether the stream ends with an end marker is the
     /// `write_end_mark` setting; without one the decoder needs the uncompressed
-    /// size from elsewhere.
+    /// size from elsewhere. The match finder runs on this thread whatever
+    /// [`LzmaEncProps::with_num_threads`] says, because a stream that is not
+    /// `Send` cannot be given to its threads; [`LzmaEncoder::encode_send`] is
+    /// the one that starts them.
     ///
     /// # Errors
     ///
@@ -101,7 +128,12 @@ impl LzmaEncoder {
         input: &mut dyn SeqInStream,
         out: &mut dyn SeqOutStream,
     ) -> Result<(), Error> {
-        self.inner.prepare(0)?;
+        // A stream that is not `Send` cannot be given to the threaded
+        // finder's threads; see `LzmaEnc::finder_threads`.
+        self.inner.finder_threads = false;
+        let res = self.inner.prepare(0);
+        self.inner.finder_threads = true;
+        res?;
         self.encode_prepared(input, out)
     }
 
@@ -121,7 +153,10 @@ impl LzmaEncoder {
         out: &mut dyn SeqOutStream,
         input_len: u64,
     ) -> Result<(), Error> {
-        self.inner.mem_prepare(input_len, 0)?;
+        self.inner.finder_threads = false;
+        let res = self.inner.mem_prepare(input_len, 0);
+        self.inner.finder_threads = true;
+        res?;
         self.encode_prepared(input, out)
     }
 

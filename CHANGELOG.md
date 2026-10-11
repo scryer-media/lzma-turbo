@@ -1,5 +1,172 @@
 # Changelog
 
+## 0.9.0 - 2026-10-10
+
+- The threaded match finder walks its binary tree in the shape of the SDK's
+  x86-64 assembly (`LzFindOpt.asm`) on x86-64 builds with the `asm` feature.
+  The walk is kept out of line and works from a cursor pointer and one tree
+  base pointer, wrapping the cyclic position with a borrow as the assembly
+  does, where the slice walk, inlined into the bt thread's loop, spilled each
+  node's link value to the stack and read it back to form the next node's
+  distance, putting a store-forwarding delay on the walk's chain of dependent
+  loads. The output is byte-identical to the slice walk, which a differential
+  test checks over random tables and windows; other targets keep the slice
+  walk. Verified, medians of three, 7z encode of a 256 MiB payload at level 5
+  against 7-Zip 26.03 (ratio = 7-Zip's time over ours): on Sapphire Rapids
+  four threads go from 0.79 to 0.86 and two from 0.80 to 0.90; on Zen 4 four
+  threads go from 0.78 to 0.88 and two from 0.84 to 0.95; a 64 MiB x86 code
+  payload through BCJ2 at four threads goes from 0.90 to 0.96 and from 0.93
+  to 0.98. One thread does not use the threaded finder and moves only within
+  noise. The bt thread's instructions fall by about a fifth and its cycles by
+  a tenth. The walk allocates nothing; peak memory stays within the spread
+  the old walk shows from run to run (327-383 MiB at four threads, 108 MiB
+  at two).
+- The threaded match finder's hash thread runs one loop per hash kind,
+  chosen once per block as the SDK's `GetHeads` family is, over byte tables
+  with the hash mask folded in. The single loop it replaces matched on the
+  kind at every position, which x86-64 builds compiled to a jump-table
+  dispatch per position with each byte read bounds-checked. The heads and
+  the hash table are unchanged, which a differential test checks for every
+  kind. Verified on Zen 4 by fixed-period counts over 48 MiB at level 5 with
+  two finder threads: the hash thread retires 0.81G user instructions
+  instead of 1.87G, about 16 a position against 7-Zip 26.03's 19. The hash
+  thread is not the critical path, so wall time moves within noise (single
+  runs of a 256 MiB 7z encode at level 5: four threads 0.88 to 0.89 of
+  7-Zip's speed, two threads 0.96 both times), while the encode's user CPU
+  time falls by about 6% at both thread counts.
+- `Lzma2AdaptiveDecoder` gains two setters for a caller that widens the
+  decode while it runs. `set_read_ahead(threads)` keeps room under the pair
+  bound for one more run's input for each thread the caller reads ahead for
+  beyond the ceiling in force, and nothing more; without it the bound refused
+  the input a caller had read ahead to decide whether to widen, so on a
+  stream of large runs it saw one run of backlog at most and widened a thread
+  at a time. `set_hand_back_waits(true)` makes a drain return
+  `DrainStatus::Progress` where it would otherwise block for a worker, so the
+  caller can apply a wider ceiling while it waits instead of after the next
+  run lands, and finish with `wait_for_worker` when it has nothing to listen
+  for. Both are off by default; what is decoded, and in what order, is
+  unchanged (`tests/adaptive.rs` decodes the same stream with hand-back on
+  while widening, and checks that read-ahead at or below the ceiling leaves
+  `memory_limit` as it was).
+- A thread under the ceiling is no longer kept idle by input read ahead
+  behind the run it would take. When the read-ahead or the ceiling came down,
+  input already held for the wider read-ahead counted against the next
+  dispatch, so a caller that widened from three threads reading ahead for six
+  to four reading ahead for four had its fourth claim refused until a run
+  landed: one of four threads idle for a whole run's decode. Under the pair
+  bound an idle thread now discounts the input held behind its run; the
+  caller's own `memory_limit` is still never exceeded, and no further input
+  is taken while the decoder is over the bound. A test feeds that state and
+  asserts the fourth claim, which the accounting before this refused.
+  Measured, n=1 screen on an x86-64 Linux host (Alder Lake, eight P-core
+  threads), sevenz-turbo's decode bench over a 2 GiB archive of 128 MiB runs
+  under its governor at a four-thread ceiling: 16.61 s becomes 14.39 s
+  against 14.29 s fixed at four. Peak RSS rises with it, from 1156 to 1285
+  MiB, because the input read ahead for the wider offer is now put to work
+  rather than left waiting; a caller that states its ceiling (sevenz-turbo's
+  `Lzma2Handle::set_max_threads`) reads ahead no further and is at 1030 MiB
+  against 1036 MiB fixed. Final, n=3 on the same host with the setter:
+  14.17-14.42 s at 1030-1079 MiB against 14.10-14.14 s at 1036 MiB fixed,
+  where the decode before this fix took 16.59-16.69 s at 1156 MiB.
+- An encoder with one match-finder thread runs the binary-tree levels about
+  twice as fast. Where it used the C's single-threaded finder (a binary tree
+  in normal mode on one thread, which is every level from 5 up by default),
+  it now runs the threaded finder's hash and tree stages itself, a block at a
+  time, on the coding thread. The hash stage takes the heads of a whole block
+  in one pass, so their cache misses overlap instead of each holding up a
+  tree walk: the same instructions run at about twice the instructions per
+  cycle. The output is byte for byte the single-threaded finder's, which the
+  end of the stream needs for the binary tree's last few positions (no
+  matches with fewer bytes left than the hash reads, as `GET_MATCHES_HEADER`
+  has it, where the threaded finder still reports hash matches). The finder
+  holds one hash block and one match block, about 0.8 MiB more; a block
+  coder reads its block in place, as the threaded finder's coders do, so the
+  per-thread memory estimate no longer counts a window for it. The push
+  encoders keep the single-threaded finder, whose look-ahead their queue
+  bound is. Verified, medians of three on an x86-64 Linux host (Alder Lake,
+  one P-core), `.xz` preset 5 on one thread, before and after against
+  `7zz -txz -mmt=1` and `xz -T1`: a 16 MiB payload from 4.70 s to 2.29 s
+  (7-Zip 1.99 s, xz 5.66 s), a 256 MiB payload from 93.0 s to 39.0 s (7-Zip
+  39.0 s, xz 92.3 s), 4 MiB of x86 code from 1.30 s to 1.02 s (7-Zip 0.90 s)
+  and a 9 MiB source tree from 3.30 s to 2.69 s (7-Zip 2.42 s), with peak RSS
+  unchanged within run-to-run noise (117 MiB on the payloads, where 7-Zip
+  holds 188 and 382 MiB). On Zen 4 the same rows go from 4.09 s to 2.41 s
+  (7-Zip 1.87 s), 79.0 s to 43.5 s (7-Zip 41.9 s, xz 101.3 s), 0.98 s to
+  0.81 s (7-Zip 0.69 s) and 2.74 s to 2.24 s (7-Zip 1.89 s), verified.
+- The hash-chain levels (0 to 4) take each position's chain head a run of
+  positions ahead. The C looks each head up in the big hash as it reaches
+  the position, so every lookup is a cache miss the chain walk waits on;
+  the heads of up to 4096 positions are now taken in one loop first, as the
+  threaded finder's hash stage does for the binary tree, and the coder reads
+  them back. The run stops at the finder's next limit check, so the window
+  and the tables are what the C leaves at every point it can see them, and
+  the output is unchanged byte for byte; the finder holds 16 KiB more. It
+  pays where the tables miss the cache. Verified, medians of three
+  interleaved runs of one binary on an x86-64 Linux host (Alder Lake,
+  P-cores), CPU time for `.xz` of a 16 MiB payload: preset 3 from 4.18 s to
+  2.97 s on one thread and from 3.80 s to 2.86 s on two; preset 1, whose
+  tables mostly stay in cache there, from 1.62 s to 1.60 s on one thread
+  and from 2.03 s to 1.87 s on two. On Zen 4, verified the same way:
+  preset 1 from 1.48 s to 1.36 s on one thread and from 1.38 s to 1.27 s on
+  two, preset 3 from 2.11 s to 1.78 s and from 2.25 s to 1.81 s. Supported,
+  on a heavily loaded Apple
+  Silicon host: preset 1 from 3.90 s to 2.91 s on one thread and preset 3
+  from 4.96 s to 3.82 s.
+- The optimal parser and the literal coder read the window through one
+  borrow per position instead of fetching it from the match finder at every
+  byte they compare. The output is unchanged byte for byte. It takes 1.7% of
+  the encoder's instructions out at preset 5, and the cycles follow by about
+  half a percent. Supported, interleaved pairs of one binary on an x86-64
+  Linux host (Alder Lake, one P-core), `.xz` preset 5 on one thread: on a
+  16 MiB payload, 18.02G to 17.70G instructions and 9.20G to 9.15G cycles
+  (seven pairs); on 64 MiB, 73.24G to 71.97G instructions and 40.02G to
+  39.80G cycles (two pairs).
+- A one-thread encoder's inline match finder leaves its hash and match
+  blocks to the allocator's zeroed pages instead of filling them. Each block
+  is written before it is read, so a stream shorter than a block never
+  touches the rest, and small streams no longer pay the 0.75 MiB the fill
+  made resident. The output and the instruction count are unchanged.
+  Supported, peak RSS of a 3 KiB stream on an x86-64 Linux host, smallest of
+  four runs: 7808 KiB before, 7020 KiB after, against 6944 KiB with the
+  single-threaded finder the inline one replaced.
+- `Lzma2Encoder::set_props` and `LzmaEncoder::set_props` give a used
+  encoder new settings, as `LzmaEnc_SetProps` does, so that a writer of many
+  streams can keep one encoder where it built one per stream, as 7-Zip's 7z
+  writer keeps one coder per write and gives it each folder's settings. The
+  next stream is byte for byte what a new encoder with those settings
+  writes, and the match finder keeps its window and tables while they are
+  long enough for the new settings, as `MatchFinder_Create` keeps them. An
+  encoder that moves between the inline and the single-threaded finder now
+  keeps the window, the tables and the hand-off buffers across the switch,
+  as the C's one `MFB` and its `hashBuf` stay put whichever finder
+  `LzmaEnc_Alloc` picks; before, each switch freed them and allocated again.
+  Verified, medians of three on an x86-64 Linux host (Alder Lake, one
+  P-core), 2000 streams of 50 to 100 KiB at levels 5, 6, 7 and 9 through
+  `encode_send`, identical output in every mode: a new encoder per stream
+  takes 9.67 s and 25,112 KiB peak RSS; one encoder given each stream's
+  settings takes 9.34 s and 21,668 KiB, against 21,036 KiB for a single
+  stream.
+- `Lzma2Encoder::set_data_limit` promises that each stream supplies at most
+  that many bytes, so the streamed encoders size the window to the input as
+  `encode_slice` sizes it to its slice. The output is unchanged byte for
+  byte; a stream that supplies more fails rather than being read past the
+  promise. Verified on the same host and streams: a new encoder per stream
+  with the limit set takes 9.60 s and 23,284 KiB, and one encoder with new
+  settings and the limit 9.45 s and 21,720 KiB.
+
+### Fixed
+
+- `Lzma2Encoder::encode`, `LzmaEncoder::encode` and
+  `LzmaEncoder::encode_sized` no longer hang when the settings ask for two
+  match-finder threads (`LzmaEncProps::with_num_threads(2)`). These take a
+  stream that is not `Send`, which the threaded finder's threads cannot be
+  given, yet they picked that finder and then waited for blocks no thread
+  would fill. The C starts the threads in `MatchFinderMt_Create` for every
+  encoder that picks the threaded finder, so it always has them to drive;
+  these paths now take the finder one thread drives and write what one
+  finder thread writes. `encode_send` and `encode_sized_send` still start
+  the threads. Verified by tests on both encoders.
+
 ## 0.8.0 - 2026-10-09
 
 - The adaptive LZMA2 decoder holds less memory under its own limit. A run

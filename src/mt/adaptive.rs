@@ -70,6 +70,8 @@ pub enum DrainStatus {
     NeedsMoreInput,
     /// Output was produced and there may be more immediately available; the
     /// caller got control back so that it can reconsider the thread count.
+    /// With [`Lzma2AdaptiveDecoder::set_hand_back_waits`] on, it also means
+    /// a worker is decoding and nothing else could be done without waiting.
     Progress,
     /// The stream's end marker was reached and every block has been delivered.
     Finished,
@@ -214,6 +216,12 @@ pub struct Lzma2AdaptiveDecoder {
     dict_prop: u8,
     memory_limit: u64,
     threads: usize,
+    /// The threads the caller reads ahead for. See
+    /// [`Lzma2AdaptiveDecoder::set_read_ahead`].
+    read_ahead: usize,
+    /// Whether a drain hands control back instead of waiting for a worker.
+    /// See [`Lzma2AdaptiveDecoder::set_hand_back_waits`].
+    hand_back_waits: bool,
     ordered: bool,
     chase: bool,
     /// Whether the last input offered was refused outright and nothing has
@@ -365,6 +373,8 @@ impl Lzma2AdaptiveDecoder {
             dict_prop,
             memory_limit: options.memory_limit,
             threads: options.threads.max(1),
+            read_ahead: 0,
+            hand_back_waits: false,
             ordered: true,
             chase: true,
             input_refused: false,
@@ -422,6 +432,44 @@ impl Lzma2AdaptiveDecoder {
     /// and cost nothing until the count goes back up.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads.max(1);
+    }
+
+    /// Sets the threads the caller is reading ahead for, which may be more
+    /// than the ceiling [`Lzma2AdaptiveDecoder::set_threads`] put in force: a
+    /// caller that widens the decode as complete runs pile up in front of it
+    /// has to be able to hand those runs over before it widens. Zero, the
+    /// default, is the ceiling in force.
+    ///
+    /// The decoder works to a run pair per thread and refuses input past that
+    /// (see [`Lzma2AdaptiveDecoder::memory_limit`]). For each thread read ahead
+    /// for beyond the ceiling it keeps room for one more run's input as well,
+    /// and nothing more: a run waiting for a worker holds its input and no
+    /// output, and a wider ceiling, once set, counts that thread's pair in
+    /// full. Without it, a caller widening on its backlog never has more than
+    /// one run beyond the threads in force to show for its reading ahead, and
+    /// widens a thread at a time on a stream of large runs. Nothing is
+    /// dispatched beyond the ceiling, and the caller's own limit, which the
+    /// pair bound never exceeds, is unchanged.
+    pub fn set_read_ahead(&mut self, threads: usize) {
+        self.read_ahead = threads;
+    }
+
+    /// Sets whether a drain hands control back rather than waiting for a
+    /// worker. Off by default.
+    ///
+    /// A drain waits for a worker when there is nothing else it can do: the
+    /// input is over, or the decoder is holding all its limit allows. A
+    /// caller that may widen the decode while it waits cannot be heard
+    /// there, because [`Lzma2AdaptiveDecoder::set_threads`] needs the
+    /// decoder back: a wider ceiling is applied only once a run lands, and
+    /// on a stream of large runs that is a whole run's decode at the old
+    /// width for every widening. With this on, such a drain returns
+    /// [`DrainStatus::Progress`] instead, having delivered whatever it could,
+    /// and the caller waits where it can also listen, finishing with
+    /// [`Lzma2AdaptiveDecoder::wait_for_worker`] when it has nothing to
+    /// listen for. What is decoded, and in what order, is unchanged.
+    pub fn set_hand_back_waits(&mut self, on: bool) {
+        self.hand_back_waits = on;
     }
 
     /// The current thread ceiling.
@@ -752,7 +800,11 @@ impl Lzma2AdaptiveDecoder {
         } else {
             piece.saturating_mul(2)
         };
+        // A thread read ahead for beyond the ceiling holds a run's input
+        // until the ceiling reaches it; see `set_read_ahead`.
+        let ahead = self.read_ahead.saturating_sub(self.threads) as u64;
         pair.saturating_mul(self.threads as u64)
+            .saturating_add(run_in.saturating_mul(ahead))
             .max(in_hand)
             .saturating_add(slack)
     }
@@ -1423,6 +1475,11 @@ impl Lzma2AdaptiveDecoder {
                         DrainStatus::NeedsMoreInput
                     });
                 }
+                // Not more input: the caller waits instead, where it can
+                // also widen. See `set_hand_back_waits`.
+                if self.hand_back_waits {
+                    return Ok(DrainStatus::Progress);
+                }
                 if self.collect(true) {
                     continue;
                 }
@@ -1852,8 +1909,36 @@ impl Lzma2AdaptiveDecoder {
     /// costs on top of what is already held is only what the one it will reuse
     /// does not already cover, because that is parked capacity, counted where
     /// it sits, and dispatch moves it rather than allocating more.
+    ///
+    /// Under the caller's limit, always. Under the pair bound, a thread under
+    /// the ceiling with no run is not kept idle by input read ahead behind the
+    /// run it would take: that input was taken under a bound that counted it,
+    /// for a read-ahead or a ceiling that has since come down, and it is
+    /// handed out a run at a time as threads come free whether this run goes
+    /// or not. Counted against the run, it left one thread of four idle for a
+    /// whole run's decode each time a caller widened past the read-ahead it
+    /// had asked for. Nothing more is taken in until the decoder is back under
+    /// the bound, so what is held over it is input already held and never
+    /// more.
     fn room_for(&self, run: Lzma2Run) -> bool {
-        self.held_bytes() + self.dispatch_cost(run.unpacked_len) <= self.limit()
+        self.room_with(self.held_bytes(), run)
+    }
+
+    /// [`Self::room_for`], with `held` in place of what is held now.
+    fn room_with(&self, held: u64, run: Lzma2Run) -> bool {
+        let after = held.saturating_add(self.dispatch_cost(run.unpacked_len));
+        if after <= self.limit() {
+            return true;
+        }
+        if after > self.memory_limit {
+            return false;
+        }
+        let landed = self.ready.len() + usize::from(self.part.is_some());
+        if self.outstanding + landed >= self.threads {
+            return false;
+        }
+        let behind: u64 = self.pending.iter().skip(1).map(|r| r.packed_len).sum();
+        after.saturating_sub(behind) <= self.pair_bound()
     }
 
     /// Gives back the parked capacity a dispatch of `run` would not reuse, if
@@ -1873,8 +1958,7 @@ impl Lzma2AdaptiveDecoder {
         if unused == 0 {
             return false;
         }
-        let after = self.held_bytes() - unused;
-        if after.saturating_add(self.dispatch_cost(run.unpacked_len)) > self.limit() {
+        if !self.room_with(self.held_bytes() - unused, run) {
             return false;
         }
         // Over the limit by this much with everything parked still held.

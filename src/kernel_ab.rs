@@ -15,6 +15,12 @@
 //! - `LZMA_TURBO_MATCH_RUN`: `scalar`, `w8` (default) or `w16`.
 //! - `LZMA_TURBO_BCJ_SCAN`: `scalar` or `wide` (default).
 //! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
+//! - `LZMA_TURBO_TREE_KERNEL`: `slice` or `reg`, the bt thread's tree walk
+//!   (the default is what the build ships: `reg` on x86-64 with `asm`).
+//! - `LZMA_TURBO_FINDER`: `st` for the C's single-threaded match finder where
+//!   one thread runs a binary tree in normal mode, or `inline` (default).
+//! - `LZMA_TURBO_HC_HEADS`: `off` for the C's hash-chain finder, which looks
+//!   each position's head up as it gets there, or `on` (default).
 //!
 //! The numbers these produced are in `docs/simd-kernels-report.md`.
 
@@ -57,6 +63,31 @@ pub(crate) fn bcj_scan_wide() -> bool {
 pub(crate) fn delta_blocked() -> bool {
     static CACHED: AtomicU8 = AtomicU8::new(UNSET);
     cached(&CACHED, "LZMA_TURBO_DELTA", |v| u8::from(v != "scalar")) == 1
+}
+
+/// Whether the bt thread walks the tree with the register-shaped kernel in
+/// `enc::bt_kernel` (`true`) or the slice kernel in `enc::lz_find_mt`.
+pub(crate) fn tree_kernel_reg() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_TREE_KERNEL", |v| match v {
+        "slice" => 0,
+        "reg" => 1,
+        _ => u8::from(cfg!(all(feature = "asm", target_arch = "x86_64"))),
+    }) == 1
+}
+
+/// Whether one thread runs the threaded match finder's stages inline. `false`
+/// is the single-threaded finder the C takes there.
+pub(crate) fn inline_finder() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_FINDER", |v| u8::from(v != "st")) == 1
+}
+
+/// Whether the hash-chain finder takes its heads a run of positions ahead.
+/// `false` is the C's lookup at each position.
+pub(crate) fn hc_heads() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_HC_HEADS", |v| u8::from(v != "off")) == 1
 }
 
 const UNSET: u8 = 255;

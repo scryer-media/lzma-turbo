@@ -73,7 +73,8 @@ usage: lzma-bench [--runs N] [--no-oracles] [--threads LIST] [--checksum K] <fil
   --mf-threads N with `--encode`, the match finder's own thread count: 2 runs
                  the encoder's threaded match finder (C: `LzFindMt.c`), which
                  is a second thread per block coder and is independent of
-                 `--threads`. The default, 1, is the single-threaded finder.
+                 `--threads`. The default, 1, runs that finder's stages a
+                 block at a time on the coding thread.
   --checksum K   have the decoder's own workers checksum their output:
                  none (default), crc32, crc64 or sha256. The CRCs are cut into
                  segments every 16 MiB, so the row also shows what splitting
