@@ -33,7 +33,9 @@
   MiB, because the input read ahead for the wider offer is now put to work
   rather than left waiting; a caller that states its ceiling (sevenz-turbo's
   `Lzma2Handle::set_max_threads`) reads ahead no further and is at 1030 MiB
-  against 1036 MiB fixed.
+  against 1036 MiB fixed. Final, n=3 on the same host with the setter:
+  14.17-14.42 s at 1030-1079 MiB against 14.10-14.14 s at 1036 MiB fixed,
+  where the decode before this fix took 16.59-16.69 s at 1156 MiB.
 
 ## 0.8.0 - 2026-10-09
 
