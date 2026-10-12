@@ -600,13 +600,15 @@ jobs:
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
             --no-default-features --features std,enc \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
-            enc::lz_find_mt::tests::a_direct_block_
+            enc::lz_find_mt::tests::a_direct_block_ \
+            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
       - name: The same tests in the release build
         run: |
           cargo test --locked --release --lib \
             --no-default-features --features std,enc \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
-            enc::lz_find_mt::tests::a_direct_block_
+            enc::lz_find_mt::tests::a_direct_block_ \
+            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.

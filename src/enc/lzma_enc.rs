@@ -22,6 +22,121 @@ use crate::enc::range_enc::RangeEnc;
 use crate::enc::stream::{SeqInStream, SeqOutStream};
 use crate::error::Error;
 
+macro_rules! finder_call {
+    ($this:expr, $checked_mode:ident, $mt:ident, $checked:ident, $selected:ident $(, $arg:expr)*) => {{
+        if $checked_mode {
+            $this.mf.$checked($($arg),*)
+        } else {
+            // SAFETY: code_one_block_kernel selects MT from the finder
+            // variant. No parser operation replaces that variant.
+            unsafe { $this.mf.$selected::<$mt>($($arg),*) }
+        }
+    }};
+}
+
+// C: the initialized (length, distance) pairs returned by GetMatches.
+// The finder writes an even count within the fixed matches array. Parser
+// cursors advance by pairs, stop at num_pairs, and truncate at an existing
+// length no smaller than the requested limit.
+macro_rules! match_word {
+    ($this:expr, $checked:ident, $index:expr) => {{
+        let index = $index;
+        if $checked {
+            &mut $this.matches[index]
+        } else {
+            debug_assert!(index < $this.matches.len());
+            // SAFETY: the finder return count and the bounded pair cursors
+            // described above establish an initialized index in matches.
+            unsafe { $this.matches.get_unchecked_mut(index) }
+        }
+    }};
+}
+
+/// C: the window behind `GetPointerToCurrentPos` in `LzmaEnc.c`.
+///
+/// Each borrow covers one parser position, never an advancement of the
+/// finder: GetMatches, Skip and GetNumAvailableBytes may slide the window.
+/// `reps` starts at one after the first literal and subsequently contains
+/// only finder distances or copies of earlier reps. The finder retains the
+/// dictionary plus the optimal parser's lookbehind, so those distances and
+/// the previous byte remain within the window even after a slide. The parser
+/// bounds all forward reads by the published availability (or a smaller
+/// fast-byte/optimal-state limit). `new` checks that upper bound once.
+struct EncodeWindow<'a, const CHECKED: bool>(&'a [u8], *const u8, usize);
+
+impl<'a, const CHECKED: bool> EncodeWindow<'a, CHECKED> {
+    /// # Safety
+    ///
+    /// All indices used through this handle must be below `data + avail`.
+    /// Backward distances must not exceed their current data offset. The
+    /// encoder's retained-history and parser-limit invariants above establish
+    /// this; the lifetime prevents using the handle across finder mutation.
+    #[inline(always)]
+    unsafe fn new(bytes: &'a [u8], data: usize, avail: u32) -> Self {
+        let end = data
+            .checked_add(avail as usize)
+            .expect("encoder window end");
+        Self(&bytes[..end], bytes.as_ptr(), end)
+    }
+    /// # Safety
+    /// base must be the MT allocation retained by finder for this coding
+    /// block. No create/run_block operation may replace it during this call.
+    /// The caller must establish data + avail <= base.1 from the finder
+    /// publication, and every index must satisfy new's history/lookahead
+    /// proof. The finder borrow prevents retaining a byte reference across
+    /// finder advancement.
+    unsafe fn from_cached(
+        _finder: &'a Finder,
+        base: (*const u8, usize),
+        data: usize,
+        avail: u32,
+    ) -> Self {
+        let end = data + avail as usize;
+        debug_assert!(end <= base.1, "encoder window end");
+        Self(&[], base.0, end)
+    }
+
+    /// C: the bounded equality loops in `ReadMatchDistances`, `GetOptimum`
+    /// and `GetOptimumFast`. Read complete words only inside the same
+    /// published margin; the checked parser keeps the bytewise oracle.
+    #[inline]
+    fn match_len(&self, data: usize, back: usize, mut len: usize, limit: usize) -> usize {
+        debug_assert!(back <= data && data + limit <= self.2);
+        if !CHECKED {
+            while len + 8 <= limit {
+                let a = u64::from_le_bytes(core::array::from_fn(|i| self[data + len + i]));
+                let b = u64::from_le_bytes(core::array::from_fn(|i| self[back + len + i]));
+                let different = a ^ b;
+                if different != 0 {
+                    return len + different.trailing_zeros() as usize / 8;
+                }
+                len += 8;
+            }
+        }
+        while len < limit && self[data + len] == self[back + len] {
+            len += 1;
+        }
+        len
+    }
+}
+
+impl<const CHECKED: bool> core::ops::Index<usize> for EncodeWindow<'_, CHECKED> {
+    type Output = u8;
+
+    #[inline(always)]
+    fn index(&self, index: usize) -> &u8 {
+        if CHECKED {
+            &self.0[index]
+        } else {
+            debug_assert!(index < self.2);
+            // SAFETY: new checks the published end, or from_cached requires the
+            // finder's published margin; the caller proves
+            // every index is below that end and backward reads cannot wrap.
+            unsafe { &*self.1.add(index) }
+        }
+    }
+}
+
 /// C: `COptimal`.
 #[derive(Clone, Copy)]
 struct Optimal {
@@ -407,6 +522,7 @@ impl LzmaEnc {
     }
 
     /// C: `GetPrice_PureRep`.
+    #[inline(always)]
     fn get_price_pure_rep(&self, rep_index: usize, state: u32, pos_state: u32) -> u32 {
         let pp = &self.prob_prices;
         let prob = self.is_rep_g0[state as usize];
@@ -535,21 +651,44 @@ impl LzmaEnc {
 
     /// C: the `MOVE_POS(p, num)` macro.
     #[inline]
-    fn move_pos(&mut self, stream: &mut dyn SeqInStream, num: u32) {
+    fn move_pos<const CHECKED: bool, const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        num: u32,
+    ) {
         self.additional_offset += num;
-        self.mf.skip(stream, num);
+        finder_call!(self, CHECKED, MT, skip, skip_for, stream, num);
     }
 
     /// C: `ReadMatchDistances`, returning `(len, numPairs)`.
-    fn read_match_distances(&mut self, stream: &mut dyn SeqInStream) -> (u32, usize) {
+    fn read_match_distances<const CHECKED: bool, const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        window_storage: (*const u8, usize),
+    ) -> (u32, usize) {
         self.additional_offset += 1;
-        self.num_avail = self.mf.get_num_available_bytes(stream);
-        let num_pairs = self.mf.get_matches(stream, &mut self.matches);
+        self.num_avail = finder_call!(
+            self,
+            CHECKED,
+            MT,
+            get_num_available_bytes,
+            get_num_available_bytes_for,
+            stream
+        );
+        let num_pairs = finder_call!(
+            self,
+            CHECKED,
+            MT,
+            get_matches,
+            get_matches_for,
+            stream,
+            &mut self.matches
+        );
 
         if num_pairs == 0 {
             return (0, 0);
         }
-        let len = self.matches[num_pairs - 2];
+        let len = *match_word!(self, CHECKED, num_pairs - 2);
         if len != self.num_fast_bytes {
             return (len, num_pairs);
         }
@@ -559,15 +698,30 @@ impl LzmaEnc {
         if num_avail > LZMA_MATCH_LEN_MAX {
             num_avail = LZMA_MATCH_LEN_MAX;
         }
-        let p1 = self.mf.cur() - 1;
-        let mut p2 = p1 + len as usize;
-        let dif = self.matches[num_pairs - 1] as usize + 1;
-        let lim = p1 + num_avail as usize;
-        let buf = self.mf.window();
-        while p2 != lim && buf[p2] == buf[p2 - dif] {
-            p2 += 1;
-        }
-        ((p2 - p1) as u32, num_pairs)
+        let p1 = finder_call!(self, CHECKED, MT, cur, cur_for) - 1;
+        let dif = (*match_word!(self, CHECKED, num_pairs - 1)) as usize + 1;
+        // SAFETY: the finder returned dif within retained history. The
+        // extension reads only p1 + len .. lim and those offsets minus dif;
+        // len <= num_avail, which the finder published before advancing.
+        let buf = {
+            if MT && !CHECKED {
+                // SAFETY: block entry captures the MT allocation, which
+                // stays allocated at this address across window slides.
+                // data is freshly obtained after every finder advance;
+                // the availability/history proof above bounds all reads.
+                unsafe {
+                    EncodeWindow::<CHECKED>::from_cached(&self.mf, window_storage, p1, num_avail)
+                }
+            } else {
+                let window = finder_call!(self, CHECKED, MT, window, window_for);
+                // SAFETY: the same per-position bound and history proof.
+                unsafe { EncodeWindow::<CHECKED>::new(window, p1, num_avail) }
+            }
+        };
+        (
+            buf.match_len(p1, p1 - dif, len as usize, num_avail as usize) as u32,
+            num_pairs,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -616,7 +770,31 @@ impl LzmaEnc {
 
     /// C: `GetOptimum`.
     #[allow(clippy::too_many_lines)]
-    fn get_optimum(&mut self, stream: &mut dyn SeqInStream, mut position: u32) -> u32 {
+    fn get_optimum<const CHECKED: bool, const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        window_storage: (*const u8, usize),
+        mut position: u32,
+    ) -> u32 {
+        assert!(self.opt.len() >= K_NUM_OPTS, "optimal table");
+        // C: GetOptimum's optimal-state margin. The initial match/rep lengths
+        // are <= LZMA_MATCH_LEN_MAX < K_NUM_OPTS. Subsequent transitions are
+        // bounded by num_avail_full <= K_NUM_OPTS - 1 - cur. Each predecessor
+        // is an earlier state, and last is only increased to a transition's
+        // bounded destination. The final reset visits 1..=last.
+        macro_rules! opt {
+            ($index:expr) => {{
+                let index = $index;
+                if CHECKED {
+                    &mut self.opt[index]
+                } else {
+                    debug_assert!(index < K_NUM_OPTS);
+                    // SAFETY: the table-length check above and the parser's
+                    // transition margin establish every index below its end.
+                    unsafe { self.opt.get_unchecked_mut(index) }
+                }
+            }};
+        }
         let mut last;
         let mut cur;
         let mut reps = [0u32; LZMA_NUM_REPS];
@@ -627,7 +805,7 @@ impl LzmaEnc {
             self.opt_end = 0;
 
             let (main_len, num_pairs) = if self.additional_offset == 0 {
-                self.read_match_distances(stream)
+                self.read_match_distances::<CHECKED, MT>(stream, window_storage)
             } else {
                 (self.longest_match_len, self.num_pairs)
             };
@@ -642,47 +820,70 @@ impl LzmaEnc {
                 num_avail = LZMA_MATCH_LEN_MAX;
             }
 
-            let data = self.mf.cur() - 1;
-            let buf = self.mf.window();
+            let data = finder_call!(self, CHECKED, MT, cur, cur_for) - 1;
+            // SAFETY: reps and matches name retained history (see EncodeWindow).
+            // Every forward read is guarded by num_avail or a smaller parser
+            // limit. This borrow ends before the next finder advancement.
+            let buf = {
+                if MT && !CHECKED {
+                    // SAFETY: block entry captures the MT allocation, which
+                    // stays allocated at this address across window slides.
+                    // data is freshly obtained after every finder advance;
+                    // the availability/history proof above bounds all reads.
+                    unsafe {
+                        EncodeWindow::<CHECKED>::from_cached(
+                            &self.mf,
+                            window_storage,
+                            data,
+                            self.num_avail,
+                        )
+                    }
+                } else {
+                    let window = finder_call!(self, CHECKED, MT, window, window_for);
+                    // SAFETY: the same per-position bound and history proof.
+                    unsafe { EncodeWindow::<CHECKED>::new(window, data, self.num_avail) }
+                }
+            };
             let mut rep_max_index = 0usize;
 
-            // C indexes `reps`, `repLens` and `p->reps` together by `i`.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..LZMA_NUM_REPS {
-                reps[i] = self.reps[i];
-                let data2 = data - reps[i] as usize;
-                if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
-                    rep_lens[i] = 0;
-                    continue;
+            // C: GetOptimum's four repetition candidates, in SDK order.
+            // Keep constant indices so each candidate needs no loop cursor.
+            'rep_scan: {
+                macro_rules! candidate {
+                    ($i:literal) => {{
+                        reps[$i] = self.reps[$i];
+                        let data2 = data - reps[$i] as usize;
+                        if buf[data] == buf[data2] && buf[data + 1] == buf[data2 + 1] {
+                            let len = buf.match_len(data, data2, 2, num_avail as usize);
+                            rep_lens[$i] = len;
+                            if len > rep_lens[rep_max_index] {
+                                rep_max_index = $i;
+                            }
+                            if len as u32 == LZMA_MATCH_LEN_MAX {
+                                break 'rep_scan;
+                            }
+                        }
+                    }};
                 }
-                let mut len = 2usize;
-                while (len as u32) < num_avail && buf[data + len] == buf[data2 + len] {
-                    len += 1;
-                }
-                rep_lens[i] = len;
-                if len > rep_lens[rep_max_index] {
-                    rep_max_index = i;
-                }
-                if len as u32 == LZMA_MATCH_LEN_MAX {
-                    // C 21.03 optimization.
-                    break;
-                }
+                candidate!(0);
+                candidate!(1);
+                candidate!(2);
+                candidate!(3);
             }
 
             if rep_lens[rep_max_index] as u32 >= self.num_fast_bytes {
                 self.back_res = rep_max_index as u32;
                 let len = rep_lens[rep_max_index] as u32;
-                self.move_pos(stream, len - 1);
+                self.move_pos::<CHECKED, MT>(stream, len - 1);
                 return len;
             }
 
             if main_len >= self.num_fast_bytes {
-                self.back_res = self.matches[num_pairs - 1] + LZMA_NUM_REPS as u32;
-                self.move_pos(stream, main_len - 1);
+                self.back_res = *match_word!(self, CHECKED, num_pairs - 1) + LZMA_NUM_REPS as u32;
+                self.move_pos::<CHECKED, MT>(stream, main_len - 1);
                 return main_len;
             }
 
-            let buf = self.mf.window();
             let cur_byte = u32::from(buf[data]);
             let match_byte = u32::from(buf[data - reps[0] as usize]);
             let prev_byte = buf[data - 1];
@@ -697,14 +898,14 @@ impl LzmaEnc {
                 return 1;
             }
 
-            self.opt[0].state = self.state as u16;
+            opt!(0).state = self.state as u16;
 
             let pos_state = position & self.pb_mask;
 
             {
                 let at = self.lit_probs_at(position, prev_byte);
                 let probs = &self.lit_probs[at..at + 0x300];
-                self.opt[1].price = price_0(
+                opt!(1).price = price_0(
                     &self.prob_prices,
                     self.is_match[self.state as usize][pos_state as usize],
                 ) + if is_lit_state(self.state) {
@@ -713,7 +914,7 @@ impl LzmaEnc {
                     lit_enc_matched_get_price(probs, cur_byte, match_byte, &self.prob_prices)
                 };
             }
-            self.opt[1].make_as_lit();
+            opt!(1).make_as_lit();
 
             let match_price = price_1(
                 &self.prob_prices,
@@ -726,18 +927,18 @@ impl LzmaEnc {
             if match_byte == cur_byte && rep_lens[0] == 0 {
                 let short_rep_price =
                     rep_match_price + self.get_price_short_rep(self.state, pos_state);
-                if short_rep_price < self.opt[1].price {
-                    self.opt[1].price = short_rep_price;
-                    self.opt[1].make_as_short_rep();
+                if short_rep_price < opt!(1).price {
+                    opt!(1).price = short_rep_price;
+                    opt!(1).make_as_short_rep();
                 }
                 if last < 2 {
-                    self.back_res = self.opt[1].dist;
+                    self.back_res = opt!(1).dist;
                     return 1;
                 }
             }
 
-            self.opt[1].len = 1;
-            self.opt[0].reps = reps;
+            opt!(1).len = 1;
+            opt!(0).reps = reps;
 
             // ---------- REP ----------
             #[allow(clippy::needless_range_loop)] // C indexes by `i`.
@@ -749,7 +950,7 @@ impl LzmaEnc {
                 let base = rep_match_price + self.get_price_pure_rep(i, self.state, pos_state);
                 loop {
                     let price2 = base + self.rep_len_enc.get_price_len(pos_state, rep_len as u32);
-                    let opt = &mut self.opt[rep_len];
+                    let opt = opt!(rep_len);
                     if price2 < opt.price {
                         opt.price = price2;
                         opt.len = rep_len as u32;
@@ -774,13 +975,13 @@ impl LzmaEnc {
                     if len < 2 {
                         len = 2;
                     } else {
-                        while len as u32 > self.matches[offs] {
+                        while len as u32 > *match_word!(self, CHECKED, offs) {
                             offs += 2;
                         }
                     }
 
                     loop {
-                        let dist = self.matches[offs + 1];
+                        let dist = *match_word!(self, CHECKED, offs + 1);
                         let mut price2 =
                             normal_match_price + self.len_enc.get_price_len(pos_state, len as u32);
                         let len_to_pos_state = get_len_to_pos_state(len as u32);
@@ -794,7 +995,7 @@ impl LzmaEnc {
                             price2 += self.pos_slot_prices[len_to_pos_state][slot as usize];
                         }
 
-                        let opt = &mut self.opt[len];
+                        let opt = opt!(len);
                         if price2 < opt.price {
                             opt.price = price2;
                             opt.len = len as u32;
@@ -802,7 +1003,7 @@ impl LzmaEnc {
                             opt.extra = 0;
                         }
 
-                        if len as u32 == self.matches[offs] {
+                        if len as u32 == *match_word!(self, CHECKED, offs) {
                             offs += 2;
                             if offs == num_pairs {
                                 break;
@@ -825,10 +1026,10 @@ impl LzmaEnc {
                 // C 18.06: the window is nearly full; take the cheapest state
                 // ahead and stop.
                 if cur >= K_NUM_OPTS - 64 {
-                    let mut price = self.opt[cur].price;
+                    let mut price = opt!(cur).price;
                     let mut best = cur;
                     for j in cur + 1..=last {
-                        let price2 = self.opt[j].price;
+                        let price2 = opt!(j).price;
                         if price >= price2 {
                             price = price2;
                             best = j;
@@ -836,13 +1037,14 @@ impl LzmaEnc {
                     }
                     let delta = best - cur;
                     if delta != 0 {
-                        self.move_pos(stream, delta as u32);
+                        self.move_pos::<CHECKED, MT>(stream, delta as u32);
                     }
                     cur = best;
                     break;
                 }
 
-                let (new_len, pairs) = self.read_match_distances(stream);
+                let (new_len, pairs) =
+                    self.read_match_distances::<CHECKED, MT>(stream, window_storage);
                 let mut new_len = new_len;
                 num_pairs = pairs;
 
@@ -854,19 +1056,19 @@ impl LzmaEnc {
 
                 position += 1;
 
-                let mut prev = cur - self.opt[cur].len as usize;
+                let mut prev = cur - opt!(cur).len as usize;
                 let state;
 
-                if self.opt[cur].len == 1 {
-                    let s = u32::from(self.opt[prev].state);
-                    state = if self.opt[cur].is_short_rep() {
+                if opt!(cur).len == 1 {
+                    let s = u32::from(opt!(prev).state);
+                    state = if opt!(cur).is_short_rep() {
                         u32::from(K_SHORT_REP_NEXT_STATES[s as usize])
                     } else {
                         u32::from(K_LITERAL_NEXT_STATES[s as usize])
                     };
                 } else {
-                    let dist = self.opt[cur].dist;
-                    let extra = u32::from(self.opt[cur].extra);
+                    let dist = opt!(cur).dist;
+                    let extra = u32::from(opt!(cur).extra);
 
                     if extra != 0 {
                         prev -= extra as usize;
@@ -880,7 +1082,7 @@ impl LzmaEnc {
                             K_STATE_REP_AFTER_LIT
                         };
                     } else {
-                        let s = u32::from(self.opt[prev].state);
+                        let s = u32::from(opt!(prev).state);
                         state = if (dist as usize) < LZMA_NUM_REPS {
                             u32::from(K_REP_NEXT_STATES[s as usize])
                         } else {
@@ -888,7 +1090,7 @@ impl LzmaEnc {
                         };
                     }
 
-                    let prev_reps = self.opt[prev].reps;
+                    let prev_reps = opt!(prev).reps;
                     let b0 = prev_reps[0];
 
                     if (dist as usize) < LZMA_NUM_REPS {
@@ -918,11 +1120,33 @@ impl LzmaEnc {
                     }
                 }
 
-                self.opt[cur].state = state as u16;
-                self.opt[cur].reps = reps;
+                opt!(cur).state = state as u16;
+                opt!(cur).reps = reps;
 
-                let data = self.mf.cur() - 1;
-                let buf = self.mf.window();
+                let data = finder_call!(self, CHECKED, MT, cur, cur_for) - 1;
+                // SAFETY: reps and matches name retained history (see EncodeWindow).
+                // Every forward read is guarded by num_avail or a smaller parser
+                // limit. This borrow ends before the next finder advancement.
+                let buf = {
+                    if MT && !CHECKED {
+                        // SAFETY: block entry captures the MT allocation, which
+                        // stays allocated at this address across window slides.
+                        // data is freshly obtained after every finder advance;
+                        // the availability/history proof above bounds all reads.
+                        unsafe {
+                            EncodeWindow::<CHECKED>::from_cached(
+                                &self.mf,
+                                window_storage,
+                                data,
+                                self.num_avail,
+                            )
+                        }
+                    } else {
+                        let window = finder_call!(self, CHECKED, MT, window, window_for);
+                        // SAFETY: the same per-position bound and history proof.
+                        unsafe { EncodeWindow::<CHECKED>::new(window, data, self.num_avail) }
+                    }
+                };
                 let cur_byte = u32::from(buf[data]);
                 let match_byte = u32::from(buf[data - reps[0] as usize]);
                 let prev_byte = buf[data - 1];
@@ -935,7 +1159,7 @@ impl LzmaEnc {
                 //    <  LIT : REP_0
                 //    <  REP    [ : LIT : REP_0 ]
                 //    <  MATCH  [ : LIT : REP_0 ]
-                let cur_price = self.opt[cur].price;
+                let cur_price = opt!(cur).price;
                 let prob = self.is_match[state as usize][pos_state as usize];
                 let match_price = cur_price + price_1(&self.prob_prices, prob);
                 let mut lit_price = cur_price + price_0(&self.prob_prices, prob);
@@ -943,8 +1167,8 @@ impl LzmaEnc {
                 let mut next_is_lit = false;
 
                 // C 18.new.06.
-                if (self.opt[cur + 1].price < K_INFINITY_PRICE && match_byte == cur_byte)
-                    || lit_price > self.opt[cur + 1].price
+                if (opt!(cur + 1).price < K_INFINITY_PRICE && match_byte == cur_byte)
+                    || lit_price > opt!(cur + 1).price
                 {
                     lit_price = 0;
                 } else {
@@ -955,8 +1179,8 @@ impl LzmaEnc {
                     } else {
                         lit_enc_matched_get_price(probs, cur_byte, match_byte, &self.prob_prices)
                     };
-                    if lit_price < self.opt[cur + 1].price {
-                        let next = &mut self.opt[cur + 1];
+                    if lit_price < opt!(cur + 1).price {
+                        let next = opt!(cur + 1);
                         next.price = lit_price;
                         next.len = 1;
                         next.make_as_lit();
@@ -978,13 +1202,13 @@ impl LzmaEnc {
                 // ---------- SHORT_REP ----------
                 if is_lit_state(state)
                     && match_byte == cur_byte
-                    && rep_match_price < self.opt[cur + 1].price
-                    && (self.opt[cur + 1].len < 2 || self.opt[cur + 1].dist != 0)
+                    && rep_match_price < opt!(cur + 1).price
+                    && (opt!(cur + 1).len < 2 || opt!(cur + 1).dist != 0)
                 {
                     let short_rep_price =
                         rep_match_price + self.get_price_short_rep(state, pos_state);
-                    if short_rep_price < self.opt[cur + 1].price {
-                        let next = &mut self.opt[cur + 1];
+                    if short_rep_price < opt!(cur + 1).price {
+                        let next = opt!(cur + 1);
                         next.price = short_rep_price;
                         next.len = 1;
                         next.make_as_short_rep();
@@ -1009,10 +1233,7 @@ impl LzmaEnc {
                         if limit > num_avail_full {
                             limit = num_avail_full;
                         }
-                        let mut len = 3u32;
-                        while len < limit && buf[data + len as usize] == buf[data2 + len as usize] {
-                            len += 1;
-                        }
+                        let len = buf.match_len(data, data2, 3, limit as usize) as u32;
 
                         let state2 = u32::from(K_LITERAL_NEXT_STATES[state as usize]);
                         let pos_state2 = (position + 1) & self.pb_mask;
@@ -1023,7 +1244,7 @@ impl LzmaEnc {
                         }
                         let len = len - 1;
                         let price2 = base + self.rep_len_enc.get_price_len(pos_state2, len);
-                        let opt = &mut self.opt[offset];
+                        let opt = opt!(offset);
                         if price2 < opt.price {
                             opt.price = price2;
                             opt.len = len;
@@ -1044,14 +1265,7 @@ impl LzmaEnc {
                             continue;
                         }
                     }
-                    let mut len = 2u32;
-                    {
-                        while len < num_avail
-                            && buf[data + len as usize] == buf[data2 + len as usize]
-                        {
-                            len += 1;
-                        }
-                    }
+                    let len = buf.match_len(data, data2, 2, num_avail as usize) as u32;
 
                     {
                         let offset = cur + len as usize;
@@ -1065,7 +1279,7 @@ impl LzmaEnc {
                         let mut len2 = len;
                         loop {
                             let price2 = base + self.rep_len_enc.get_price_len(pos_state, len2);
-                            let opt = &mut self.opt[cur + len2 as usize];
+                            let opt = opt!(cur + len2 as usize);
                             if price2 < opt.price {
                                 opt.price = price2;
                                 opt.len = len2;
@@ -1114,13 +1328,7 @@ impl LzmaEnc {
                         pos_state2 = (pos_state2 + 1) & self.pb_mask;
                         base += self.get_price_rep_0(state2, pos_state2);
 
-                        {
-                            while len2 < limit
-                                && buf[data + len2 as usize] == buf[data2 + len2 as usize]
-                            {
-                                len2 += 1;
-                            }
-                        }
+                        len2 = buf.match_len(data, data2, len2 as usize, limit as usize) as u32;
                         len2 -= len;
 
                         let offset = cur + len as usize + len2 as usize;
@@ -1129,7 +1337,7 @@ impl LzmaEnc {
                         }
                         let len2 = len2 - 1;
                         let price2 = base + self.rep_len_enc.get_price_len(pos_state2, len2);
-                        let opt = &mut self.opt[offset];
+                        let opt = opt!(offset);
                         if price2 < opt.price {
                             opt.price = price2;
                             opt.len = len2;
@@ -1143,10 +1351,10 @@ impl LzmaEnc {
                 if new_len > num_avail {
                     new_len = num_avail;
                     num_pairs = 0;
-                    while new_len > self.matches[num_pairs] {
+                    while new_len > *match_word!(self, CHECKED, num_pairs) {
                         num_pairs += 2;
                     }
-                    self.matches[num_pairs] = new_len;
+                    *match_word!(self, CHECKED, num_pairs) = new_len;
                     num_pairs += 2;
                 }
 
@@ -1162,10 +1370,10 @@ impl LzmaEnc {
                     }
 
                     let mut offs = 0usize;
-                    while start_len > self.matches[offs] {
+                    while start_len > *match_word!(self, CHECKED, offs) {
                         offs += 2;
                     }
-                    let mut dist = self.matches[offs + 1];
+                    let mut dist = *match_word!(self, CHECKED, offs + 1);
                     let mut pos_slot = self.get_pos_slot2(dist);
 
                     let mut len = start_len;
@@ -1181,7 +1389,7 @@ impl LzmaEnc {
                                 base + self.pos_slot_prices[len_norm][pos_slot as usize]
                                     + self.align_prices[(dist & K_ALIGN_MASK) as usize]
                             };
-                            let opt = &mut self.opt[cur + len as usize];
+                            let opt = opt!(cur + len as usize);
                             if price2 < opt.price {
                                 opt.price = price2;
                                 opt.len = len;
@@ -1191,7 +1399,7 @@ impl LzmaEnc {
                             base = price2;
                         }
 
-                        if len == self.matches[offs] {
+                        if len == *match_word!(self, CHECKED, offs) {
                             // ---------- MATCH : LIT : REP_0 ----------
                             let data2 = data - dist as usize - 1;
                             let mut len2 = len + 1;
@@ -1205,13 +1413,8 @@ impl LzmaEnc {
                                     && buf[data + len2 as usize - 1]
                                         == buf[data2 + len2 as usize - 1]
                             } {
-                                {
-                                    while len2 < limit
-                                        && buf[data + len2 as usize] == buf[data2 + len2 as usize]
-                                    {
-                                        len2 += 1;
-                                    }
-                                }
+                                len2 = buf.match_len(data, data2, len2 as usize, limit as usize)
+                                    as u32;
                                 len2 -= len;
 
                                 let state2 = u32::from(K_MATCH_NEXT_STATES[state as usize]);
@@ -1240,7 +1443,7 @@ impl LzmaEnc {
                                 let len2 = len2 - 1;
                                 let price2 =
                                     base + self.rep_len_enc.get_price_len(pos_state2, len2);
-                                let opt = &mut self.opt[offset];
+                                let opt = opt!(offset);
                                 if price2 < opt.price {
                                     opt.price = price2;
                                     opt.len = len2;
@@ -1253,7 +1456,7 @@ impl LzmaEnc {
                             if offs == num_pairs {
                                 break;
                             }
-                            dist = self.matches[offs + 1];
+                            dist = *match_word!(self, CHECKED, offs + 1);
                             pos_slot = self.get_pos_slot2(dist);
                         }
                         len += 1;
@@ -1264,7 +1467,7 @@ impl LzmaEnc {
 
         let mut l = last;
         loop {
-            self.opt[l].price = K_INFINITY_PRICE;
+            opt!(l).price = K_INFINITY_PRICE;
             l -= 1;
             if l == 0 {
                 break;
@@ -1281,9 +1484,13 @@ impl LzmaEnc {
     }
 
     /// C: `GetOptimumFast`.
-    fn get_optimum_fast(&mut self, stream: &mut dyn SeqInStream) -> u32 {
+    fn get_optimum_fast<const CHECKED: bool, const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        window_storage: (*const u8, usize),
+    ) -> u32 {
         let (main_len, num_pairs) = if self.additional_offset == 0 {
-            self.read_match_distances(stream)
+            self.read_match_distances::<CHECKED, MT>(stream, window_storage)
         } else {
             (self.longest_match_len, self.num_pairs)
         };
@@ -1298,7 +1505,7 @@ impl LzmaEnc {
         if num_avail > LZMA_MATCH_LEN_MAX {
             num_avail = LZMA_MATCH_LEN_MAX;
         }
-        let data = self.mf.cur() - 1;
+        let data = finder_call!(self, CHECKED, MT, cur, cur_for) - 1;
         let mut rep_len = 0u32;
         let mut rep_index = 0usize;
 
@@ -1306,17 +1513,37 @@ impl LzmaEnc {
             let data2 = data - self.reps[i] as usize;
             let mut len = 2u32;
             {
-                let buf = self.mf.window();
+                // SAFETY: reps and matches name retained history (see EncodeWindow).
+                // Every forward read is guarded by num_avail or a smaller parser
+                // limit. This borrow ends before the next finder advancement.
+                let buf = {
+                    if MT && !CHECKED {
+                        // SAFETY: block entry captures the MT allocation, which
+                        // stays allocated at this address across window slides.
+                        // data is freshly obtained after every finder advance;
+                        // the availability/history proof above bounds all reads.
+                        unsafe {
+                            EncodeWindow::<CHECKED>::from_cached(
+                                &self.mf,
+                                window_storage,
+                                data,
+                                self.num_avail,
+                            )
+                        }
+                    } else {
+                        let window = finder_call!(self, CHECKED, MT, window, window_for);
+                        // SAFETY: the same per-position bound and history proof.
+                        unsafe { EncodeWindow::<CHECKED>::new(window, data, self.num_avail) }
+                    }
+                };
                 if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                     continue;
                 }
-                while len < num_avail && buf[data + len as usize] == buf[data2 + len as usize] {
-                    len += 1;
-                }
+                len = buf.match_len(data, data2, len as usize, num_avail as usize) as u32;
             }
             if len >= self.num_fast_bytes {
                 self.back_res = i as u32;
-                self.move_pos(stream, len - 1);
+                self.move_pos::<CHECKED, MT>(stream, len - 1);
                 return len;
             }
             if len > rep_len {
@@ -1326,20 +1553,20 @@ impl LzmaEnc {
         }
 
         if main_len >= self.num_fast_bytes {
-            self.back_res = self.matches[num_pairs - 1] + LZMA_NUM_REPS as u32;
-            self.move_pos(stream, main_len - 1);
+            self.back_res = *match_word!(self, CHECKED, num_pairs - 1) + LZMA_NUM_REPS as u32;
+            self.move_pos::<CHECKED, MT>(stream, main_len - 1);
             return main_len;
         }
 
         let mut main_dist = 0u32; // C: "for GCC"
 
         if main_len >= 2 {
-            main_dist = self.matches[num_pairs - 1];
+            main_dist = *match_word!(self, CHECKED, num_pairs - 1);
             while num_pairs > 2 {
-                if main_len != self.matches[num_pairs - 4] + 1 {
+                if main_len != *match_word!(self, CHECKED, num_pairs - 4) + 1 {
                     break;
                 }
-                let dist2 = self.matches[num_pairs - 3];
+                let dist2 = *match_word!(self, CHECKED, num_pairs - 3);
                 if !Self::change_pair(dist2, main_dist) {
                     break;
                 }
@@ -1358,7 +1585,7 @@ impl LzmaEnc {
                 || (rep_len + 3 >= main_len && main_dist >= (1 << 15)))
         {
             self.back_res = rep_index as u32;
-            self.move_pos(stream, rep_len - 1);
+            self.move_pos::<CHECKED, MT>(stream, rep_len - 1);
             return rep_len;
         }
 
@@ -1367,12 +1594,12 @@ impl LzmaEnc {
         }
 
         {
-            let (len1, pairs) = self.read_match_distances(stream);
+            let (len1, pairs) = self.read_match_distances::<CHECKED, MT>(stream, window_storage);
             self.num_pairs = pairs;
             self.longest_match_len = len1;
 
             if len1 >= 2 {
-                let new_dist = self.matches[self.num_pairs - 1];
+                let new_dist = *match_word!(self, CHECKED, self.num_pairs - 1);
                 if (len1 >= main_len && new_dist < main_dist)
                     || (len1 == main_len + 1 && !Self::change_pair(main_dist, new_dist))
                     || (len1 > main_len + 1)
@@ -1385,30 +1612,45 @@ impl LzmaEnc {
             }
         }
 
-        let data = self.mf.cur() - 1;
+        let data = finder_call!(self, CHECKED, MT, cur, cur_for) - 1;
 
         for i in 0..LZMA_NUM_REPS {
             let data2 = data - self.reps[i] as usize;
-            let buf = self.mf.window();
+            // SAFETY: reps and matches name retained history (see EncodeWindow).
+            // Every forward read is guarded by num_avail or a smaller parser
+            // limit. This borrow ends before the next finder advancement.
+            let buf = {
+                if MT && !CHECKED {
+                    // SAFETY: block entry captures the MT allocation, which
+                    // stays allocated at this address across window slides.
+                    // data is freshly obtained after every finder advance;
+                    // the availability/history proof above bounds all reads.
+                    unsafe {
+                        EncodeWindow::<CHECKED>::from_cached(
+                            &self.mf,
+                            window_storage,
+                            data,
+                            self.num_avail,
+                        )
+                    }
+                } else {
+                    let window = finder_call!(self, CHECKED, MT, window, window_for);
+                    // SAFETY: the same per-position bound and history proof.
+                    unsafe { EncodeWindow::<CHECKED>::new(window, data, self.num_avail) }
+                }
+            };
             if buf[data] != buf[data2] || buf[data + 1] != buf[data2 + 1] {
                 continue;
             }
             let limit = main_len - 1;
-            let mut len = 2u32;
-            loop {
-                if len >= limit {
-                    return 1;
-                }
-                if buf[data + len as usize] != buf[data2 + len as usize] {
-                    break;
-                }
-                len += 1;
+            if buf.match_len(data, data2, 2, limit as usize) >= limit as usize {
+                return 1;
             }
         }
 
         self.back_res = main_dist + LZMA_NUM_REPS as u32;
         if main_len != 2 {
-            self.move_pos(stream, main_len - 2);
+            self.move_pos::<CHECKED, MT>(stream, main_len - 2);
         }
         main_len
     }
@@ -1420,12 +1662,10 @@ impl LzmaEnc {
     /// C: `WriteEndMarker`.
     fn write_end_marker(&mut self, pos_state: u32, out: &mut dyn SeqOutStream) {
         {
-            let mut prob = self.is_match[self.state as usize][pos_state as usize];
-            self.rc.encode_bit_1(&mut prob, out);
-            self.is_match[self.state as usize][pos_state as usize] = prob;
-            let mut prob = self.is_rep[self.state as usize];
-            self.rc.encode_bit_0(&mut prob, out);
-            self.is_rep[self.state as usize] = prob;
+            let prob = &mut self.is_match[self.state as usize][pos_state as usize];
+            self.rc.encode_bit_1(prob, out);
+            let prob = &mut self.is_rep[self.state as usize];
+            self.rc.encode_bit_0(prob, out);
         }
         self.state = u32::from(K_MATCH_NEXT_STATES[self.state as usize]);
 
@@ -1435,9 +1675,8 @@ impl LzmaEnc {
             // C: `RcTree_Encode_PosSlot(..., (1 << kNumPosSlotBits) - 1)`.
             let mut m = 1usize;
             loop {
-                let mut prob = self.pos_slot_encoder[0][m];
-                self.rc.encode_bit_1(&mut prob, out);
-                self.pos_slot_encoder[0][m] = prob;
+                let prob = &mut self.pos_slot_encoder[0][m];
+                self.rc.encode_bit_1(prob, out);
                 m = (m << 1) + 1;
                 if m >= (1 << K_NUM_POS_SLOT_BITS) {
                     break;
@@ -1454,9 +1693,8 @@ impl LzmaEnc {
             // C: `RcTree_ReverseEncode(..., kNumAlignBits, kAlignMask)`.
             let mut m = 1usize;
             loop {
-                let mut prob = self.pos_align_encoder[m];
-                self.rc.encode_bit_1(&mut prob, out);
-                self.pos_align_encoder[m] = prob;
+                let prob = &mut self.pos_align_encoder[m];
+                self.rc.encode_bit_1(prob, out);
                 m = (m << 1) + 1;
                 if m >= K_ALIGN_TABLE_SIZE {
                     break;
@@ -1505,6 +1743,43 @@ impl LzmaEnc {
         max_pack_size: usize,
         max_unpack_size: u32,
     ) -> Result<(), Error> {
+        #[cfg(feature = "kernel-ab")]
+        if crate::kernel_ab::encoder_checked() {
+            return self.code_one_block_kernel::<true>(stream, out, max_pack_size, max_unpack_size);
+        }
+        self.code_one_block_kernel::<false>(stream, out, max_pack_size, max_unpack_size)
+    }
+
+    /// C: `LzmaEnc_CodeOneBlock`; the checked instantiation is the oracle.
+    #[allow(clippy::too_many_lines)]
+    fn code_one_block_kernel<const CHECKED: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        out: &mut dyn SeqOutStream,
+        max_pack_size: usize,
+        max_unpack_size: u32,
+    ) -> Result<(), Error> {
+        if self.mf.uses_mt() {
+            self.code_one_block_finder::<CHECKED, true>(stream, out, max_pack_size, max_unpack_size)
+        } else {
+            self.code_one_block_finder::<CHECKED, false>(
+                stream,
+                out,
+                max_pack_size,
+                max_unpack_size,
+            )
+        }
+    }
+
+    /// C: `LzmaEnc_CodeOneBlock`; the checked instantiation is the oracle.
+    #[allow(clippy::too_many_lines)]
+    fn code_one_block_finder<const CHECKED: bool, const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        out: &mut dyn SeqOutStream,
+        max_pack_size: usize,
+        max_unpack_size: u32,
+    ) -> Result<(), Error> {
         if self.need_init {
             self.mf.init(stream)?;
             self.need_init = false;
@@ -1515,33 +1790,70 @@ impl LzmaEnc {
         }
         self.check_errors()?;
 
+        // C: the MT allocation stays fixed until this coding block returns.
+        // Common::win is a stored raw allocation pointer, not a pointer
+        // borrowed from a slice that finder advancement could invalidate.
+        let window_storage = self.mf.window_storage();
         let mut now_pos32 = self.now_pos64 as u32;
         let start_pos32 = now_pos32;
 
         if self.now_pos64 == 0 {
-            if self.mf.get_num_available_bytes(stream) == 0 {
+            if finder_call!(
+                self,
+                CHECKED,
+                MT,
+                get_num_available_bytes,
+                get_num_available_bytes_for,
+                stream
+            ) == 0
+            {
                 return self.flush(now_pos32, out);
             }
-            self.read_match_distances(stream);
-            let mut prob = self.is_match[K_STATE_START][0];
-            self.rc.encode_bit_0(&mut prob, out);
-            self.is_match[K_STATE_START][0] = prob;
-            let cur_byte =
-                u32::from(self.mf.window()[self.mf.cur() - self.additional_offset as usize]);
+            self.read_match_distances::<CHECKED, MT>(stream, window_storage);
+            let prob = &mut self.is_match[K_STATE_START][0];
+            self.rc.encode_bit_0(prob, out);
+            let data =
+                finder_call!(self, CHECKED, MT, cur, cur_for) - self.additional_offset as usize;
+            // SAFETY: the nonempty input check above and one finder advance
+            // establish this single literal, with no backward read.
+            let buf = {
+                if MT && !CHECKED {
+                    // SAFETY: block entry captures the MT allocation, which
+                    // stays allocated at this address across window slides.
+                    // data is freshly obtained after every finder advance;
+                    // the availability/history proof above bounds all reads.
+                    unsafe {
+                        EncodeWindow::<CHECKED>::from_cached(&self.mf, window_storage, data, 1)
+                    }
+                } else {
+                    let window = finder_call!(self, CHECKED, MT, window, window_for);
+                    // SAFETY: the same per-position bound and history proof.
+                    unsafe { EncodeWindow::<CHECKED>::new(window, data, 1) }
+                }
+            };
+            let cur_byte = u32::from(buf[data]);
             self.rc
                 .lit_encode(&mut self.lit_probs[..0x300], cur_byte, out);
             self.additional_offset -= 1;
             now_pos32 += 1;
         }
 
-        if self.mf.get_num_available_bytes(stream) != 0 {
+        if finder_call!(
+            self,
+            CHECKED,
+            MT,
+            get_num_available_bytes,
+            get_num_available_bytes_for,
+            stream
+        ) != 0
+        {
             loop {
                 let len = if self.fast_mode {
-                    self.get_optimum_fast(stream)
+                    self.get_optimum_fast::<CHECKED, MT>(stream, window_storage)
                 } else {
                     let oci = self.opt_cur;
                     if self.opt_end == oci {
-                        self.get_optimum(stream, now_pos32)
+                        self.get_optimum::<CHECKED, MT>(stream, window_storage, now_pos32)
                     } else {
                         let opt = self.opt[oci];
                         self.back_res = opt.dist;
@@ -1554,12 +1866,35 @@ impl LzmaEnc {
                 let mut dist = self.back_res;
 
                 if dist == MARK_LIT {
-                    let mut prob = self.is_match[self.state as usize][pos_state as usize];
-                    self.rc.encode_bit_0(&mut prob, out);
-                    self.is_match[self.state as usize][pos_state as usize] = prob;
+                    let prob = &mut self.is_match[self.state as usize][pos_state as usize];
+                    self.rc.encode_bit_0(prob, out);
 
-                    let data = self.mf.cur() - self.additional_offset as usize;
-                    let buf = self.mf.window();
+                    let data = finder_call!(self, CHECKED, MT, cur, cur_for)
+                        - self.additional_offset as usize;
+                    // SAFETY: the parser selected a literal at this retained
+                    // position. The previous byte exists after the first
+                    // literal, and reps[0] names retained history. No finder
+                    // advancement occurs during this borrow.
+                    let buf = {
+                        if MT && !CHECKED {
+                            // SAFETY: block entry captures the MT allocation, which
+                            // stays allocated at this address across window slides.
+                            // data is freshly obtained after every finder advance;
+                            // the availability/history proof above bounds all reads.
+                            unsafe {
+                                EncodeWindow::<CHECKED>::from_cached(
+                                    &self.mf,
+                                    window_storage,
+                                    data,
+                                    1,
+                                )
+                            }
+                        } else {
+                            let window = finder_call!(self, CHECKED, MT, window, window_for);
+                            // SAFETY: the same per-position bound and history proof.
+                            unsafe { EncodeWindow::<CHECKED>::new(window, data, 1) }
+                        }
+                    };
                     let at = self.lit_probs_at(now_pos32, buf[data - 1]);
                     let cur_byte = u32::from(buf[data]);
                     let state = self.state;
@@ -1577,53 +1912,45 @@ impl LzmaEnc {
                         );
                     }
                 } else {
-                    let mut prob = self.is_match[self.state as usize][pos_state as usize];
-                    self.rc.encode_bit_1(&mut prob, out);
-                    self.is_match[self.state as usize][pos_state as usize] = prob;
+                    let prob = &mut self.is_match[self.state as usize][pos_state as usize];
+                    self.rc.encode_bit_1(prob, out);
 
                     if (dist as usize) < LZMA_NUM_REPS {
-                        let mut prob = self.is_rep[self.state as usize];
-                        self.rc.encode_bit_1(&mut prob, out);
-                        self.is_rep[self.state as usize] = prob;
+                        let prob = &mut self.is_rep[self.state as usize];
+                        self.rc.encode_bit_1(prob, out);
 
                         if dist == 0 {
-                            let mut prob = self.is_rep_g0[self.state as usize];
-                            self.rc.encode_bit_0(&mut prob, out);
-                            self.is_rep_g0[self.state as usize] = prob;
+                            let prob = &mut self.is_rep_g0[self.state as usize];
+                            self.rc.encode_bit_0(prob, out);
                             // C takes `probs = &p->isRep0Long[p->state][posState]`
                             // before the short-rep branch changes `p->state`, so
                             // the update lands in the old state's slot.
                             let si = self.state as usize;
-                            let mut prob = self.is_rep0_long[si][pos_state as usize];
+                            let prob = &mut self.is_rep0_long[si][pos_state as usize];
                             if len != 1 {
-                                self.rc.encode_bit_1_base(&mut prob);
+                                self.rc.encode_bit_1_base(prob);
                             } else {
-                                self.rc.encode_bit_0_base(&mut prob);
+                                self.rc.encode_bit_0_base(prob);
                                 self.state = u32::from(K_SHORT_REP_NEXT_STATES[si]);
                             }
-                            self.is_rep0_long[si][pos_state as usize] = prob;
                         } else {
-                            let mut prob = self.is_rep_g0[self.state as usize];
-                            self.rc.encode_bit_1(&mut prob, out);
-                            self.is_rep_g0[self.state as usize] = prob;
-                            let mut prob = self.is_rep_g1[self.state as usize];
+                            let prob = &mut self.is_rep_g0[self.state as usize];
+                            self.rc.encode_bit_1(prob, out);
+                            let prob = &mut self.is_rep_g1[self.state as usize];
                             if dist == 1 {
-                                self.rc.encode_bit_0_base(&mut prob);
-                                self.is_rep_g1[self.state as usize] = prob;
+                                self.rc.encode_bit_0_base(prob);
                                 dist = self.reps[1];
                             } else {
-                                self.rc.encode_bit_1(&mut prob, out);
-                                self.is_rep_g1[self.state as usize] = prob;
-                                let mut prob = self.is_rep_g2[self.state as usize];
+                                self.rc.encode_bit_1(prob, out);
+                                let prob = &mut self.is_rep_g2[self.state as usize];
                                 if dist == 2 {
-                                    self.rc.encode_bit_0_base(&mut prob);
+                                    self.rc.encode_bit_0_base(prob);
                                     dist = self.reps[2];
                                 } else {
-                                    self.rc.encode_bit_1_base(&mut prob);
+                                    self.rc.encode_bit_1_base(prob);
                                     dist = self.reps[3];
                                     self.reps[3] = self.reps[2];
                                 }
-                                self.is_rep_g2[self.state as usize] = prob;
                                 self.reps[2] = self.reps[1];
                             }
                             self.reps[1] = self.reps[0];
@@ -1643,9 +1970,8 @@ impl LzmaEnc {
                             self.state = u32::from(K_REP_NEXT_STATES[self.state as usize]);
                         }
                     } else {
-                        let mut prob = self.is_rep[self.state as usize];
-                        self.rc.encode_bit_0(&mut prob, out);
-                        self.is_rep[self.state as usize] = prob;
+                        let prob = &mut self.is_rep[self.state as usize];
+                        self.rc.encode_bit_0(prob, out);
                         self.state = u32::from(K_MATCH_NEXT_STATES[self.state as usize]);
 
                         self.len_probs.encode(
@@ -1670,9 +1996,8 @@ impl LzmaEnc {
                                 let i = (sym >> K_NUM_POS_SLOT_BITS) as usize;
                                 let bit = (sym >> (K_NUM_POS_SLOT_BITS - 1)) & 1;
                                 sym <<= 1;
-                                let mut prob = self.pos_slot_encoder[lps][i];
-                                self.rc.encode_bit(&mut prob, bit, out);
-                                self.pos_slot_encoder[lps][i] = prob;
+                                let prob = &mut self.pos_slot_encoder[lps][i];
+                                self.rc.encode_bit(prob, bit, out);
                                 if sym >= (1 << (K_NUM_POS_SLOT_BITS * 2)) {
                                     break;
                                 }
@@ -1708,9 +2033,8 @@ impl LzmaEnc {
                                     if k != 3 {
                                         dist >>= 1;
                                     }
-                                    let mut prob = self.pos_align_encoder[m];
-                                    self.rc.encode_bit(&mut prob, bit, out);
-                                    self.pos_align_encoder[m] = prob;
+                                    let prob = &mut self.pos_align_encoder[m];
+                                    self.rc.encode_bit(prob, bit, out);
                                     m = (m << 1) + bit as usize;
                                 }
                             }
@@ -1741,7 +2065,15 @@ impl LzmaEnc {
                         }
                     }
 
-                    if self.mf.get_num_available_bytes(stream) == 0 {
+                    if finder_call!(
+                        self,
+                        CHECKED,
+                        MT,
+                        get_num_available_bytes,
+                        get_num_available_bytes_for,
+                        stream
+                    ) == 0
+                    {
                         break;
                     }
                     let processed = now_pos32 - start_pos32;
@@ -2136,12 +2468,12 @@ impl LzmaEnc {
         &mut self,
         stream: &mut dyn SeqInStream,
         re_init: bool,
-        dest: &mut Vec<u8>,
-        dest_limit: usize,
+        dest: &mut [u8],
         desired_pack_size: usize,
         unpack_size: &mut u32,
-    ) -> Result<bool, Error> {
+    ) -> Result<(usize, bool), Error> {
         let now_pos64 = self.now_pos64;
+        let dest_limit = dest.len();
 
         self.write_end_mark = false;
         self.finished = false;
@@ -2154,40 +2486,39 @@ impl LzmaEnc {
         self.rc.init();
 
         let mut sink = LimitedSink {
-            out: dest,
-            rem: dest_limit,
+            remaining: dest,
             overflow: false,
         };
         let res = self.code_one_block(stream, &mut sink, desired_pack_size, *unpack_size);
         let overflow = sink.overflow;
+        let written = dest_limit - sink.remaining.len();
 
         *unpack_size = (self.now_pos64 - now_pos64) as u32;
         if overflow {
-            return Ok(true);
+            return Ok((written, true));
         }
-        res.map(|()| false)
+        res.map(|()| (written, false))
     }
 }
 
 /// C: `CLzmaEnc_SeqOutStreamBuf`, the bounded buffer `LzmaEnc_CodeOneMemBlock`
 /// writes into, which records an overflow rather than failing at once.
 struct LimitedSink<'a> {
-    out: &'a mut Vec<u8>,
-    rem: usize,
+    remaining: &'a mut [u8],
     overflow: bool,
 }
 
 impl SeqOutStream for LimitedSink<'_> {
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut size = data.len();
-        if self.rem < size {
-            size = self.rem;
+        if self.remaining.len() < size {
+            size = self.remaining.len();
             self.overflow = true;
         }
         if size != 0 {
-            self.out.try_reserve(size).map_err(|_| Error::Alloc)?;
-            self.out.extend_from_slice(&data[..size]);
-            self.rem -= size;
+            let (written, remaining) = core::mem::take(&mut self.remaining).split_at_mut(size);
+            written.copy_from_slice(&data[..size]);
+            self.remaining = remaining;
         }
         Ok(())
     }
@@ -2207,4 +2538,134 @@ fn fast_pos_init() -> Vec<u8> {
         at += k;
     }
     g
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::enc::stream::{NoStream, SliceStream};
+
+    #[test]
+    fn the_window_match_lengths_equal_the_bytewise_oracle() {
+        let limits: &[usize] = if cfg!(miri) {
+            &[0, 7, 8, 9, 17]
+        } else {
+            &[
+                0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 272, 273,
+            ]
+        };
+        let distances: &[usize] = if cfg!(miri) {
+            &[1, 3]
+        } else {
+            &[1, 2, 3, 7, 8, 15, 16, 300]
+        };
+        for back in 0..if cfg!(miri) { 2 } else { 16 } {
+            for &distance in distances {
+                let data = back + distance;
+                for &limit in limits {
+                    for mismatch in 0..=limit {
+                        // The allocation ends exactly at the published limit.
+                        // Small distances also exercise overlapping matches.
+                        let mut bytes = vec![37; data + limit];
+                        if mismatch < limit {
+                            bytes[data + mismatch] ^= 1;
+                        }
+                        let checked = EncodeWindow::<true>(&bytes, bytes.as_ptr(), bytes.len());
+                        let words = EncodeWindow::<false>(&bytes, bytes.as_ptr(), bytes.len());
+                        for start in [0, 2, 3, 31] {
+                            assert_eq!(
+                                words.match_len(data, back, start, limit),
+                                checked.match_len(data, back, start, limit),
+                                "back={back} distance={distance} limit={limit} mismatch={mismatch} start={start}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn encode<const CHECKED: bool>(src: &[u8], props: &LzmaEncProps) -> Vec<u8> {
+        let mut enc = alloc::boxed::Box::new(LzmaEnc::new().unwrap());
+        enc.set_props(props).unwrap();
+        enc.mem_prepare(src.len() as u64, 0).unwrap();
+        let mut out = Vec::new();
+        let mut stream = SliceStream::new(src);
+        if let Some(sh) = enc.mt_handle() {
+            crate::enc::lz_find_mt::with_threads(&sh, &mut stream, || {
+                while !enc.finished {
+                    enc.code_one_block_kernel::<CHECKED>(&mut NoStream, &mut out, 0, 0)
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            while !enc.finished {
+                enc.code_one_block_kernel::<CHECKED>(&mut stream, &mut out, 0, 0)
+                    .unwrap();
+            }
+        }
+        out
+    }
+
+    /// The same parser instantiated with checked and unchecked window reads.
+    /// Covers every finder family, both parsers, threaded/inline windows,
+    /// tiny tails, long repeats, noisy literals and dictionary wrap. Miri
+    /// runs the identical paths on small deterministic inputs.
+    #[test]
+    fn encoder_window_reads_match_the_checked_parser() {
+        let size = if cfg!(miri) { 96 } else { 96 * 1024 };
+        let mut mixed = Vec::with_capacity(size);
+        let mut seed = 0x1234_5678u32;
+        for i in 0..size {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let byte = if i > 32 && i % 1024 < 800 {
+                mixed[i - (1 + (i / 256) % 31)]
+            } else {
+                seed as u8
+            };
+            mixed.push(byte);
+        }
+        let dense: Vec<u8> = (0..size)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed & 3) as u8
+            })
+            .collect();
+        let shapes = [
+            mixed,
+            dense,
+            vec![0; size],
+            (0..size).map(|i| (i % 251) as u8).collect(),
+        ];
+        for (kind, fast, threads) in [
+            (MatchFinderKind::Hc4, true, 1),
+            (MatchFinderKind::Bt2, true, 1),
+            (MatchFinderKind::Bt3, false, 1),
+            (MatchFinderKind::Bt4, false, 1),
+            (MatchFinderKind::Bt5, false, 1),
+            (MatchFinderKind::Bt4, false, 2),
+        ] {
+            let props = LzmaEncProps::new()
+                .with_dict_size(4096)
+                .with_match_finder(kind)
+                .with_fast_mode(fast)
+                .with_fast_bytes(16)
+                .with_num_threads(threads)
+                .with_end_mark(true);
+            for src in &shapes {
+                assert_eq!(encode::<false>(src, &props), encode::<true>(src, &props));
+            }
+        }
+        let props = LzmaEncProps::new().with_dict_size(4096).with_num_threads(1);
+        for len in [0, 1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33] {
+            let src = &shapes[0][..len];
+            assert_eq!(encode::<false>(src, &props), encode::<true>(src, &props));
+        }
+    }
 }

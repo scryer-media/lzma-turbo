@@ -2,6 +2,22 @@
 
 ## 0.9.0 - 2026-10-10
 
+- Streaming LZMA2 encoding takes 3.6–23% less wall time than official 7zz
+  on the measured 256 MiB seeded/zero-filled T2/T4 cases on Zen 4 and
+  Sapphire Rapids. Buffered encoding stays within 3% of reference wall and
+  CPU time, with RSS within 3% of the matching SDK memory API; seeded T4
+  buffered RSS is about 15% lower. The BT worker executes 8.5% fewer
+  instructions than the official binary. These are measured configurations,
+  not guarantees for every input or architecture. Full samples and rejected
+  candidates remain in `docs/encoder-perf-0.9.0.md` and its companion JSON.
+- Preserve bit-exact encoder output while reducing input/output copying,
+  parser bounds-check overhead and threaded match-finder work. Native
+  differential tests cover the x86-64 assembly; Miri covers portable unsafe
+  paths, as enumerated in `AGENTS.md`.
+- Make the adaptive decoder's read-ahead regression tests independent of
+  worker completion timing. A deterministic dispatch test verifies that
+  widening admits the fourth worker and refuses a fifth busy worker.
+
 - The threaded match finder walks its binary tree in the shape of the SDK's
   x86-64 assembly (`LzFindOpt.asm`) on x86-64 builds with the `asm` feature.
   The walk is kept out of line and works from a cursor pointer and one tree

@@ -277,6 +277,136 @@ impl Finder {
         }
     }
 
+    /// The MT window allocation, stable across one encoder coding block.
+    pub(crate) fn window_storage(&self) -> (*const u8, usize) {
+        #[cfg(feature = "std")]
+        if let Finder::Mt(mt) = self {
+            return mt.window_storage();
+        }
+        (core::ptr::null(), 0)
+    }
+
+    /// The interface chosen by LzmaEnc_Alloc, including inline execution.
+    #[inline]
+    pub(crate) fn uses_mt(&self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            matches!(self, Finder::Mt(_))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
+    }
+
+    /// # Safety
+    /// MT must equal uses_mt() for this finder.
+    /// C: `IMatchFinder2::GetMatches`.
+    #[inline]
+    pub(crate) unsafe fn get_matches_for<const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        d: &mut [u32],
+    ) -> usize {
+        // SAFETY: the caller selected MT from this variant at block entry;
+        // finder advancement never replaces the enum variant.
+        unsafe {
+            if self.uses_mt() != MT {
+                core::hint::unreachable_unchecked();
+            }
+        }
+        match self {
+            Finder::St(mf) => mf.get_matches(stream, d),
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.get_matches(d),
+        }
+    }
+
+    /// # Safety
+    /// MT must equal uses_mt() for this finder.
+    /// C: `IMatchFinder2::Skip`.
+    #[inline]
+    pub(crate) unsafe fn skip_for<const MT: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        num: u32,
+    ) {
+        // SAFETY: the caller selected MT from this variant at block entry;
+        // finder advancement never replaces the enum variant.
+        unsafe {
+            if self.uses_mt() != MT {
+                core::hint::unreachable_unchecked();
+            }
+        }
+        match self {
+            Finder::St(mf) => mf.skip(stream, num),
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.skip(stream, num),
+        }
+    }
+
+    /// # Safety
+    /// MT must equal uses_mt() for this finder.
+    /// C: `IMatchFinder2::GetNumAvailableBytes`. `stream` is read only by
+    /// the inline finder, which fills its next block here.
+    #[inline]
+    pub(crate) unsafe fn get_num_available_bytes_for<const MT: bool>(
+        &mut self,
+        #[cfg_attr(not(feature = "std"), allow(unused_variables))] stream: &mut dyn SeqInStream,
+    ) -> u32 {
+        // SAFETY: the caller selected MT from this variant at block entry;
+        // finder advancement never replaces the enum variant.
+        unsafe {
+            if self.uses_mt() != MT {
+                core::hint::unreachable_unchecked();
+            }
+        }
+        match self {
+            Finder::St(mf) => mf.get_num_available_bytes(),
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.get_num_available_bytes(stream),
+        }
+    }
+
+    /// # Safety
+    /// MT must equal uses_mt() for this finder.
+    /// C: `IMatchFinder2::GetPointerToCurrentPos`, as an index into
+    /// [`Finder::window`].
+    #[inline]
+    pub(crate) unsafe fn cur_for<const MT: bool>(&self) -> usize {
+        // SAFETY: the caller selected MT from this variant at block entry;
+        // finder advancement never replaces the enum variant.
+        unsafe {
+            if self.uses_mt() != MT {
+                core::hint::unreachable_unchecked();
+            }
+        }
+        match self {
+            Finder::St(mf) => mf.cur(),
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.cur(),
+        }
+    }
+
+    /// The window `cur` indexes.
+    /// # Safety
+    /// MT must equal uses_mt() for this finder.
+    #[inline]
+    pub(crate) unsafe fn window_for<const MT: bool>(&self) -> &[u8] {
+        // SAFETY: the caller selected MT from this variant at block entry;
+        // finder advancement never replaces the enum variant.
+        unsafe {
+            if self.uses_mt() != MT {
+                core::hint::unreachable_unchecked();
+            }
+        }
+        match self {
+            Finder::St(mf) => &mf.buf_base,
+            #[cfg(feature = "std")]
+            Finder::Mt(mt) => mt.window(),
+        }
+    }
+
     /// The handle a stream's pair of producer threads is started from, by
     /// [`crate::enc::lz_find_mt::with_threads`].
     ///

@@ -2194,6 +2194,29 @@ mod tests {
     }
 
     #[test]
+    fn read_ahead_cannot_block_an_idle_slot_or_create_a_fifth_busy_slot() {
+        let mut d = decoder(3, u64::MAX);
+        d.set_read_ahead(6);
+        for i in 0..6 {
+            hold(&mut d, &run(MIB, i));
+        }
+        hold(&mut d, &[1]); // Declare the sixth run without completing the seventh.
+        d.scan().expect("scan");
+        for _ in 0..3 {
+            assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
+        }
+        // Do not collect completions: outstanding accounting stays fixed
+        // regardless of the workers' speed. No sleep or scheduling assumption.
+        d.set_threads(4);
+        d.set_read_ahead(4);
+        assert!(d.held_bytes() + d.dispatch_cost(MIB as u64) > d.limit());
+        assert_eq!(d.dispatch().expect("fourth dispatch"), Dispatch::Sent);
+        assert_eq!(d.outstanding, 4);
+        assert_eq!(d.dispatch().expect("fifth dispatch"), Dispatch::Busy);
+        assert_eq!(d.runs_claimed(), 4);
+    }
+
+    #[test]
     fn a_piece_is_reckoned_against_the_idle_slots_only() {
         // Four threads, three runs out, the fourth run in hand and not yet
         // declared: the scanner has not seen where the next one starts.

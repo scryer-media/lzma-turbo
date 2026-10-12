@@ -51,7 +51,17 @@ ports that shape rather than that lineage.
 
 ## Speed
 
-These are dated numbers: Linux x86_64, the 16-thread x86_64 bench box of
+The current 0.9.0 encoder measurements cover level-5 LZMA2 on Linux x86-64
+Zen 4 and Sapphire Rapids. For 256 MiB seeded and zero-filled inputs at
+T2/T4, streaming uses 3.6–23% less wall time than official 7zz 26.03.
+Buffered wall and CPU time stay within 3% of 7zz, and peak RSS stays within
+3% of the matching SDK memory API; seeded T4 buffered RSS is about 15% lower.
+These are encoder API results, not archive-container or all-platform claims.
+The exact settings, T1 results and retained samples are in
+[docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md).
+
+The decode tables below are historical, not rerun by that encoder audit:
+Linux x86_64, the 16-thread x86_64 bench box of
 [docs/perf-log.md](docs/perf-log.md), measured with `tools/lzma-bench` in
 September 2026 at commits before 0.6.0, median of three runs. Every row
 decodes the same bytes, checked against the oracle by length and CRC-32. To
@@ -83,7 +93,7 @@ LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`, unpinned:
 | 4 | 1.6 s | 1.6 s |
 | 16 | 0.60 s | 0.69 s |
 
-The 8- and 16-thread LZMA2 rows are the one place `7zz` is ahead, by how
+In these historical tables, the 8- and 16-thread LZMA2 rows favor `7zz`, by how
 well its threads land on this machine's performance cores; pinned to those
 cores the two are within 5%. docs/perf-log.md names the machine behind the
 first two tables as a 12th-gen Core i5-1240P (Alder Lake-P) and the one behind
@@ -155,7 +165,7 @@ two builds differ there. Solid, single-threaded output stays the default. What
 was left out, and how the frame around the compressed data is proved, is in
 [docs/encoder.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/encoder.md).
 
-Throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
+Decode throughput work against the acceptance gate (within 3% of `7zz t -mmt=1` on
 the same file and machine) is tracked in [docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md);
 see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/porting.md) for the plan.
 
@@ -164,7 +174,7 @@ see [docs/porting.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/
 | feature | default | what it adds |
 | --- | --- | --- |
 | `std` | yes | the `std::io::Read` adapters and `std::error::Error` |
-| `asm` | yes | 7-Zip's own decode loop on `aarch64` and `x86_64` |
+| `asm` | yes | 7-Zip's decode loop on `aarch64` and `x86_64`, and the encoder's SDK tree-walk assembly on `x86_64` |
 | `crc` | yes | CRC-32 and CRC-64/XZ, from `crc-fast`, their `CrcFolder`, and worker-side checksums in the threaded decoders; implies `std` |
 | `crypto` | yes | SHA-256, xz check type 10, from `aws-lc-rs`; implies `std` |
 | `enc` | yes | the encoder: `LzmaEncoder`, `Lzma2Encoder`, the `.lzma` writer and the `Write` adapters, and with `xz` also `XzEncoder` and `XzWriter`; implies `crc` |

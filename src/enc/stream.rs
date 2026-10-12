@@ -5,15 +5,13 @@
 //! as a parameter instead, because a borrow held in the struct would put a
 //! lifetime on `CLzmaEnc` and on everything that owns one.
 //!
-//! # Deviation: `directInput` only for a threaded block
+//! # Deviation: `directInput` through the threaded/inline finder
 //!
 //! `MatchFinder_SET_DIRECT_INPUT_BUF` lets the C point `p->buffer` straight at
-//! the caller's bytes and never allocate a window. This port does that only
-//! where the C's threaded `Lzma2Enc` spends most of its time: a block a block
-//! thread codes with the threaded match finder, which reads it in place
-//! (`crate::enc::lz_find_mt::run_block`). Everywhere else there is the
-//! window, filled from a stream, and a slice source is [`SliceStream`], a
-//! stream over that slice.
+//! the caller's bytes and never allocate a window. This port does that for
+//! block-threaded LZMA2 and solid buffered LZMA2 through the threaded or
+//! inline finder (`crate::enc::lz_find_mt::run_block`). Other paths retain
+//! a window filled from a stream; their slice source is [`SliceStream`].
 //!
 //! The two find the same matches. The two modes differ only in how much input is
 //! visible at once, and that reaches nothing a match depends on:

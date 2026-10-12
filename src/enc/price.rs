@@ -133,14 +133,12 @@ impl LenEnc {
         // C: `probs` walks `p->low`; here it is the index of its first entry.
         let mut base = 0usize;
         if sym >= K_LEN_NUM_LOW_SYMBOLS {
-            let mut prob = self.low[base];
-            rc.encode_bit_1(&mut prob, out);
-            self.low[base] = prob;
+            let prob = &mut self.low[base];
+            rc.encode_bit_1(prob, out);
             base += K_LEN_NUM_LOW_SYMBOLS as usize;
             if sym >= K_LEN_NUM_LOW_SYMBOLS * 2 {
-                let mut prob = self.low[base];
-                rc.encode_bit_1(&mut prob, out);
-                self.low[base] = prob;
+                let prob = &mut self.low[base];
+                rc.encode_bit_1(prob, out);
                 // C: `LitEnc_Encode(rc, p->high, sym - kLenNumLowSymbols * 2)`.
                 rc.lit_encode(&mut self.high, sym - K_LEN_NUM_LOW_SYMBOLS * 2, out);
                 return;
@@ -150,27 +148,23 @@ impl LenEnc {
 
         // C: `RcTree_Encode(rc, probs + (posState << kLenNumLowBits), kLenNumLowBits, sym)`,
         // unrolled as the C unrolls it.
-        let mut prob = self.low[base];
-        rc.encode_bit_0(&mut prob, out);
-        self.low[base] = prob;
+        let prob = &mut self.low[base];
+        rc.encode_bit_0(prob, out);
         base += (pos_state as usize) << (1 + K_LEN_NUM_LOW_BITS);
 
         let bit = sym >> 2;
-        let mut prob = self.low[base + 1];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + 1] = prob;
+        let prob = &mut self.low[base + 1];
+        rc.encode_bit(prob, bit, out);
         let mut m = (1usize << 1) + bit as usize;
 
         let bit = (sym >> 1) & 1;
-        let mut prob = self.low[base + m];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + m] = prob;
+        let prob = &mut self.low[base + m];
+        rc.encode_bit(prob, bit, out);
         m = (m << 1) + bit as usize;
 
         let bit = sym & 1;
-        let mut prob = self.low[base + m];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + m] = prob;
+        let prob = &mut self.low[base + m];
+        rc.encode_bit(prob, bit, out);
     }
 }
 

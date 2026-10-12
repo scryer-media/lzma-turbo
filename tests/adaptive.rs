@@ -875,9 +875,9 @@ fn a_thread_under_the_ceiling_is_not_kept_idle_by_input_read_ahead() {
     // reading ahead for four are allowed. Widened to four, the fourth thread
     // takes the next run at once rather than waiting for a run to land: what
     // stands in its way is input already held behind that run. Nothing is
-    // handed to the sink before the fourth claim, so a run that lands first
-    // still holds its slot's output, and the claim is the same whichever
-    // runs the workers have finished.
+    // handed to the sink before the fourth claim. Completed workers may
+    // release enough input for later claims; those cumulative claims are
+    // not the number of workers currently busy.
     let runs: Vec<_> = (0..8)
         .map(|i| copy_run(&pseudo_random(1 << 20, 0x5eed + i)))
         .collect();
@@ -894,7 +894,7 @@ fn a_thread_under_the_ceiling_is_not_kept_idle_by_input_read_ahead() {
         assert_ne!(took, 0, "input refused at {pos}");
         pos += took;
     }
-    for _ in 0..4 {
+    for _ in 0..3 {
         dec.drain_upto(0, |_, _| panic!("handed bytes over"))
             .expect("drain");
     }
@@ -913,10 +913,9 @@ fn a_thread_under_the_ceiling_is_not_kept_idle_by_input_read_ahead() {
     assert_eq!(dec.runs_claimed(), 4, "the fourth thread waited");
     dec.drain_upto(0, |_, _| panic!("handed bytes over"))
         .expect("drain");
-    assert_eq!(
-        dec.runs_claimed(),
-        4,
-        "a fifth run went out on four threads"
+    assert!(
+        dec.ledger().runs_out <= 4,
+        "more than four runs outstanding"
     );
 
     let mut out = Vec::new();

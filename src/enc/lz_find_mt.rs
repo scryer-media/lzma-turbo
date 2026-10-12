@@ -216,9 +216,9 @@ impl MtSync {
     }
 
     /// C: `MtSync_GetNextBlock`. Returns the index of the block that is now
-    /// filled, and leaves the buffer *locked* for the caller - the next call
-    /// is what unlocks it.
-    fn get_next_block(&self) -> u32 {
+    /// filled. A movable window stays locked until the next call; direct
+    /// input is immutable, so only the semaphore handoff is needed.
+    fn get_next_block(&self, movable: bool) -> u32 {
         let mut num_blocks = 0;
         if Self::get(&self.need_start) {
             self.num_processed_blocks.store(1, Ordering::SeqCst);
@@ -228,14 +228,18 @@ impl MtSync {
             self.was_stopped.reset();
             self.can_start.set();
         } else {
-            self.unlock_buffer();
+            if movable {
+                self.unlock_buffer();
+            }
             // C: "we free current block".
             num_blocks = self.num_processed_blocks.fetch_add(1, Ordering::SeqCst);
             self.free.release1();
         }
 
         self.filled.wait();
-        self.lock_buffer();
+        if movable {
+            self.lock_buffer();
+        }
         num_blocks
     }
 
@@ -551,7 +555,7 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
     all(feature = "asm", target_arch = "x86_64", not(feature = "kernel-ab")),
     allow(dead_code)
 )]
-fn get_matches_spec_n_2(
+pub(super) fn get_matches_spec_n_2(
     win: &[u8],
     len_limit_0: usize,
     mut pos: u32,
@@ -1595,14 +1599,18 @@ impl MtShared {
     /// entered `hash_sync.cs`, before it looks at the window.
     #[inline]
     fn apply_bt_shift(&self, b: &mut BtState) {
-        b.buffer -= self.bt_shift.swap(0, Ordering::SeqCst);
+        if !self.common().direct {
+            b.buffer -= self.bt_shift.swap(0, Ordering::SeqCst);
+        }
     }
 
     /// The lz thread's half of `move_block`: called each time it has just
     /// entered `bt_sync.cs`.
     #[inline]
     fn apply_lz_shift(&self, l: &mut LzState) {
-        l.pointer_to_cur_pos -= self.lz_shift.swap(0, Ordering::SeqCst);
+        if !self.common().direct {
+            l.pointer_to_cur_pos -= self.lz_shift.swap(0, Ordering::SeqCst);
+        }
     }
 
     /// C: `MatchFinder_ReadBlock`, against the window through its one raw
@@ -2060,7 +2068,8 @@ fn bt_get_matches(
 /// - so the unlock below stays balanced.
 fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     let sync = &sh.hash_sync;
-    if !MtSync::get(&sync.need_start) {
+    let movable = !sh.common().direct;
+    if movable && !MtSync::get(&sync.need_start) {
         sync.lock_buffer();
         // The window may have slid while `hash_sync.cs` was open.
         sh.apply_bt_shift(b);
@@ -2068,7 +2077,7 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     let block_offset = bt_block_offset(global_block_index);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         bt_get_matches(sh, b, block_offset, || {
-            hash_block_offset(sh.hash_sync.get_next_block())
+            hash_block_offset(sh.hash_sync.get_next_block(movable))
         });
     }));
     if run.is_err() {
@@ -2081,7 +2090,9 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     }
     // C: "We suppose that we have called GetNextBlock() from start. So buffer
     // is LOCKED".
-    sync.unlock_buffer();
+    if movable {
+        sync.unlock_buffer();
+    }
 }
 
 /// C: `BtThreadFunc`, reached through `BtThreadFunc2`.
@@ -2599,6 +2610,13 @@ impl MatchFinderMt {
         unsafe { (*self.shared().lz_state.get()).pointer_to_cur_pos }
     }
 
+    /// C: the allocation behind pointerToCurPos. Moves slide bytes inside
+    /// this allocation; only create/run_block replace it, outside coding.
+    pub(crate) fn window_storage(&self) -> (*const u8, usize) {
+        let c = self.shared().common();
+        (c.win, c.win_len)
+    }
+
     /// The window the encoder reads literals and match bytes out of.
     ///
     /// C: the bytes `p->pointerToCurPos` points into.
@@ -2652,7 +2670,7 @@ impl MatchFinderMt {
                 bt_get_matches(sh, b, 0, || hash_stage_inline(sh, stream));
                 0
             } else {
-                sh.bt_sync.get_next_block()
+                sh.bt_sync.get_next_block(!c.direct)
             };
             // The window may have slid while `bt_sync.cs` was open, or
             // inline, while the hash stage ran.
@@ -2709,76 +2727,65 @@ impl MatchFinderMt {
     }
 }
 
-impl MatchFinderMt {
-    /// C: `MixMatches2` / `MixMatches3` / `MixMatches4`.
-    ///
-    /// The bt thread only tracks matches of at least `numHashBytes` bytes, so
-    /// the short ones are found here, from the low hash table, and spliced in
-    /// front of the pairs it produced. `match_min_pos` is where the bt
-    /// thread's nearest match already is: anything further back is redundant.
-    fn mix_matches(&self, match_min_pos: u32, d: &mut [u32], mut di: usize) -> usize {
-        let sh = self.shared();
-        let c = sh.common();
-        // SAFETY: the lz thread owns `lz_state` and the low hash, and may read
-        // the window.
-        let (l, hash, win) = unsafe { (&*sh.lz_state.get(), c.low_hash(), c.win()) };
-        let cur = l.pointer_to_cur_pos;
-        let m = l.lz_pos;
+/// C: `MixMatches2` / `MixMatches3` / `MixMatches4`, with one hash-table
+/// bound check. The checked instantiation retains each original index check.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn mix_matches_kernel<const CHECKED: bool>(
+    mix: Mix,
+    crc: &[u32; 256],
+    hash: &mut [u32],
+    win: &[u8],
+    cur: usize,
+    m: u32,
+    match_min_pos: u32,
+    d: &mut [u32],
+    mut di: usize,
+) -> usize {
+    if !CHECKED {
+        let required = if mix == Mix::Two {
+            K_HASH2_SIZE as usize
+        } else {
+            K_FIX4_HASH_SIZE
+        };
+        assert!(hash.len() >= required, "short low hash table");
+    }
+    // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
+    let temp = crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
+    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+    let c2 = if CHECKED {
+        core::mem::replace(&mut hash[h2], m)
+    } else {
+        // SAFETY: h2 is masked below K_HASH2_SIZE, covered by the
+        // table extent guaranteed by the caller or checked at entry.
+        // No other hash borrow is live.
+        unsafe { hash.as_mut_ptr().add(h2).replace(m) }
+    };
 
-        // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
-        let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
-        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-        let c2 = hash[h2];
-        hash[h2] = m;
-
-        if c.mix == Mix::Two {
-            if c2 >= match_min_pos && win[cur - (m - c2) as usize] == win[cur] {
-                d[di] = 2;
-                d[di + 1] = m - c2 - 1;
-                di += 2;
-            }
-            return di;
+    if mix == Mix::Two {
+        if c2 >= match_min_pos && win[cur - (m - c2) as usize] == win[cur] {
+            d[di] = 2;
+            d[di + 1] = m - c2 - 1;
+            di += 2;
         }
+        return di;
+    }
 
-        let h3 = ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-        let c3 = hash[K_FIX3_HASH_SIZE + h3];
-        hash[K_FIX3_HASH_SIZE + h3] = m;
+    let h3 = ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+    let c3 = if CHECKED {
+        core::mem::replace(&mut hash[K_FIX3_HASH_SIZE + h3], m)
+    } else {
+        // SAFETY: h3 is masked below K_HASH3_SIZE; the entry assertion
+        // covers the constant K_FIX3_HASH_SIZE offset and the full table.
+        unsafe { hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).replace(m) }
+    };
 
-        if c.mix == Mix::Three {
-            if c2 >= match_min_pos {
-                let back = (m - c2) as usize;
-                if win[cur - back] == win[cur] {
-                    d[di + 1] = m - c2 - 1;
-                    if win[cur - back + 2] == win[cur + 2] {
-                        d[di] = 3;
-                        return di + 2;
-                    }
-                    d[di] = 2;
-                    di += 2;
-                }
-            }
-            if c3 >= match_min_pos {
-                let back = (m - c3) as usize;
-                if win[cur - back] == win[cur] {
-                    d[di] = 3;
-                    d[di + 1] = m - c3 - 1;
-                    di += 2;
-                }
-            }
-            return di;
-        }
-
-        // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
-        // is no fourth hash here.
+    if mix == Mix::Three {
         if c2 >= match_min_pos {
             let back = (m - c2) as usize;
             if win[cur - back] == win[cur] {
                 d[di + 1] = m - c2 - 1;
                 if win[cur - back + 2] == win[cur + 2] {
-                    if win[cur - back + 3] == win[cur + 3] {
-                        d[di] = 4;
-                        return di + 2;
-                    }
                     d[di] = 3;
                     return di + 2;
                 }
@@ -2789,18 +2796,214 @@ impl MatchFinderMt {
         if c3 >= match_min_pos {
             let back = (m - c3) as usize;
             if win[cur - back] == win[cur] {
+                d[di] = 3;
                 d[di + 1] = m - c3 - 1;
+                di += 2;
+            }
+        }
+        return di;
+    }
+
+    // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
+    // is no fourth hash here.
+    if c2 >= match_min_pos {
+        let back = (m - c2) as usize;
+        if win[cur - back] == win[cur] {
+            d[di + 1] = m - c2 - 1;
+            if win[cur - back + 2] == win[cur + 2] {
                 if win[cur - back + 3] == win[cur + 3] {
                     d[di] = 4;
                     return di + 2;
                 }
                 d[di] = 3;
+                return di + 2;
+            }
+            d[di] = 2;
+            di += 2;
+        }
+    }
+    if c3 >= match_min_pos {
+        let back = (m - c3) as usize;
+        if win[cur - back] == win[cur] {
+            d[di + 1] = m - c3 - 1;
+            if win[cur - back + 3] == win[cur + 3] {
+                d[di] = 4;
+                return di + 2;
+            }
+            d[di] = 3;
+            di += 2;
+        }
+    }
+    di
+}
+/// C: MixMatches2/3/4, specialized as the SDK's selected function.
+/// The bt stage handles longer matches; these pairs precede its matches.
+///
+/// # Safety
+/// Every low-hash entry must precede m. Initialization, normalization and
+/// writing before INCREASE_LZ_POS establish this invariant in the finder.
+/// If TRUSTED, the caller also guarantees the hash extent for MIX,
+/// lookahead of 2/3/4 bytes, match_min_pos <= m with m - match_min_pos <= cur,
+/// and room for two output pairs starting at di. Otherwise entry checks
+/// establish these bounds.
+/// MatchFinderMt establishes hash extent at creation, window/history from
+/// its published current position and availability, and checks output room.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bool>(
+    crc: &[u32; 256],
+    hash: &mut [u32],
+    win: &[u8],
+    cur: usize,
+    m: u32,
+    match_min_pos: u32,
+    d: &mut [u32],
+    mut di: usize,
+) -> usize {
+    if !CHECKED && !TRUSTED {
+        let required = if MIX == 2 {
+            K_HASH2_SIZE as usize
+        } else {
+            K_FIX4_HASH_SIZE
+        };
+        assert!(hash.len() >= required, "short low hash table");
+    }
+    if !CHECKED && !TRUSTED {
+        let lookahead = if MIX == 2 {
+            2
+        } else if MIX == 3 {
+            3
+        } else {
+            4
+        };
+        assert!(
+            cur.checked_add(lookahead)
+                .is_some_and(|end| end <= win.len()),
+            "short mixer window"
+        );
+        assert!(
+            match_min_pos <= m && (m - match_min_pos) as usize <= cur,
+            "mixer history"
+        );
+        let room = if MIX == 2 { 2 } else { 4 };
+        assert!(
+            di.checked_add(room).is_some_and(|end| end <= d.len()),
+            "short mixer output"
+        );
+    }
+    let read = |index| {
+        if CHECKED {
+            win[index]
+        } else {
+            // SAFETY: the caller or entry checks cover lookahead and the
+            // oldest allowed position; hash positions precede m.
+            unsafe { *win.get_unchecked(index) }
+        }
+    };
+    let mut write = |index, value| {
+        if CHECKED {
+            d[index] = value;
+        } else {
+            // SAFETY: the caller or entry reservation covers both output pairs.
+            unsafe {
+                *d.get_unchecked_mut(index) = value;
+            }
+        }
+    };
+    // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
+    let temp = crc[usize::from(read(cur))] ^ u32::from(read(cur + 1));
+    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+    let c2 = if CHECKED {
+        core::mem::replace(&mut hash[h2], m)
+    } else {
+        // SAFETY: h2 is masked below K_HASH2_SIZE, covered by the
+        // table extent guaranteed by the caller or checked at entry.
+        // No other hash borrow is live.
+        unsafe { hash.as_mut_ptr().add(h2).replace(m) }
+    };
+
+    if MIX == 2 {
+        if c2 >= match_min_pos && read(cur - (m - c2) as usize) == read(cur) {
+            write(di, 2);
+            write(di + 1, m - c2 - 1);
+            di += 2;
+        }
+        return di;
+    }
+
+    let h3 = ((temp ^ (u32::from(read(cur + 2)) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+    let c3 = if CHECKED {
+        core::mem::replace(&mut hash[K_FIX3_HASH_SIZE + h3], m)
+    } else {
+        // SAFETY: h3 is masked below K_HASH3_SIZE. The caller or entry
+        // check guarantees the table includes the K_FIX3_HASH_SIZE offset.
+        unsafe { hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).replace(m) }
+    };
+
+    if MIX == 3 {
+        if c2 >= match_min_pos {
+            let back = (m - c2) as usize;
+            if read(cur - back) == read(cur) {
+                write(di + 1, m - c2 - 1);
+                if read(cur - back + 2) == read(cur + 2) {
+                    write(di, 3);
+                    return di + 2;
+                }
+                write(di, 2);
                 di += 2;
             }
         }
-        di
+        if c3 >= match_min_pos {
+            let back = (m - c3) as usize;
+            if read(cur - back) == read(cur) {
+                write(di, 3);
+                write(di + 1, m - c3 - 1);
+                di += 2;
+            }
+        }
+        return di;
     }
 
+    // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
+    // is no fourth hash here.
+    if c2 >= match_min_pos {
+        let back = (m - c2) as usize;
+        if read(cur - back) == read(cur) {
+            write(di + 1, m - c2 - 1);
+            if read(cur - back + 2) == read(cur + 2) {
+                if read(cur - back + 3) == read(cur + 3) {
+                    write(di, 4);
+                    return di + 2;
+                }
+                write(di, 3);
+                return di + 2;
+            }
+            write(di, 2);
+            di += 2;
+        }
+    }
+    if c3 >= match_min_pos {
+        let back = (m - c3) as usize;
+        if read(cur - back) == read(cur) {
+            write(di + 1, m - c3 - 1);
+            if read(cur - back + 3) == read(cur + 3) {
+                write(di, 4);
+                return di + 2;
+            }
+            write(di, 3);
+            di += 2;
+        }
+    }
+    di
+}
+
+impl MatchFinderMt {
+    /// C: `MixMatches2` / `MixMatches3` / `MixMatches4`.
+    ///
+    /// The bt thread only tracks matches of at least `numHashBytes` bytes, so
+    /// the short ones are found here, from the low hash table, and spliced in
+    /// front of the pairs it produced. `match_min_pos` is where the bt
+    /// thread's nearest match already is: anything further back is redundant.
     /// C: `INCREASE_LZ_POS`.
     #[inline]
     fn increase_lz_pos(&self) {
@@ -2813,6 +3016,34 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt_GetMatches`, or `MatchFinderMt2_GetMatches` when
     /// there is no low hash to mix in.
     pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
+        #[cfg(feature = "kernel-ab")]
+        if crate::kernel_ab::encoder_checked() {
+            return self.get_matches_select::<true>(d);
+        }
+        self.get_matches_select::<false>(d)
+    }
+
+    #[inline]
+    fn get_matches_select<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+        // C: the usual BT4 vtable selects MixMatches3. Keep its call site
+        // separate from the other hash widths, avoiding a per-byte jump table.
+        if self.shared().common().mix == Mix::Three {
+            return self.get_matches_kind::<3, CHECKED>(d);
+        }
+        self.get_matches_other::<CHECKED>(d)
+    }
+
+    #[inline(never)]
+    fn get_matches_other<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+        match self.shared().common().mix {
+            Mix::None => self.get_matches_kind::<0, CHECKED>(d),
+            Mix::Two => self.get_matches_kind::<2, CHECKED>(d),
+            Mix::Three => self.get_matches_kind::<3, CHECKED>(d),
+            Mix::Four => self.get_matches_kind::<4, CHECKED>(d),
+        }
+    }
+
+    fn get_matches_kind<const MIX: u8, const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
         let sh = self.shared();
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
@@ -2836,7 +3067,7 @@ impl MatchFinderMt {
             return 0;
         }
 
-        if c.mix == Mix::None {
+        if MIX == 0 {
             let bt_lim = bt_pos + len as usize;
             l.bt_buf_pos = base + bt_lim;
             l.bt_num_avail_bytes -= 1;
@@ -2855,6 +3086,10 @@ impl MatchFinderMt {
         l.bt_num_avail_bytes = avail;
         l.bt_buf_pos = base + bt_pos + len as usize;
 
+        // SAFETY: the lz thread owns the low hash and holds the window.
+        let (hash, win) = unsafe { (c.low_hash(), c.win()) };
+        let cur = l.pointer_to_cur_pos;
+        let m = l.lz_pos;
         let mut di = 0;
         if len == 0 {
             if avail >= (BT_HASH_BYTES_MAX - 1) - 1 {
@@ -2864,14 +3099,44 @@ impl MatchFinderMt {
                 } else {
                     m = 1;
                 }
-                di = self.mix_matches(m, d, di);
+                // SAFETY: hash entries precede lz_pos; they start at zero,
+                // are normalized with it, and are written before advancement.
+                // create sizes the low hash for MIX. The availability test
+                // above establishes lookahead; history_size and keep_before
+                // retain every position >= m, including after a window slide.
+                // di is zero and the branch below reserves both output pairs.
+                di = unsafe {
+                    if d.len() >= 4 {
+                        mix_matches_kind::<CHECKED, MIX, true>(
+                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                        )
+                    } else {
+                        mix_matches_kind::<CHECKED, MIX, false>(
+                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                        )
+                    }
+                };
             }
         } else {
             // C: "first match pair from BinTree: (match_len, match_dist)
             // [...] MixMatchesFunc() inserts only hash matches that are nearer
             // than (match_dist)".
             let min_pos = l.lz_pos - bt[bt_pos + 1];
-            di = self.mix_matches(min_pos, d, di);
+            // SAFETY: the same hash extent/history invariant as above. A
+            // nonempty bt match establishes lookahead and a distance within
+            // retained history; min_pos excludes every older low-hash entry.
+            // di is zero and the branch below checks room for both pairs.
+            di = unsafe {
+                if d.len() >= 4 {
+                    mix_matches_kind::<CHECKED, MIX, true>(
+                        &c.crc, hash, win, cur, m, min_pos, d, di,
+                    )
+                } else {
+                    mix_matches_kind::<CHECKED, MIX, false>(
+                        &c.crc, hash, win, cur, m, min_pos, d, di,
+                    )
+                }
+            };
             let mut left = len;
             loop {
                 d[di] = bt[bt_pos];
@@ -2891,15 +3156,20 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt0_Skip` / `MatchFinderMt2_Skip` / `MatchFinderMt3_Skip`
     /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair. `stream` is
     /// read only inline.
-    pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
-        let min_len = match self.shared().common().mix {
-            Mix::None => 0,
-            Mix::Two => 2,
+    pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
+        match self.shared().common().mix {
+            Mix::None => self.skip_kind::<0>(stream, num),
+            Mix::Two => self.skip_kind::<2>(stream, num),
             // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
             // "the difference is that MatchFinderMt3_Skip() updates hash for
             // last 3 bytes of stream".
-            Mix::Three | Mix::Four => 3,
-        };
+            Mix::Three | Mix::Four => self.skip_kind::<3>(stream, num),
+        }
+    }
+
+    /// C: each specialized `MatchFinderMt*_Skip`, retaining the held block
+    /// and window until `GET_NEXT_BLOCK_IF_REQUIRED` must hand them back.
+    fn skip_kind<const MIN_LEN: u32>(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
         loop {
             self.next_block_if_required(stream);
             let sh = self.shared();
@@ -2907,25 +3177,48 @@ impl MatchFinderMt {
             // SAFETY: the lz thread owns `lz_state` and the low hash, and may
             // read the window.
             let (l, hash, win) = unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win()) };
-            let avail = l.bt_num_avail_bytes;
-            l.bt_num_avail_bytes = avail.wrapping_sub(1);
-            if min_len != 0 && avail >= min_len {
-                let cur = l.pointer_to_cur_pos;
-                let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
-                let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-                hash[h2] = l.lz_pos;
-                if min_len == 3 {
-                    let h3 =
-                        ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-                    hash[K_FIX3_HASH_SIZE + h3] = l.lz_pos;
+            // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
+            // The inner loop stops before the next handoff, so these views
+            // never survive a block release or a window slide.
+            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
+            // C: the specialized SKIP loop's hash extent and cursor locals.
+            // Keep one checked table extent for the masked indices below.
+            let hash_len = match MIN_LEN {
+                3 => K_FIX4_HASH_SIZE,
+                2 => K_HASH2_SIZE as usize,
+                _ => 0,
+            };
+            let hash = &mut hash[..hash_len];
+            let mut avail = l.bt_num_avail_bytes;
+            let mut cur = l.pointer_to_cur_pos;
+            let mut pos = l.lz_pos;
+            let mut bt_pos = l.bt_buf_pos - base;
+            let bt_limit = l.bt_buf_pos_limit - base;
+            loop {
+                if MIN_LEN != 0 && avail >= MIN_LEN {
+                    let bytes = &win[cur..cur + MIN_LEN as usize];
+                    let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+                    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                    hash[h2] = pos;
+                    if MIN_LEN == 3 {
+                        let h3 =
+                            ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                        hash[K_FIX3_HASH_SIZE + h3] = pos;
+                    }
+                }
+                avail = avail.wrapping_sub(1);
+                pos += 1;
+                cur += 1;
+                bt_pos += bt[bt_pos] as usize + 1;
+                num -= 1;
+                if num == 0 || bt_pos == bt_limit {
+                    break;
                 }
             }
-            l.lz_pos += 1;
-            l.pointer_to_cur_pos += 1;
-            // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
-            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
-            l.bt_buf_pos += bt[l.bt_buf_pos - base] as usize + 1;
-            num -= 1;
+            l.bt_num_avail_bytes = avail;
+            l.pointer_to_cur_pos = cur;
+            l.lz_pos = pos;
+            l.bt_buf_pos = base + bt_pos;
             if num == 0 {
                 return;
             }
@@ -3129,10 +3422,11 @@ mod tests {
 
     use super::{
         BT_BLOCK_SIZE, BT_BUFFER_SIZE, HASH_BLOCK_SIZE, HASH_BUFFER_SIZE, Heads, MatchFinder,
-        MatchFinderMt, get_heads, get_heads_indexed, get_matches_spec_n_2,
-        get_matches_spec_n_2_checked, run_block, with_threads,
+        MatchFinderMt, Mix, get_heads, get_heads_indexed, get_matches_spec_n_2,
+        get_matches_spec_n_2_checked, mix_matches_kernel, mix_matches_kind, run_block,
+        with_threads,
     };
-    use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
+    use crate::enc::consts::{K_FIX4_HASH_SIZE, K_HASH2_SIZE, K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
     use crate::enc::stream::{NoStream, SeqInStream, SliceStream};
     use crate::enc::{Lzma2Encoder, LzmaEncProps};
@@ -3259,6 +3553,105 @@ mod tests {
 
         fn below(&mut self, n: u32) -> u32 {
             self.next() % n
+        }
+    }
+
+    /// The low hash cursor reads and writes exactly what the checked mixer
+    /// does, including all early returns after two-, three- and four-byte
+    /// matches, expired candidates and a nonzero output offset.
+    #[test]
+    fn the_mix_matches_kernel_matches_checked_tables() {
+        let mut rng = Rng(0x5EED_1234_5678_9000);
+        let crc: [u32; 256] = core::array::from_fn(|_| rng.next());
+        for mix in [Mix::Two, Mix::Three, Mix::Four] {
+            for case_no in 0..if cfg!(miri) { 6 } else { 300 } {
+                let size = if mix == Mix::Two {
+                    K_HASH2_SIZE as usize
+                } else {
+                    K_FIX4_HASH_SIZE
+                };
+                let m = 1024;
+                let mut hash: Vec<u32> = (0..size).map(|_| rng.below(m)).collect();
+                let mut checked_hash = hash.clone();
+                let mut trusted_hash = hash.clone();
+                let alphabet = [1, 2, 4, 256][case_no % 4];
+                let win: Vec<u8> = (0..260).map(|_| rng.below(alphabet) as u8).collect();
+                let mut out = [0xDEAD_BEEF; 8];
+                let mut checked_out = out;
+                let mut trusted_out = out;
+                let min = m - 256 + rng.below(256);
+                // SAFETY: every generated hash entry is below m. The
+                // retained 256 bytes cover min, and the window/output
+                // allocations include the kernel's lookahead and margin.
+                let got = unsafe {
+                    match mix {
+                        Mix::Two => mix_matches_kind::<false, 2, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::Three => mix_matches_kind::<false, 3, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::Four => mix_matches_kind::<false, 4, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::None => unreachable!(),
+                    }
+                };
+                // SAFETY: the same generated table, history, lookahead and
+                // output margins stated above satisfy the trusted contract.
+                let trusted = unsafe {
+                    match mix {
+                        Mix::Two => mix_matches_kind::<false, 2, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::Three => mix_matches_kind::<false, 3, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::Four => mix_matches_kind::<false, 4, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::None => unreachable!(),
+                    }
+                };
+                let want = mix_matches_kernel::<true>(
+                    mix,
+                    &crc,
+                    &mut checked_hash,
+                    &win,
+                    256,
+                    m,
+                    min,
+                    &mut checked_out,
+                    2,
+                );
+                assert_eq!(got, want);
+                assert_eq!(trusted, want);
+                assert_eq!(trusted_out, checked_out);
+                assert_eq!(trusted_hash, checked_hash);
+                assert_eq!(out, checked_out);
+                assert_eq!(hash, checked_hash);
+            }
         }
     }
 
@@ -3546,8 +3939,8 @@ mod tests {
     /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
     /// every access checked, on the same generated tables and under the same
     /// conditions: the same answer, the same tree, the same matches. It runs
-    /// in the same Miri job as the slice kernel's test, so every raw-pointer
-    /// access it makes is checked there too.
+    /// natively against the x86 assembly where available. In the Miri job it
+    /// exercises the same margin wrapper and the portable pointer walk.
     #[test]
     fn the_register_walk_is_the_checked_walk_on_any_tables() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -3603,6 +3996,135 @@ mod tests {
             break_it(&mut c);
             let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&c, reg)));
             assert!(refused.is_err(), "condition {name} was not tested");
+        }
+    }
+
+    /// A short output buffer may fit the actual matches without fitting the
+    /// register walk's worst-case reservation. It must take the slice path.
+    /// Also cover exact long-match output, early limits, and oversized limits.
+    #[test]
+    fn the_register_walk_hands_short_output_to_the_slice_walk() {
+        let mut c = Case {
+            win: vec![7; 28],
+            len_limit_0: 24,
+            pos: 9,
+            cur: 8,
+            son: vec![0; 32],
+            cut: 16,
+            d_len: 3,
+            di: 0,
+            max_len_0: 3,
+            heads: vec![1; 4],
+            hi: 0,
+            limit: 1,
+            hsize: 4,
+            cbp: 8,
+            cyclic: 16,
+        };
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for (d_len, limit) in [(3, 0), (3, 1), (12, 10), (120, 1), (120, usize::MAX)] {
+            c.d_len = d_len;
+            c.limit = limit;
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+        }
+        c.d_len = 2;
+        c.limit = 1;
+        for kernel in [reg, get_matches_spec_n_2_checked] {
+            assert!(std::panic::catch_unwind(|| walk(&c, kernel)).is_err());
+        }
+    }
+
+    /// Exercise the assembly's direct/cyclic modes and the Rust fallbacks,
+    /// including a corrupt child on the last permitted tree iteration.
+    #[test]
+    fn the_register_walk_preserves_sdk_modes_and_error_order() {
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for (pos, cbp) in [(24, 24), (40, 8), (24, 8), (u32::MAX - 2, 4)] {
+            let mut c = Case {
+                win: vec![7; 99],
+                len_limit_0: 95,
+                pos,
+                cur: 64,
+                son: vec![pos - 1; 64],
+                cut: 1,
+                d_len: 300,
+                di: 2,
+                max_len_0: 3,
+                heads: vec![1; 4],
+                hi: 0,
+                limit: usize::MAX,
+                hsize: 4,
+                cbp,
+                cyclic: 32,
+            };
+            // Equal bytes reach the limit and copy a run of tree links.
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+            // A mismatch follows the corrupt child even when cut == 1.
+            c.win[64] = 8;
+            let want = walk(&c, get_matches_spec_n_2_checked);
+            assert!(want.0.is_none());
+            assert_eq!(walk(&c, reg), want);
+            c.heads[0] = 0;
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+            c.heads[0] = 1;
+            c.son.fill(0);
+            c.cut = 0;
+            let got = std::panic::catch_unwind(|| walk(&c, reg));
+            let want = std::panic::catch_unwind(|| walk(&c, get_matches_spec_n_2_checked));
+            if cfg!(debug_assertions) {
+                assert!(got.is_err() && want.is_err());
+            } else {
+                assert_eq!(got.unwrap(), want.unwrap());
+            }
+        }
+    }
+
+    /// C: GetMatchesSpecN_2's length extension. Exercise every mismatch byte
+    /// around word boundaries, both ordering directions, and every alignment.
+    /// The current window ends exactly at the match limit: a word load must
+    /// fit completely, and the remaining bytes must use the scalar tail.
+    #[test]
+    fn the_register_walk_bounds_every_word_and_tail() {
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for alignment in 0..16 {
+            if cfg!(miri) && alignment != 0 && alignment != 15 {
+                continue;
+            }
+            for len in [3, 4, 7, 8, 9, 10, 15, 16, 17, 18, 31, 32, 33] {
+                for mismatch in 0..=len {
+                    for byte in [0x30, 0x32] {
+                        let cur = 64 + alignment;
+                        let mut win = vec![0x31; cur + len];
+                        if mismatch < len {
+                            win[cur + mismatch] = byte;
+                        }
+                        let c = Case {
+                            win,
+                            len_limit_0: cur + len - 1,
+                            pos: cur as u32 + 1,
+                            cur,
+                            son: vec![0; 128],
+                            cut: 32,
+                            d_len: 1 + 2 * len,
+                            di: 0,
+                            max_len_0: 2,
+                            heads: vec![48],
+                            hi: 0,
+                            limit: 1 + 2 * len,
+                            hsize: 1,
+                            cbp: alignment as u32,
+                            cyclic: 64,
+                        };
+                        let want = walk(&c, get_matches_spec_n_2_checked);
+                        assert!(want.0.is_some());
+                        assert_eq!(
+                            walk(&c, reg),
+                            want,
+                            "alignment={alignment} len={len} mismatch={mismatch} byte={byte}"
+                        );
+                    }
+                }
+            }
         }
     }
 
