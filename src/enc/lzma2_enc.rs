@@ -1116,8 +1116,7 @@ impl Lzma2Encoder {
         self.coder.encode_mt1_mem_into(src, &mut out, true)?;
         let written = out.written;
         storage.truncate(written);
-        storage.shrink_to_fit();
-        Ok(storage)
+        Ok(shrink_result(storage))
     }
 
     /// C: `Lzma2Enc_MtCallback_Code`'s bounded memory destinations, laid out
@@ -1187,8 +1186,7 @@ impl Lzma2Encoder {
         }
         storage.truncate(written);
         // Release the trailing block regions as well as their reservation.
-        storage.shrink_to_fit();
-        Ok(storage)
+        Ok(shrink_result(storage))
     }
 
     /// Encode a stream with block threads.
@@ -1497,6 +1495,35 @@ impl Lzma2MtCallback<'_> {
     }
 }
 
+/// Release unused output capacity when the allocator permits it. A completed
+/// stream remains usable if shrinking fails; do not invoke the allocation
+/// error handler for this optional reduction.
+#[cfg(feature = "std")]
+fn shrink_result(bytes: Vec<u8>) -> Vec<u8> {
+    let len = bytes.len();
+    if len == bytes.capacity() {
+        return bytes;
+    }
+    if len == 0 {
+        return Vec::new();
+    }
+    let layout = alloc::alloc::Layout::array::<u8>(bytes.capacity())
+        .expect("an existing byte vector has a valid allocation layout");
+    let mut bytes = core::mem::ManuallyDrop::new(bytes);
+    // SAFETY: the Vec owns a global-allocator allocation with this exact
+    // layout. The checks above establish 0 < len < capacity, so the new size
+    // is nonzero and fits isize. No other owner can access the allocation.
+    let ptr = unsafe { alloc::alloc::realloc(bytes.as_mut_ptr(), layout, len) };
+    if ptr.is_null() {
+        // A failed realloc leaves the original allocation and contents intact.
+        return core::mem::ManuallyDrop::into_inner(bytes);
+    }
+    // SAFETY: successful realloc transfers ownership to ptr, preserves the
+    // initialized len bytes, and supplies a u8 allocation of exactly len.
+    // ManuallyDrop prevents freeing the old, now invalid allocation.
+    unsafe { Vec::from_raw_parts(ptr, len, len) }
+}
+
 /// Encode `src` as a raw LZMA2 stream, returning it with its property byte.
 ///
 /// # Errors
@@ -1534,6 +1561,19 @@ pub fn encode_lzma2_mt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shrinking_a_result_preserves_bytes_and_releases_capacity() {
+        for len in [0, 1, 17, 128] {
+            let mut bytes = Vec::with_capacity(128);
+            bytes.extend((0..len).map(|i| i as u8));
+            let result = shrink_result(bytes);
+            assert_eq!(result, (0..len).map(|i| i as u8).collect::<Vec<_>>());
+            assert_eq!(result.capacity(), len);
+        }
+        assert_eq!(shrink_result(Vec::new()).capacity(), 0);
+    }
 
     #[test]
     fn property_byte_rounds_the_dictionary_up() {
