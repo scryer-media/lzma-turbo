@@ -13,6 +13,11 @@ use crate::enc::stream::SeqOutStream;
 /// C: `CProbPrice ProbPrices[kBitModelTotal >> kNumMoveReducingBits]`.
 pub(crate) type ProbPrices = [u32; (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize];
 
+/// A probability is below `kBitModelTotal`, so its price index already fits
+/// [`ProbPrices`]; masking it says so to the compiler, which then drops the
+/// bounds check from every price lookup. The mask never changes an index.
+const PP_MASK: usize = (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize - 1;
+
 /// C: `LzmaEnc_InitPriceTables`.
 pub(crate) fn init_price_tables() -> ProbPrices {
     let mut prices: ProbPrices = [0; (K_BIT_MODEL_TOTAL >> K_NUM_MOVE_REDUCING_BITS) as usize];
@@ -38,19 +43,19 @@ pub(crate) fn init_price_tables() -> ProbPrices {
 #[inline]
 pub(crate) fn price(pp: &ProbPrices, prob: u16, bit: u32) -> u32 {
     let masked = u32::from(prob) ^ (0u32.wrapping_sub(bit) & (K_BIT_MODEL_TOTAL - 1));
-    pp[(masked >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[(masked >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `GET_PRICEa_0(prob)`.
 #[inline]
 pub(crate) fn price_0(pp: &ProbPrices, prob: u16) -> u32 {
-    pp[(u32::from(prob) >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[(u32::from(prob) >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `GET_PRICEa_1(prob)`.
 #[inline]
 pub(crate) fn price_1(pp: &ProbPrices, prob: u16) -> u32 {
-    pp[((u32::from(prob) ^ (K_BIT_MODEL_TOTAL - 1)) >> K_NUM_MOVE_REDUCING_BITS) as usize]
+    pp[((u32::from(prob) ^ (K_BIT_MODEL_TOTAL - 1)) >> K_NUM_MOVE_REDUCING_BITS) as usize & PP_MASK]
 }
 
 /// C: `LitEnc_GetPrice`.
@@ -128,14 +133,12 @@ impl LenEnc {
         // C: `probs` walks `p->low`; here it is the index of its first entry.
         let mut base = 0usize;
         if sym >= K_LEN_NUM_LOW_SYMBOLS {
-            let mut prob = self.low[base];
-            rc.encode_bit_1(&mut prob, out);
-            self.low[base] = prob;
+            let prob = &mut self.low[base];
+            rc.encode_bit_1(prob, out);
             base += K_LEN_NUM_LOW_SYMBOLS as usize;
             if sym >= K_LEN_NUM_LOW_SYMBOLS * 2 {
-                let mut prob = self.low[base];
-                rc.encode_bit_1(&mut prob, out);
-                self.low[base] = prob;
+                let prob = &mut self.low[base];
+                rc.encode_bit_1(prob, out);
                 // C: `LitEnc_Encode(rc, p->high, sym - kLenNumLowSymbols * 2)`.
                 rc.lit_encode(&mut self.high, sym - K_LEN_NUM_LOW_SYMBOLS * 2, out);
                 return;
@@ -145,27 +148,23 @@ impl LenEnc {
 
         // C: `RcTree_Encode(rc, probs + (posState << kLenNumLowBits), kLenNumLowBits, sym)`,
         // unrolled as the C unrolls it.
-        let mut prob = self.low[base];
-        rc.encode_bit_0(&mut prob, out);
-        self.low[base] = prob;
+        let prob = &mut self.low[base];
+        rc.encode_bit_0(prob, out);
         base += (pos_state as usize) << (1 + K_LEN_NUM_LOW_BITS);
 
         let bit = sym >> 2;
-        let mut prob = self.low[base + 1];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + 1] = prob;
+        let prob = &mut self.low[base + 1];
+        rc.encode_bit(prob, bit, out);
         let mut m = (1usize << 1) + bit as usize;
 
         let bit = (sym >> 1) & 1;
-        let mut prob = self.low[base + m];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + m] = prob;
+        let prob = &mut self.low[base + m];
+        rc.encode_bit(prob, bit, out);
         m = (m << 1) + bit as usize;
 
         let bit = sym & 1;
-        let mut prob = self.low[base + m];
-        rc.encode_bit(&mut prob, bit, out);
-        self.low[base + m] = prob;
+        let prob = &mut self.low[base + m];
+        rc.encode_bit(prob, bit, out);
     }
 }
 

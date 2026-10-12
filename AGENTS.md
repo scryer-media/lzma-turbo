@@ -20,18 +20,51 @@ port rules and what was left out are in `docs/encoder.md`.
    named in `docs/porting.md`. Cite the C function name in a comment when a Rust
    function corresponds to one.
 3. `unsafe` is allowed where the C relies on the margin invariant, and
-   elsewhere only where CI verifies it: a differential test against a checked
-   version of the same code, run natively in the ordinary suite and under Miri
-   in a CI job that `ci-complete` requires. Three cases exist today, all
-   verified by the `unchecked-kernel-miri` job: the threaded match finder's
-   tree walk, the match finder's zeroed allocation (`zeroed_vec`), and the
-   threaded finder's direct-input hand-off (`run_block`), whose test reads
-   the same blocks through it and through the copying window path. An FFI
-   advice call whose only soundness condition is its range, such as
-   `madvise_hugepage` in `src/enc/huge_pages.rs`, is verified instead by the
-   range tests and a native Linux test of the real call on a filled buffer,
-   both in the ordinary suite: Miri has no `madvise`. Every `unsafe` block carries a `// SAFETY:` comment stating the
-   invariant that makes it sound and which check established it.
+   elsewhere only with the verification specified below. Every unsafe block
+   carries a `// SAFETY:` comment identifying its invariant and establishing
+   check. Portable encoder paths have checked differential tests in the
+   ordinary native suite and the required `unchecked-kernel-miri` CI job.
+   Miri results do not verify assembly or OS FFI. The encoder inventory is:
+
+   - Tree/table pointer access and the portable register walk:
+     `the_unchecked_walk_is_the_checked_walk_on_any_tables`,
+     `the_walk_refuses_what_it_cannot_vouch_for`, and the five
+     `the_register_walk_*` tests in `src/enc/lz_find_mt.rs`. Native and Miri;
+     Miri exercises the portable walk and its entry-margin wrapper.
+   - x86-64 `sdk_walk` in `src/enc/bt_kernel_x86_64.S`: native-only; the
+     production encoder selects it with `asm` enabled. The five
+     `the_register_walk_*` tests also invoke it directly and compare answers,
+     mutated trees and output against the checked walk, including invalid
+     margins, short output, SDK modes/error order, and every word/tail.
+     Miri never executes this assembly.
+   - `zeroed_vec`: `a_zeroed_vec_is_zeroes_of_every_zeroable_type` in
+     `src/enc/lz_find.rs`, native and Miri.
+   - Shared finder storage and borrowed direct-input lifetime/ownership in
+     `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
+     `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,
+     cancellation and reuse tests cover the threaded lifecycle as well.
+     `a_streamed_window_is_counted_when_reusing_a_block_coder` also checks
+     retained-window accounting between streams, natively.
+   - The test-only allocator in `tests/encoder_alloc.rs` delegates successful
+     allocations and deallocations to `System`, and injects null returns for
+     selected layouts. Its native tests are
+     `hash_chain_head_allocation_failure_is_recoverable` and
+     `failed_reconfiguration_keeps_the_allocated_coder_usable`; this
+     allocator is not part of the library or the Miri kernel job.
+   - Low-hash/table access in `mix_matches_kind`:
+     `the_mix_matches_kernel_matches_checked_tables`, native and Miri.
+   - `EncodeWindow` byte/word reads and parser `match_word!` / `opt!`
+     indexing: `encoder_window_reads_match_the_checked_parser` in
+     `src/enc/lzma_enc.rs`, native and Miri, across finder families, parser
+     modes, windows and tails. `the_window_match_lengths_equal_the_bytewise_oracle`
+     also checks match lengths in the native suite.
+   - `Finder::*_for` variant assumptions (`unreachable_unchecked`): the same
+     checked-parser differential test exercises the single-threaded,
+     inline and threaded variants natively and under Miri. `MT` is selected
+     at block entry and the finder variant cannot change within the block.
+   - `madvise_hugepage`: `the_advice_covers_only_whole_huge_pages_inside_the_buffer`
+     checks the range, and `the_kernel_takes_the_advice_and_the_bytes_are_unchanged`
+     checks the real FFI call natively on Linux. Miri has no `madvise`.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only
    library dependencies the crate may take are `crc-fast`, behind the `crc`

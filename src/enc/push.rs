@@ -35,7 +35,10 @@
 //! The match finder is always the single-threaded one: these exist for the
 //! callers that have no threads. `LzmaEncProps::with_num_threads(2)` is
 //! accepted and ignored, and the bytes are the same as with it, because the
-//! threaded finder finds the same matches.
+//! threaded finder finds the same matches. Nor is it the threaded finder run
+//! inline, which one thread otherwise takes: that reads up to a hash block
+//! and a bt block ahead of the coder, far past the look-ahead `MARGIN`
+//! covers.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -174,6 +177,7 @@ impl LzmaPushEncoder {
     /// encoder or its queue could not be allocated.
     pub fn new(props: &LzmaEncProps) -> Result<Self, Error> {
         let mut enc = Box::new(LzmaEnc::new()?);
+        enc.inline_finder = false;
         enc.set_props(&single_finder(props))?;
         enc.prepare(0)?;
         Ok(LzmaPushEncoder {
@@ -309,6 +313,7 @@ impl Lzma2PushEncoder {
         // Solid and one block thread are `Lzma2Encoder`'s defaults.
         let mut enc = Lzma2Encoder::new(&single_finder(props))?;
         enc.sync_coder()?;
+        enc.coder.set_inline_finder(false);
         // What `LzmaEnc_Alloc` would refuse, refused here and not at the
         // first chunk.
         enc.coder.check_alloc()?;
@@ -336,6 +341,7 @@ impl Lzma2PushEncoder {
     pub fn reset(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
         self.done = true;
         self.enc.set_props(&single_finder(props))?;
+        self.enc.coder.set_inline_finder(false);
         // What `LzmaEnc_Alloc` would refuse, refused here as `new` refuses it.
         self.enc.coder.check_alloc()?;
         self.src.reset();
@@ -350,6 +356,8 @@ impl Lzma2PushEncoder {
     /// filled once.
     fn begin(&mut self, data_limit: u64) -> Result<(), Error> {
         if !self.begun {
+            // `set_props` may have built a new coder since `new` or `reset`.
+            self.enc.coder.set_inline_finder(false);
             self.enc.coder.begin_solid(data_limit)?;
             self.begun = true;
         }

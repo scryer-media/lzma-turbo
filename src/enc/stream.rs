@@ -5,15 +5,13 @@
 //! as a parameter instead, because a borrow held in the struct would put a
 //! lifetime on `CLzmaEnc` and on everything that owns one.
 //!
-//! # Deviation: `directInput` only for a threaded block
+//! # Deviation: `directInput` through the threaded/inline finder
 //!
 //! `MatchFinder_SET_DIRECT_INPUT_BUF` lets the C point `p->buffer` straight at
-//! the caller's bytes and never allocate a window. This port does that only
-//! where the C's threaded `Lzma2Enc` spends most of its time: a block a block
-//! thread codes with the threaded match finder, which reads it in place
-//! (`crate::enc::lz_find_mt::run_block`). Everywhere else there is the
-//! window, filled from a stream, and a slice source is [`SliceStream`], a
-//! stream over that slice.
+//! the caller's bytes and never allocate a window. This port does that for
+//! block-threaded LZMA2 and solid buffered LZMA2 through the threaded or
+//! inline finder (`crate::enc::lz_find_mt::run_block`). Other paths retain
+//! a window filled from a stream; their slice source is [`SliceStream`].
 //!
 //! The two find the same matches. The two modes differ only in how much input is
 //! visible at once, and that reaches nothing a match depends on:
@@ -119,6 +117,46 @@ impl<S: SeqInStream + ?Sized> SeqInStream for LimitedSeqInStream<'_, S> {
             self.processed += size2 as u64;
         }
         Ok(size2)
+    }
+}
+
+/// The input of a stream its caller promised would supply at most `left`
+/// more bytes ([`crate::enc::Lzma2Encoder::set_data_limit`]). The window is
+/// sized to that promise, so a stream that breaks it is refused with
+/// [`Error::Param`] rather than read past: once `left` bytes have come
+/// through, the next read asks the real stream for one byte, and the end of
+/// the stream is the only answer that passes.
+///
+/// C: none; the C's window never depends on the input's length.
+pub(crate) struct CappedInStream<'s, S: SeqInStream + ?Sized> {
+    inner: &'s mut S,
+    left: u64,
+}
+
+impl<'s, S: SeqInStream + ?Sized> CappedInStream<'s, S> {
+    pub(crate) fn new(inner: &'s mut S, limit: u64) -> Self {
+        CappedInStream { inner, left: limit }
+    }
+}
+
+impl<S: SeqInStream + ?Sized> SeqInStream for CappedInStream<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(Error::Param),
+            };
+        }
+        let n = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let got = self.inner.read(&mut buf[..n])?;
+        self.left -= got as u64;
+        Ok(got)
     }
 }
 

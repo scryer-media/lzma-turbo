@@ -216,9 +216,9 @@ impl MtSync {
     }
 
     /// C: `MtSync_GetNextBlock`. Returns the index of the block that is now
-    /// filled, and leaves the buffer *locked* for the caller - the next call
-    /// is what unlocks it.
-    fn get_next_block(&self) -> u32 {
+    /// filled. A movable window stays locked until the next call; direct
+    /// input is immutable, so only the semaphore handoff is needed.
+    fn get_next_block(&self, movable: bool) -> u32 {
         let mut num_blocks = 0;
         if Self::get(&self.need_start) {
             self.num_processed_blocks.store(1, Ordering::SeqCst);
@@ -228,14 +228,18 @@ impl MtSync {
             self.was_stopped.reset();
             self.can_start.set();
         } else {
-            self.unlock_buffer();
+            if movable {
+                self.unlock_buffer();
+            }
             // C: "we free current block".
             num_blocks = self.num_processed_blocks.fetch_add(1, Ordering::SeqCst);
             self.free.release1();
         }
 
         self.filled.wait();
-        self.lock_buffer();
+        if movable {
+            self.lock_buffer();
+        }
         num_blocks
     }
 
@@ -296,6 +300,7 @@ enum Heads {
     H5b,
 }
 
+#[cfg(test)]
 #[inline]
 fn ui16(p: &[u8], i: usize) -> u32 {
     u32::from(p[i]) | (u32::from(p[i + 1]) << 8)
@@ -303,6 +308,7 @@ fn ui16(p: &[u8], i: usize) -> u32 {
 
 /// C: `GetUi24hi_from32(p)`, the top three bytes of a little-endian 32-bit
 /// load.
+#[cfg(test)]
 #[inline]
 fn ui24hi(p: &[u8], i: usize) -> u32 {
     u32::from(p[i + 1]) | (u32::from(p[i + 2]) << 8) | (u32::from(p[i + 3]) << 16)
@@ -315,46 +321,103 @@ fn ui24hi(p: &[u8], i: usize) -> u32 {
 /// — the same "insert and report the previous head" step the single-threaded
 /// finder does inline, lifted out so that it can run a block ahead.
 ///
-/// The C's `USE_GetHeads_LOCAL_CRC` builds per-call copies of the byte table
-/// with `hashMask` already folded in. That is a strength reduction, not a
+/// The shape is the C's: one loop per kind, chosen once per call
+/// (`C/LzFindMt.c:304-317`, `GetHeads_DECL` / `GetHeads_LOOP`), and for the
+/// kinds that mix in more than one byte of the table, per-call copies of the
+/// byte table with `hashMask` already folded in (`USE_GetHeads_LOCAL_CRC`,
+/// `:372-437`), so that the loop does two or three loads and xors per byte and
+/// nothing else to form the value. That is a strength reduction, not a
 /// different value: every term it leaves unmasked is at most 24 bits and
 /// `hashMask` always has its low 16 (`bigHash`: 24) bits set, so masking the
-/// terms and masking the sum agree. The masks are written where the C puts
-/// them so the two can be read against each other.
+/// terms and masking the sum agree. `H3` masks the sum, as the C's
+/// `DEF_GetHeads(3, ...)` does (`:322`).
+///
+/// # Panics
+///
+/// If `p` is shorter than the bytes the heads hash, `heads.len()` plus the
+/// kind's bytes less one, or a value indexes past `hash`: the reads the
+/// per-byte loop makes are the ones an indexed loop would check, tested once.
 fn get_heads(
     kind: Heads,
     p: &[u8],
-    mut pos: u32,
+    pos: u32,
     hash: &mut [u32],
     mask: u32,
     heads: &mut [u32],
     crc: &[u32; 256],
 ) {
-    for (i, head) in heads.iter_mut().enumerate() {
-        let value = match kind {
-            Heads::H2 => ui16(p, i),
-            Heads::H3 => (crc[usize::from(p[i])] ^ ui16(p, i + 1)) & mask,
-            Heads::H3b => ui16(p, i) ^ (u32::from(p[i + 2]) << 16),
-            Heads::H4 => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ui16(p, i + 1)
-            }
-            Heads::H4b => (crc[usize::from(p[i])] & mask) ^ ui24hi(p, i),
-            Heads::H5 => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_2) & mask)
-                    ^ ui16(p, i + 1)
-            }
-            Heads::H5b => {
-                (crc[usize::from(p[i])] & mask)
-                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
-                    ^ ui24hi(p, i)
-            }
-        } as usize;
-        *head = pos.wrapping_sub(hash[value]);
-        hash[value] = pos;
+    let masked = |shift: u32| -> [u32; 256] { core::array::from_fn(|i| (crc[i] << shift) & mask) };
+    match kind {
+        Heads::H2 => heads_loop::<2>(p, pos, hash, heads, |w| ui16w(w[0], w[1])),
+        Heads::H3 => heads_loop::<3>(p, pos, hash, heads, |w| {
+            (crc[usize::from(w[0])] ^ ui16w(w[1], w[2])) & mask
+        }),
+        Heads::H3b => heads_loop::<3>(p, pos, hash, heads, |w| {
+            ui16w(w[0], w[1]) ^ (u32::from(w[2]) << 16)
+        }),
+        Heads::H4 => {
+            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+            heads_loop::<4>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])] ^ c1[usize::from(w[3])] ^ ui16w(w[1], w[2])
+            });
+        }
+        Heads::H4b => {
+            let c0 = masked(0);
+            heads_loop::<4>(p, pos, hash, heads, |w| c0[usize::from(w[0])] ^ ui24hiw(w));
+        }
+        Heads::H5 => {
+            let (c0, c1, c2) = (
+                masked(0),
+                masked(K_LZ_HASH_CRC_SHIFT_1),
+                masked(K_LZ_HASH_CRC_SHIFT_2),
+            );
+            heads_loop::<5>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])]
+                    ^ c1[usize::from(w[3])]
+                    ^ c2[usize::from(w[4])]
+                    ^ ui16w(w[1], w[2])
+            });
+        }
+        Heads::H5b => {
+            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+            heads_loop::<5>(p, pos, hash, heads, |w| {
+                c0[usize::from(w[0])] ^ c1[usize::from(w[4])] ^ ui24hiw(w)
+            });
+        }
+    }
+}
+
+/// C: `GetUi16` of two bytes in address order.
+#[inline(always)]
+fn ui16w(b0: u8, b1: u8) -> u32 {
+    u32::from(b0) | (u32::from(b1) << 8)
+}
+
+/// C: `GetUi24hi_from32`, over the four bytes of a window.
+#[inline(always)]
+fn ui24hiw<const N: usize>(w: &[u8; N]) -> u32 {
+    u32::from(w[1]) | (u32::from(w[2]) << 8) | (u32::from(w[3]) << 16)
+}
+
+/// C: `GetHeads_LOOP(v)`, with `value` as `v` over the `N` bytes at each
+/// position.
+#[inline(always)]
+fn heads_loop<const N: usize>(
+    p: &[u8],
+    mut pos: u32,
+    hash: &mut [u32],
+    heads: &mut [u32],
+    value: impl Fn(&[u8; N]) -> u32,
+) {
+    assert!(
+        heads.is_empty() || p.len() >= heads.len() + N - 1,
+        "the window ends before the last hashed byte"
+    );
+    for (w, head) in p.windows(N).zip(heads.iter_mut()) {
+        let w: &[u8; N] = w.try_into().expect("a window of N bytes");
+        let v = value(w) as usize;
+        *head = pos.wrapping_sub(hash[v]);
+        hash[v] = pos;
         pos = pos.wrapping_add(1);
     }
 }
@@ -486,7 +549,13 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
 /// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-fn get_matches_spec_n_2(
+// On x86-64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
+// one is the tests' and other targets'.
+#[cfg_attr(
+    all(feature = "asm", target_arch = "x86_64", not(feature = "kernel-ab")),
+    allow(dead_code)
+)]
+pub(super) fn get_matches_spec_n_2(
     win: &[u8],
     len_limit_0: usize,
     mut pos: u32,
@@ -759,6 +828,52 @@ fn get_matches_spec_n_2(
     Some((di, pos))
 }
 
+/// The tree walk the bt thread runs: the register-shaped kernel in
+/// [`crate::enc::bt_kernel`] on x86-64 with the `asm` feature, where it is the
+/// SDK's `LzFindOpt.asm` shape, and [`get_matches_spec_n_2`] elsewhere. The
+/// two give the same answer and effects (`the_register_walk_is_the_checked_walk_on_any_tables`).
+/// With `kernel-ab`, `LZMA_TURBO_TREE_KERNEL` picks one at run time.
+type TreeWalk = fn(
+    &[u8],
+    usize,
+    u32,
+    usize,
+    &mut [u32],
+    u32,
+    &mut [u32],
+    usize,
+    usize,
+    &[u32],
+    usize,
+    usize,
+    usize,
+    u32,
+    u32,
+) -> Option<(usize, u32)>;
+
+#[inline(always)]
+fn tree_walk() -> TreeWalk {
+    #[cfg(feature = "kernel-ab")]
+    {
+        if crate::kernel_ab::tree_kernel_reg() {
+            crate::enc::bt_kernel::get_matches_spec_n_2_reg
+        } else {
+            get_matches_spec_n_2
+        }
+    }
+    #[cfg(all(not(feature = "kernel-ab"), feature = "asm", target_arch = "x86_64"))]
+    {
+        crate::enc::bt_kernel::get_matches_spec_n_2_reg
+    }
+    #[cfg(all(
+        not(feature = "kernel-ab"),
+        not(all(feature = "asm", target_arch = "x86_64"))
+    ))]
+    {
+        get_matches_spec_n_2
+    }
+}
+
 /// [`get_matches_spec_n_2`] as it was with every access bounds-checked: the
 /// reference the unchecked walk is compared against.
 #[cfg(test)]
@@ -993,8 +1108,17 @@ struct Common {
     tab: *mut u32,
     /// C: `p->hashBuf`, with `p->btBuf` following it in the same allocation
     /// exactly as `MatchFinderMt_Create` lays it out, and two more words after
-    /// that for `p->failureBuf`.
+    /// that for `p->failureBuf`. Inline, one block of each.
     bufs: *mut u32,
+    /// Where `btBuf` starts in `bufs`, in words: `HASH_BUFFER_SIZE`, or
+    /// `HASH_BLOCK_SIZE` inline.
+    bt_base: usize,
+    /// Where the two `failureBuf` words start in `bufs`.
+    park_base: usize,
+    /// No threads: the caller's thread runs the hash and bt stages a block
+    /// at a time when it needs the next block of matches. See
+    /// [`MatchFinderMt::get_next_block_bt`].
+    inline: bool,
 
     /// C: `mf->hashMask`.
     hash_mask: u32,
@@ -1036,6 +1160,9 @@ impl Common {
             direct: false,
             tab: core::ptr::NonNull::dangling().as_ptr(),
             bufs: core::ptr::NonNull::dangling().as_ptr(),
+            bt_base: 0,
+            park_base: 0,
+            inline: false,
             hash_mask: 0,
             fixed_hash_size: 0,
             son_base: 0,
@@ -1140,10 +1267,10 @@ impl Common {
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_block(&self, offset: usize) -> &mut [u32] {
         // SAFETY: as `hash_block`; `offset` names a whole block of `bt_buf`,
-        // which starts `HASH_BUFFER_SIZE` words into `bufs`.
+        // which starts `bt_base` words into `bufs`.
         unsafe {
             core::slice::from_raw_parts_mut(
-                self.bufs.add(HASH_BUFFER_SIZE + offset),
+                self.bufs.add(self.bt_base + offset),
                 BT_BLOCK_SIZE as usize,
             )
         }
@@ -1157,12 +1284,10 @@ impl Common {
     /// Caller must be the lz thread, the only one that touches them.
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_park(&self) -> &mut [u32] {
-        // SAFETY: `bufs` is `HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2` words long
+        // SAFETY: `bufs` is `park_base + 2` words long
         // (`MatchFinderMt::create`), and no other thread forms a reference
         // to the last two.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE + BT_BUFFER_SIZE), 2)
-        }
+        unsafe { core::slice::from_raw_parts_mut(self.bufs.add(self.park_base), 2) }
     }
 
     /// The block of `bt_buf` the lz thread is reading at `pos`, in
@@ -1175,6 +1300,7 @@ impl Common {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn bt_held(&self, pos: usize) -> (usize, &mut [u32]) {
+        // Inline there is one block, so `pos` is either in it or parked.
         if pos >= BT_BUFFER_SIZE {
             // SAFETY: the caller is the lz thread.
             (BT_BUFFER_SIZE, unsafe { self.bt_park() })
@@ -1196,7 +1322,10 @@ impl Common {
     unsafe fn bt_all(&self) -> &mut [u32] {
         // SAFETY: nothing else is running.
         unsafe {
-            core::slice::from_raw_parts_mut(self.bufs.add(HASH_BUFFER_SIZE), BT_BUFFER_SIZE + 2)
+            core::slice::from_raw_parts_mut(
+                self.bufs.add(self.bt_base),
+                self.park_base + 2 - self.bt_base,
+            )
         }
     }
 }
@@ -1470,14 +1599,18 @@ impl MtShared {
     /// entered `hash_sync.cs`, before it looks at the window.
     #[inline]
     fn apply_bt_shift(&self, b: &mut BtState) {
-        b.buffer -= self.bt_shift.swap(0, Ordering::SeqCst);
+        if !self.common().direct {
+            b.buffer -= self.bt_shift.swap(0, Ordering::SeqCst);
+        }
     }
 
     /// The lz thread's half of `move_block`: called each time it has just
     /// entered `bt_sync.cs`.
     #[inline]
     fn apply_lz_shift(&self, l: &mut LzState) {
-        l.pointer_to_cur_pos -= self.lz_shift.swap(0, Ordering::SeqCst);
+        if !self.common().direct {
+            l.pointer_to_cur_pos -= self.lz_shift.swap(0, Ordering::SeqCst);
+        }
     }
 
     /// C: `MatchFinder_ReadBlock`, against the window through its one raw
@@ -1650,6 +1783,29 @@ fn hash_thread_func(sh: &MtShared, stream: &mut dyn SeqInStream) {
     }
 }
 
+/// One pass of `HashThreadFunc`'s loop on the caller's thread, for the
+/// inline finder: slide the window if it needs it, read, and fill the one
+/// `hash_buf` block. The C's order, without the semaphores or the critical
+/// sections: nothing else runs, and nothing holds the window while this
+/// moves it.
+///
+/// C: the body of the inner `for (;;)` in `HashThreadFunc`
+/// (`C/LzFindMt.c:466-542`).
+fn hash_stage_inline(sh: &MtShared, stream: &mut dyn SeqInStream) -> usize {
+    // SAFETY: inline, the caller's thread is the only one there is, and it
+    // enters the hash thread's cell only here, from the bt stage, which holds
+    // `bt_state` and nothing else.
+    let h = unsafe { &mut *sh.hash_state.get() };
+    // C: `if (MatchFinder_NeedMove(mf)) { ... MatchFinder_MoveBlock(mf); ...
+    // continue; }`, which comes straight back here.
+    while sh.need_move(h) {
+        sh.move_block(h);
+    }
+    sh.read_if_required(h, stream);
+    hash_fill_block(sh, h, 0);
+    0
+}
+
 /// One `hash_buf` block of `HashThreadFunc`'s loop: the heads for the next
 /// run of positions, or the end-of-stream header once the bytes run out.
 fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
@@ -1711,7 +1867,16 @@ fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
 
 /// C: `BtGetMatches`. Fills one `bt_buf` block from the head distances the
 /// hash thread produced, pulling more `hash_buf` blocks as it needs them.
-fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
+///
+/// `next_heads` hands over the next filled `hash_buf` block and returns its
+/// offset: on the bt thread that is `MtSync_GetNextBlock(&p->hashSync)`, and
+/// inline it runs the hash stage for one block ([`hash_stage_inline`]).
+fn bt_get_matches(
+    sh: &MtShared,
+    b: &mut BtState,
+    block_offset: usize,
+    mut next_heads: impl FnMut() -> usize,
+) {
     let c = sh.common();
     let mut num_processed: u32 = 0;
     let mut cur_pos: u32 = 2;
@@ -1737,10 +1902,10 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
         if b.hash_buf_pos == b.hash_buf_pos_limit {
             let avail;
             {
-                let bi = sh.hash_sync.get_next_block();
-                // The window may have slid while `hash_sync.cs` was open.
+                let k = next_heads() as u32;
+                // The window may have slid while `hash_sync.cs` was open, or
+                // inline, while `next_heads` ran the hash stage.
                 sh.apply_bt_shift(b);
-                let k = hash_block_offset(bi) as u32;
                 // SAFETY: `get_next_block` has just handed this block over.
                 let h = unsafe { c.hash_block(k as usize) };
                 if h[0] < 2 {
@@ -1840,7 +2005,7 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
             // the cyclic size plus that and more; so afterwards
             // `cyclic_buffer_size <= b.buffer`. Normalisation only lowers
             // `pos`, to exactly `cyclic_buffer_size`.
-            match get_matches_spec_n_2(
+            match tree_walk()(
                 win,
                 b.buffer + len_limit as usize - 1,
                 pos,
@@ -1903,14 +2068,17 @@ fn bt_get_matches(sh: &MtShared, b: &mut BtState, block_offset: usize) {
 /// - so the unlock below stays balanced.
 fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     let sync = &sh.hash_sync;
-    if !MtSync::get(&sync.need_start) {
+    let movable = !sh.common().direct;
+    if movable && !MtSync::get(&sync.need_start) {
         sync.lock_buffer();
         // The window may have slid while `hash_sync.cs` was open.
         sh.apply_bt_shift(b);
     }
     let block_offset = bt_block_offset(global_block_index);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bt_get_matches(sh, b, block_offset);
+        bt_get_matches(sh, b, block_offset, || {
+            hash_block_offset(sh.hash_sync.get_next_block(movable))
+        });
     }));
     if run.is_err() {
         b.failure = true;
@@ -1922,7 +2090,9 @@ fn bt_fill_block(sh: &MtShared, b: &mut BtState, global_block_index: u32) {
     }
     // C: "We suppose that we have called GetNextBlock() from start. So buffer
     // is LOCKED".
-    sync.unlock_buffer();
+    if movable {
+        sync.unlock_buffer();
+    }
 }
 
 /// C: `BtThreadFunc`, reached through `BtThreadFunc2`.
@@ -1961,6 +2131,41 @@ fn bt_thread_func(sh: &MtShared) {
 // LZ THREAD - the public face
 // ---------------------------------------------------------------------------
 
+/// The buffer layout and the keep sizes for one mode: `(hash_buf words,
+/// bt_buf words, extra keep before, extra keep after)`.
+///
+/// Threaded, the C's (`MatchFinderMt_Create`, `C/LzFindMt.c:856-879`): two
+/// hash blocks and sixteen bt blocks, and a window kept back by both rings,
+/// because the lz thread may be that far behind the hash thread when it
+/// slides the window.
+///
+/// Inline, one block of each, and the window kept back by one bt block. The
+/// hash stage runs only when the bt stage has used every head it was given,
+/// so it slides the window with the bt stage at its own position, and the lz
+/// stage at most the bt block it is filling behind: fewer than
+/// `BT_BLOCK_SIZE` positions, as every position takes at least one word of
+/// it. The keep after is the C's in both modes: the hash stage hashes up to
+/// a block ahead of what it read, and every position it hashes still needs
+/// `keepAddBufferAfter` bytes behind it, for the same matches as the
+/// single-threaded finder's.
+const fn layout(inline: bool) -> (usize, usize, u32, u32) {
+    if inline {
+        (
+            HASH_BLOCK_SIZE as usize,
+            BT_BLOCK_SIZE as usize,
+            BT_BLOCK_SIZE,
+            HASH_BLOCK_SIZE,
+        )
+    } else {
+        (
+            HASH_BUFFER_SIZE,
+            BT_BUFFER_SIZE,
+            (HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32,
+            HASH_BLOCK_SIZE,
+        )
+    }
+}
+
 /// The threaded match finder.
 ///
 /// C: `CMatchFinderMt` plus the `IMatchFinder2` vtable
@@ -1990,6 +2195,37 @@ impl Drop for MatchFinderMt {
 }
 
 impl MatchFinderMt {
+    /// The `CMatchFinder` this finder was configured through, holding the
+    /// window and table this finder last allocated, for
+    /// [`crate::enc::finder::Finder::make_st`], and the hand-off buffers
+    /// parked in it. The threads are stopped.
+    ///
+    /// C: there is one `MFB` for both finders (`C/LzmaEnc.c:494`), so the
+    /// single-threaded `MatchFinder_Create` (`C/LzmaEnc.c:2761`) finds the
+    /// window and table the threaded one left and keeps them while they are
+    /// long enough (`C/LzFind.c:394`, `C/LzFind.c:479`).
+    pub(crate) fn into_st(mut self) -> MatchFinder {
+        self.retire_threads();
+        let mut mfb = core::mem::replace(&mut self.mfb, MatchFinder::new());
+        if let Some(sh) = self.sh.take() {
+            // SAFETY: as for `own` in `create`: the threads of a block pair
+            // were joined just above, a stream's are joined when its stream
+            // ends, and nothing else holds `sh`.
+            let own = unsafe {
+                *sh.common.get() = Common::empty();
+                &mut *sh.own.get()
+            };
+            if mfb.buf_base.is_empty() {
+                mfb.buf_base = core::mem::take(&mut own.win);
+            }
+            if mfb.hash.is_empty() {
+                mfb.hash = core::mem::take(&mut own.tab);
+            }
+            mfb.mt_bufs = core::mem::take(&mut own.bufs);
+        }
+        mfb
+    }
+
     /// C: `MatchFinderMt_Construct`.
     pub(crate) fn new() -> Self {
         MatchFinderMt {
@@ -2007,7 +2243,10 @@ impl MatchFinderMt {
 
     /// C: `MatchFinderMt_Create`. `direct` is the C's `directInput`: the
     /// stream is a block [`run_block`] will hand the finder in place, and no
-    /// window is allocated for it.
+    /// window is allocated for it. `inline` asks for no threads: the caller's
+    /// thread runs both producer stages a block at a time, and one block of
+    /// each buffer is allocated (see [`layout`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -2016,10 +2255,19 @@ impl MatchFinderMt {
         keep_add_buffer_after: u32,
         data_limit: u64,
         direct: bool,
+        inline: bool,
     ) -> Result<(), Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
         }
+        if inline {
+            // A pair kept for blocks by an earlier threaded `create` must
+            // not wait on this finder's buffers: an inline one never stops
+            // it.
+            self.retire_threads();
+        }
+        let (hash_words, bt_words, add_before, add_after) = layout(inline);
+        let bufs_len = hash_words + bt_words + 2;
 
         // C: `MatchFinderMt_Create` keeps `hashBuf` once it has it, and
         // `MatchFinder_Create` keeps a window and tables that are long enough.
@@ -2042,22 +2290,37 @@ impl MatchFinderMt {
             *sh.common.get() = Common::empty();
             &mut *sh.own.get()
         };
-        self.mfb.buf_base = core::mem::take(&mut own.win);
-        self.mfb.hash = core::mem::take(&mut own.tab);
+        // A finder [`crate::enc::finder::Finder::make_mt`] has just made
+        // holds nothing in `sh` yet, and its `mfb` holds what the
+        // single-threaded finder allocated: those are kept, as the C's one
+        // `MFB` keeps them whichever finder `LzmaEnc_Alloc` picks
+        // (`C/LzmaEnc.c:494`, `C/LzFindMt.c:872`).
+        if !own.win.is_empty() {
+            self.mfb.buf_base = core::mem::take(&mut own.win);
+        }
+        if !own.tab.is_empty() {
+            self.mfb.hash = core::mem::take(&mut own.tab);
+        }
         let mut bufs = core::mem::take(&mut own.bufs);
+        if bufs.is_empty() {
+            bufs = core::mem::take(&mut self.mfb.mt_bufs);
+        }
         self.sh = Some(Arc::clone(&sh));
-        if bufs.len() == HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2 {
+        if bufs.len() == bufs_len {
             // Every word of a hash block and of a bt block is written by the
             // thread that fills it before the thread it is handed to reads it.
             // The two words past `btBuf` are the exception: the lz thread
             // parks on them after a failure.
-            bufs[HASH_BUFFER_SIZE + BT_BUFFER_SIZE..].fill(0);
+            bufs[hash_words + bt_words..].fill(0);
         } else {
-            bufs = Vec::new();
-            bufs.try_reserve_exact(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2)
-                .map_err(|_| Error::Alloc)?;
-            crate::enc::huge_pages::advise_vec(&bufs);
-            bufs.resize(HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2, 0);
+            // Zeroed by the allocator, not by a fill: a block is written
+            // before it is read, so a stream shorter than a block leaves the
+            // rest of it untouched and never resident. The inline finder's
+            // one block of each is about 0.75 MiB that a small stream would
+            // otherwise pay in full.
+            // The old buffers go first, so the two are never held at once.
+            drop(core::mem::take(&mut bufs));
+            bufs = crate::enc::lz_find::zeroed_vec(bufs_len)?;
             #[cfg(test)]
             {
                 self.mfb.allocs += 1;
@@ -2065,10 +2328,10 @@ impl MatchFinderMt {
         }
 
         let before = keep_add_buffer_before
-            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .checked_add(add_before)
             .ok_or(Error::Param)?;
         let after = keep_add_buffer_after
-            .checked_add(HASH_BLOCK_SIZE)
+            .checked_add(add_after)
             .ok_or(Error::Param)?;
         self.mfb.direct_input = direct;
         self.mfb
@@ -2116,6 +2379,9 @@ impl MatchFinderMt {
             direct,
             tab: tab.as_mut_ptr(),
             bufs: bufs.as_mut_ptr(),
+            bt_base: hash_words,
+            park_base: hash_words + bt_words,
+            inline,
             hash_mask: self.mfb.hash_mask,
             fixed_hash_size: self.mfb.fixed_hash_size as usize,
             son_base,
@@ -2146,6 +2412,7 @@ impl MatchFinderMt {
     /// left out with `direct`, as [`MatchFinderMt::create`] leaves it out.
     /// `mfb` is the `CMatchFinder` carrying the settings; nothing is
     /// allocated.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mem_usage(
         mfb: &mut MatchFinder,
         history_size: u32,
@@ -2153,18 +2420,20 @@ impl MatchFinderMt {
         match_max_len: u32,
         keep_add_buffer_after: u32,
         direct: bool,
+        inline: bool,
     ) -> Result<u64, Error> {
         if BT_BLOCK_SIZE <= match_max_len * 4 {
             return Err(Error::Param);
         }
+        let (hash_words, bt_words, add_before, add_after) = layout(inline);
         let before = keep_add_buffer_before
-            .checked_add((HASH_BUFFER_SIZE + BT_BUFFER_SIZE) as u32)
+            .checked_add(add_before)
             .ok_or(Error::Param)?;
         let after = keep_add_buffer_after
-            .checked_add(HASH_BLOCK_SIZE)
+            .checked_add(add_after)
             .ok_or(Error::Param)?;
         let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
-        Ok(base + (HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2) as u64 * 4)
+        Ok(base + (hash_words + bt_words + 2) as u64 * 4)
     }
 
     /// What this finder has allocated, in bytes: the window, the tables, and
@@ -2183,17 +2452,22 @@ impl MatchFinderMt {
 
     /// The window this finder has allocated, and the length of the one its
     /// threads read now, in bytes.
-    #[cfg(test)]
     pub(crate) fn windows(&self) -> (usize, usize) {
-        let sh = self.shared();
+        let Some(sh) = &self.sh else {
+            return (self.mfb.buf_base.len(), 0);
+        };
         // SAFETY: the lz thread, outside a stream; see `create`.
         let own = unsafe { &*sh.own.get() };
-        (own.win.len(), sh.common().win_len)
+        (own.win.len() + self.mfb.buf_base.len(), sh.common().win_len)
     }
 
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
     pub(crate) fn init_mt(&self) -> Result<(), Error> {
         let sh = self.shared();
+        if sh.common().inline {
+            // No threads, so no semaphores to count blocks with.
+            return Ok(());
+        }
         sh.hash_sync.init(HASH_NUM_BLOCKS)?;
         sh.bt_sync.init(BT_NUM_BLOCKS)
     }
@@ -2219,6 +2493,12 @@ impl MatchFinderMt {
 
             // C: `MatchFinder_Init_LowHash`.
             c.low_hash().fill(K_EMPTY_HASH_VALUE);
+            if c.inline {
+                // C: `MatchFinder_Init_HighHash`, which the hash thread runs
+                // when it starts (`C/LzFindMt.c:464`); inline the hash stage
+                // is this thread's.
+                c.high_hash()[..=c.hash_mask as usize].fill(K_EMPTY_HASH_VALUE);
+            }
 
             let b = &mut *sh.bt_state.get();
             b.hash_buf_pos = 0;
@@ -2252,7 +2532,17 @@ impl MatchFinderMt {
     /// must never wait on the same sync objects.
     pub(crate) fn stream_handle(&mut self) -> Option<Arc<MtShared>> {
         self.retire_threads();
+        if self.is_inline() {
+            // No threads to start: the encoder hands the stream to the
+            // finder's own calls instead.
+            return None;
+        }
         self.sh.clone()
+    }
+
+    /// Whether this finder runs its stages on the caller's thread.
+    pub(crate) fn is_inline(&self) -> bool {
+        self.sh.as_deref().is_some_and(|sh| sh.common().inline)
     }
 
     /// The handle [`run_block`] needs, with this finder's pair of producer
@@ -2266,7 +2556,9 @@ impl MatchFinderMt {
         let Some(sh) = self.sh.clone() else {
             return Ok(None);
         };
-        if self.threads.is_none() {
+        // Inline, `run_block` only sets the block the hash stage reads; no
+        // thread is started, and its stop finds none running.
+        if self.threads.is_none() && !sh.common().inline {
             // Set before the spawns: the bt thread calls
             // `hash_sync.stop_writing()`, which does nothing unless the flag
             // is already up.
@@ -2319,6 +2611,13 @@ impl MatchFinderMt {
         unsafe { (*self.shared().lz_state.get()).pointer_to_cur_pos }
     }
 
+    /// C: the allocation behind pointerToCurPos. Moves slide bytes inside
+    /// this allocation; only create/run_block replace it, outside coding.
+    pub(crate) fn window_storage(&self) -> (*const u8, usize) {
+        let c = self.shared().common();
+        (c.win, c.win_len)
+    }
+
     /// The window the encoder reads literals and match bytes out of.
     ///
     /// C: the bytes `p->pointerToCurPos` points into.
@@ -2352,8 +2651,10 @@ impl MatchFinderMt {
         })
     }
 
-    /// C: `MatchFinderMt_GetNextBlock_Bt`.
-    fn get_next_block_bt(&mut self) -> u32 {
+    /// C: `MatchFinderMt_GetNextBlock_Bt`. Inline, the block is filled here
+    /// instead of waited for: the bt stage runs for one block, running the
+    /// hash stage over `stream` whenever it has used its heads.
+    fn get_next_block_bt(&mut self, stream: &mut dyn SeqInStream) -> u32 {
         let sh = self.shared();
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
@@ -2361,8 +2662,19 @@ impl MatchFinderMt {
         if l.failure_lz_bt {
             l.bt_buf_pos = BT_BUFFER_SIZE;
         } else {
-            let bi = sh.bt_sync.get_next_block();
-            // The window may have slid while `bt_sync.cs` was open.
+            let bi = if c.inline {
+                // SAFETY: inline, this thread is the bt thread too, and holds
+                // no other borrow of `bt_state`. The block it fills is the
+                // one this thread read from last, which it is done with.
+                let b = unsafe { &mut *sh.bt_state.get() };
+                // C: `BtFillBlock` without the lock, `C/LzFindMt.c:740-757`.
+                bt_get_matches(sh, b, 0, || hash_stage_inline(sh, stream));
+                0
+            } else {
+                sh.bt_sync.get_next_block(!c.direct)
+            };
+            // The window may have slid while `bt_sync.cs` was open, or
+            // inline, while the hash stage ran.
             sh.apply_lz_shift(l);
             let base = bt_block_offset(bi);
             // SAFETY: `get_next_block` has just handed this block over, and
@@ -2396,95 +2708,85 @@ impl MatchFinderMt {
 
     /// C: `GET_NEXT_BLOCK_IF_REQUIRED`.
     #[inline]
-    fn next_block_if_required(&mut self) {
+    fn next_block_if_required(&mut self, stream: &mut dyn SeqInStream) {
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &*self.shared().lz_state.get() };
         if l.bt_buf_pos == l.bt_buf_pos_limit {
-            self.get_next_block_bt();
+            self.get_next_block_bt(stream);
         }
     }
 
-    /// C: `MatchFinderMt_GetNumAvailableBytes`.
-    pub(crate) fn get_num_available_bytes(&mut self) -> u32 {
+    /// C: `MatchFinderMt_GetNumAvailableBytes`. `stream` is read only
+    /// inline; threaded, the hash thread holds the input.
+    pub(crate) fn get_num_available_bytes(&mut self, stream: &mut dyn SeqInStream) -> u32 {
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &*self.shared().lz_state.get() };
         if l.bt_buf_pos != l.bt_buf_pos_limit {
             return l.bt_num_avail_bytes;
         }
-        self.get_next_block_bt()
+        self.get_next_block_bt(stream)
     }
 }
 
-impl MatchFinderMt {
-    /// C: `MixMatches2` / `MixMatches3` / `MixMatches4`.
-    ///
-    /// The bt thread only tracks matches of at least `numHashBytes` bytes, so
-    /// the short ones are found here, from the low hash table, and spliced in
-    /// front of the pairs it produced. `match_min_pos` is where the bt
-    /// thread's nearest match already is: anything further back is redundant.
-    fn mix_matches(&self, match_min_pos: u32, d: &mut [u32], mut di: usize) -> usize {
-        let sh = self.shared();
-        let c = sh.common();
-        // SAFETY: the lz thread owns `lz_state` and the low hash, and may read
-        // the window.
-        let (l, hash, win) = unsafe { (&*sh.lz_state.get(), c.low_hash(), c.win()) };
-        let cur = l.pointer_to_cur_pos;
-        let m = l.lz_pos;
+/// C: `MixMatches2` / `MixMatches3` / `MixMatches4`, with one hash-table
+/// bound check. The checked instantiation retains each original index check.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn mix_matches_kernel<const CHECKED: bool>(
+    mix: Mix,
+    crc: &[u32; 256],
+    hash: &mut [u32],
+    win: &[u8],
+    cur: usize,
+    m: u32,
+    match_min_pos: u32,
+    d: &mut [u32],
+    mut di: usize,
+) -> usize {
+    if !CHECKED {
+        let required = if mix == Mix::Two {
+            K_HASH2_SIZE as usize
+        } else {
+            K_FIX4_HASH_SIZE
+        };
+        assert!(hash.len() >= required, "short low hash table");
+    }
+    // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
+    let temp = crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
+    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+    let c2 = if CHECKED {
+        core::mem::replace(&mut hash[h2], m)
+    } else {
+        // SAFETY: h2 is masked below K_HASH2_SIZE, covered by the
+        // table extent guaranteed by the caller or checked at entry.
+        // No other hash borrow is live.
+        unsafe { hash.as_mut_ptr().add(h2).replace(m) }
+    };
 
-        // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
-        let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
-        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-        let c2 = hash[h2];
-        hash[h2] = m;
-
-        if c.mix == Mix::Two {
-            if c2 >= match_min_pos && win[cur - (m - c2) as usize] == win[cur] {
-                d[di] = 2;
-                d[di + 1] = m - c2 - 1;
-                di += 2;
-            }
-            return di;
+    if mix == Mix::Two {
+        if c2 >= match_min_pos && win[cur - (m - c2) as usize] == win[cur] {
+            d[di] = 2;
+            d[di + 1] = m - c2 - 1;
+            di += 2;
         }
+        return di;
+    }
 
-        let h3 = ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-        let c3 = hash[K_FIX3_HASH_SIZE + h3];
-        hash[K_FIX3_HASH_SIZE + h3] = m;
+    let h3 = ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+    let c3 = if CHECKED {
+        core::mem::replace(&mut hash[K_FIX3_HASH_SIZE + h3], m)
+    } else {
+        // SAFETY: h3 is masked below K_HASH3_SIZE; the entry assertion
+        // covers the constant K_FIX3_HASH_SIZE offset and the full table.
+        unsafe { hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).replace(m) }
+    };
 
-        if c.mix == Mix::Three {
-            if c2 >= match_min_pos {
-                let back = (m - c2) as usize;
-                if win[cur - back] == win[cur] {
-                    d[di + 1] = m - c2 - 1;
-                    if win[cur - back + 2] == win[cur + 2] {
-                        d[di] = 3;
-                        return di + 2;
-                    }
-                    d[di] = 2;
-                    di += 2;
-                }
-            }
-            if c3 >= match_min_pos {
-                let back = (m - c3) as usize;
-                if win[cur - back] == win[cur] {
-                    d[di] = 3;
-                    d[di + 1] = m - c3 - 1;
-                    di += 2;
-                }
-            }
-            return di;
-        }
-
-        // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
-        // is no fourth hash here.
+    if mix == Mix::Three {
         if c2 >= match_min_pos {
             let back = (m - c2) as usize;
             if win[cur - back] == win[cur] {
                 d[di + 1] = m - c2 - 1;
                 if win[cur - back + 2] == win[cur + 2] {
-                    if win[cur - back + 3] == win[cur + 3] {
-                        d[di] = 4;
-                        return di + 2;
-                    }
                     d[di] = 3;
                     return di + 2;
                 }
@@ -2495,18 +2797,214 @@ impl MatchFinderMt {
         if c3 >= match_min_pos {
             let back = (m - c3) as usize;
             if win[cur - back] == win[cur] {
+                d[di] = 3;
                 d[di + 1] = m - c3 - 1;
+                di += 2;
+            }
+        }
+        return di;
+    }
+
+    // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
+    // is no fourth hash here.
+    if c2 >= match_min_pos {
+        let back = (m - c2) as usize;
+        if win[cur - back] == win[cur] {
+            d[di + 1] = m - c2 - 1;
+            if win[cur - back + 2] == win[cur + 2] {
                 if win[cur - back + 3] == win[cur + 3] {
                     d[di] = 4;
                     return di + 2;
                 }
                 d[di] = 3;
+                return di + 2;
+            }
+            d[di] = 2;
+            di += 2;
+        }
+    }
+    if c3 >= match_min_pos {
+        let back = (m - c3) as usize;
+        if win[cur - back] == win[cur] {
+            d[di + 1] = m - c3 - 1;
+            if win[cur - back + 3] == win[cur + 3] {
+                d[di] = 4;
+                return di + 2;
+            }
+            d[di] = 3;
+            di += 2;
+        }
+    }
+    di
+}
+/// C: MixMatches2/3/4, specialized as the SDK's selected function.
+/// The bt stage handles longer matches; these pairs precede its matches.
+///
+/// # Safety
+/// Every low-hash entry must precede m. Initialization, normalization and
+/// writing before INCREASE_LZ_POS establish this invariant in the finder.
+/// If TRUSTED, the caller also guarantees the hash extent for MIX,
+/// lookahead of 2/3/4 bytes, match_min_pos <= m with m - match_min_pos <= cur,
+/// and room for two output pairs starting at di. Otherwise entry checks
+/// establish these bounds.
+/// MatchFinderMt establishes hash extent at creation, window/history from
+/// its published current position and availability, and checks output room.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bool>(
+    crc: &[u32; 256],
+    hash: &mut [u32],
+    win: &[u8],
+    cur: usize,
+    m: u32,
+    match_min_pos: u32,
+    d: &mut [u32],
+    mut di: usize,
+) -> usize {
+    if !CHECKED && !TRUSTED {
+        let required = if MIX == 2 {
+            K_HASH2_SIZE as usize
+        } else {
+            K_FIX4_HASH_SIZE
+        };
+        assert!(hash.len() >= required, "short low hash table");
+    }
+    if !CHECKED && !TRUSTED {
+        let lookahead = if MIX == 2 {
+            2
+        } else if MIX == 3 {
+            3
+        } else {
+            4
+        };
+        assert!(
+            cur.checked_add(lookahead)
+                .is_some_and(|end| end <= win.len()),
+            "short mixer window"
+        );
+        assert!(
+            match_min_pos <= m && (m - match_min_pos) as usize <= cur,
+            "mixer history"
+        );
+        let room = if MIX == 2 { 2 } else { 4 };
+        assert!(
+            di.checked_add(room).is_some_and(|end| end <= d.len()),
+            "short mixer output"
+        );
+    }
+    let read = |index| {
+        if CHECKED {
+            win[index]
+        } else {
+            // SAFETY: the caller or entry checks cover lookahead and the
+            // oldest allowed position; hash positions precede m.
+            unsafe { *win.get_unchecked(index) }
+        }
+    };
+    let mut write = |index, value| {
+        if CHECKED {
+            d[index] = value;
+        } else {
+            // SAFETY: the caller or entry reservation covers both output pairs.
+            unsafe {
+                *d.get_unchecked_mut(index) = value;
+            }
+        }
+    };
+    // C: `MT_HASH2_CALC` / `MT_HASH3_CALC`.
+    let temp = crc[usize::from(read(cur))] ^ u32::from(read(cur + 1));
+    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+    let c2 = if CHECKED {
+        core::mem::replace(&mut hash[h2], m)
+    } else {
+        // SAFETY: h2 is masked below K_HASH2_SIZE, covered by the
+        // table extent guaranteed by the caller or checked at entry.
+        // No other hash borrow is live.
+        unsafe { hash.as_mut_ptr().add(h2).replace(m) }
+    };
+
+    if MIX == 2 {
+        if c2 >= match_min_pos && read(cur - (m - c2) as usize) == read(cur) {
+            write(di, 2);
+            write(di + 1, m - c2 - 1);
+            di += 2;
+        }
+        return di;
+    }
+
+    let h3 = ((temp ^ (u32::from(read(cur + 2)) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+    let c3 = if CHECKED {
+        core::mem::replace(&mut hash[K_FIX3_HASH_SIZE + h3], m)
+    } else {
+        // SAFETY: h3 is masked below K_HASH3_SIZE. The caller or entry
+        // check guarantees the table includes the K_FIX3_HASH_SIZE offset.
+        unsafe { hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).replace(m) }
+    };
+
+    if MIX == 3 {
+        if c2 >= match_min_pos {
+            let back = (m - c2) as usize;
+            if read(cur - back) == read(cur) {
+                write(di + 1, m - c2 - 1);
+                if read(cur - back + 2) == read(cur + 2) {
+                    write(di, 3);
+                    return di + 2;
+                }
+                write(di, 2);
                 di += 2;
             }
         }
-        di
+        if c3 >= match_min_pos {
+            let back = (m - c3) as usize;
+            if read(cur - back) == read(cur) {
+                write(di, 3);
+                write(di + 1, m - c3 - 1);
+                di += 2;
+            }
+        }
+        return di;
     }
 
+    // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
+    // is no fourth hash here.
+    if c2 >= match_min_pos {
+        let back = (m - c2) as usize;
+        if read(cur - back) == read(cur) {
+            write(di + 1, m - c2 - 1);
+            if read(cur - back + 2) == read(cur + 2) {
+                if read(cur - back + 3) == read(cur + 3) {
+                    write(di, 4);
+                    return di + 2;
+                }
+                write(di, 3);
+                return di + 2;
+            }
+            write(di, 2);
+            di += 2;
+        }
+    }
+    if c3 >= match_min_pos {
+        let back = (m - c3) as usize;
+        if read(cur - back) == read(cur) {
+            write(di + 1, m - c3 - 1);
+            if read(cur - back + 3) == read(cur + 3) {
+                write(di, 4);
+                return di + 2;
+            }
+            write(di, 3);
+            di += 2;
+        }
+    }
+    di
+}
+
+impl MatchFinderMt {
+    /// C: `MixMatches2` / `MixMatches3` / `MixMatches4`.
+    ///
+    /// The bt thread only tracks matches of at least `numHashBytes` bytes, so
+    /// the short ones are found here, from the low hash table, and spliced in
+    /// front of the pairs it produced. `match_min_pos` is where the bt
+    /// thread's nearest match already is: anything further back is redundant.
     /// C: `INCREASE_LZ_POS`.
     #[inline]
     fn increase_lz_pos(&self) {
@@ -2519,6 +3017,34 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt_GetMatches`, or `MatchFinderMt2_GetMatches` when
     /// there is no low hash to mix in.
     pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
+        #[cfg(feature = "kernel-ab")]
+        if crate::kernel_ab::encoder_checked() {
+            return self.get_matches_select::<true>(d);
+        }
+        self.get_matches_select::<false>(d)
+    }
+
+    #[inline]
+    fn get_matches_select<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+        // C: the usual BT4 vtable selects MixMatches3. Keep its call site
+        // separate from the other hash widths, avoiding a per-byte jump table.
+        if self.shared().common().mix == Mix::Three {
+            return self.get_matches_kind::<3, CHECKED>(d);
+        }
+        self.get_matches_other::<CHECKED>(d)
+    }
+
+    #[inline(never)]
+    fn get_matches_other<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+        match self.shared().common().mix {
+            Mix::None => self.get_matches_kind::<0, CHECKED>(d),
+            Mix::Two => self.get_matches_kind::<2, CHECKED>(d),
+            Mix::Three => self.get_matches_kind::<3, CHECKED>(d),
+            Mix::Four => self.get_matches_kind::<4, CHECKED>(d),
+        }
+    }
+
+    fn get_matches_kind<const MIX: u8, const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
         let sh = self.shared();
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
@@ -2531,7 +3057,18 @@ impl MatchFinderMt {
         let len = bt[bt_pos];
         bt_pos += 1;
 
-        if c.mix == Mix::None {
+        // Inline stands in for the one-thread finder, so its last few
+        // positions follow C `GET_MATCHES_HEADER(minLen)` in LzFind.c: with
+        // fewer than `num_hash_bytes` bytes left there are no matches. The
+        // threads mix hash matches there, as `MatchFinderMt_GetMatches` does.
+        if c.inline && l.bt_num_avail_bytes < c.num_hash_bytes {
+            l.bt_num_avail_bytes -= 1;
+            l.bt_buf_pos = base + bt_pos + len as usize;
+            self.increase_lz_pos();
+            return 0;
+        }
+
+        if MIX == 0 {
             let bt_lim = bt_pos + len as usize;
             l.bt_buf_pos = base + bt_lim;
             l.bt_num_avail_bytes -= 1;
@@ -2550,6 +3087,10 @@ impl MatchFinderMt {
         l.bt_num_avail_bytes = avail;
         l.bt_buf_pos = base + bt_pos + len as usize;
 
+        // SAFETY: the lz thread owns the low hash and holds the window.
+        let (hash, win) = unsafe { (c.low_hash(), c.win()) };
+        let cur = l.pointer_to_cur_pos;
+        let m = l.lz_pos;
         let mut di = 0;
         if len == 0 {
             if avail >= (BT_HASH_BYTES_MAX - 1) - 1 {
@@ -2559,14 +3100,44 @@ impl MatchFinderMt {
                 } else {
                     m = 1;
                 }
-                di = self.mix_matches(m, d, di);
+                // SAFETY: hash entries precede lz_pos; they start at zero,
+                // are normalized with it, and are written before advancement.
+                // create sizes the low hash for MIX. The availability test
+                // above establishes lookahead; history_size and keep_before
+                // retain every position >= m, including after a window slide.
+                // di is zero and the branch below reserves both output pairs.
+                di = unsafe {
+                    if d.len() >= 4 {
+                        mix_matches_kind::<CHECKED, MIX, true>(
+                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                        )
+                    } else {
+                        mix_matches_kind::<CHECKED, MIX, false>(
+                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                        )
+                    }
+                };
             }
         } else {
             // C: "first match pair from BinTree: (match_len, match_dist)
             // [...] MixMatchesFunc() inserts only hash matches that are nearer
             // than (match_dist)".
             let min_pos = l.lz_pos - bt[bt_pos + 1];
-            di = self.mix_matches(min_pos, d, di);
+            // SAFETY: the same hash extent/history invariant as above. A
+            // nonempty bt match establishes lookahead and a distance within
+            // retained history; min_pos excludes every older low-hash entry.
+            // di is zero and the branch below checks room for both pairs.
+            di = unsafe {
+                if d.len() >= 4 {
+                    mix_matches_kind::<CHECKED, MIX, true>(
+                        &c.crc, hash, win, cur, m, min_pos, d, di,
+                    )
+                } else {
+                    mix_matches_kind::<CHECKED, MIX, false>(
+                        &c.crc, hash, win, cur, m, min_pos, d, di,
+                    )
+                }
+            };
             let mut left = len;
             loop {
                 d[di] = bt[bt_pos];
@@ -2584,42 +3155,71 @@ impl MatchFinderMt {
     }
 
     /// C: `MatchFinderMt0_Skip` / `MatchFinderMt2_Skip` / `MatchFinderMt3_Skip`
-    /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair.
-    pub(crate) fn skip(&mut self, mut num: u32) {
-        let min_len = match self.shared().common().mix {
-            Mix::None => 0,
-            Mix::Two => 2,
+    /// over the `SKIP_HEADER_MT` / `SKIP_FOOTER_MT` macro pair. `stream` is
+    /// read only inline.
+    pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
+        match self.shared().common().mix {
+            Mix::None => self.skip_kind::<0>(stream, num),
+            Mix::Two => self.skip_kind::<2>(stream, num),
             // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
             // "the difference is that MatchFinderMt3_Skip() updates hash for
             // last 3 bytes of stream".
-            Mix::Three | Mix::Four => 3,
-        };
+            Mix::Three | Mix::Four => self.skip_kind::<3>(stream, num),
+        }
+    }
+
+    /// C: each specialized `MatchFinderMt*_Skip`, retaining the held block
+    /// and window until `GET_NEXT_BLOCK_IF_REQUIRED` must hand them back.
+    fn skip_kind<const MIN_LEN: u32>(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
         loop {
-            self.next_block_if_required();
+            self.next_block_if_required(stream);
             let sh = self.shared();
             let c = sh.common();
             // SAFETY: the lz thread owns `lz_state` and the low hash, and may
             // read the window.
             let (l, hash, win) = unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win()) };
-            let avail = l.bt_num_avail_bytes;
-            l.bt_num_avail_bytes = avail.wrapping_sub(1);
-            if min_len != 0 && avail >= min_len {
-                let cur = l.pointer_to_cur_pos;
-                let temp = c.crc[usize::from(win[cur])] ^ u32::from(win[cur + 1]);
-                let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-                hash[h2] = l.lz_pos;
-                if min_len == 3 {
-                    let h3 =
-                        ((temp ^ (u32::from(win[cur + 2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-                    hash[K_FIX3_HASH_SIZE + h3] = l.lz_pos;
+            // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
+            // The inner loop stops before the next handoff, so these views
+            // never survive a block release or a window slide.
+            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
+            // C: the specialized SKIP loop's hash extent and cursor locals.
+            // Keep one checked table extent for the masked indices below.
+            let hash_len = match MIN_LEN {
+                3 => K_FIX4_HASH_SIZE,
+                2 => K_HASH2_SIZE as usize,
+                _ => 0,
+            };
+            let hash = &mut hash[..hash_len];
+            let mut avail = l.bt_num_avail_bytes;
+            let mut cur = l.pointer_to_cur_pos;
+            let mut pos = l.lz_pos;
+            let mut bt_pos = l.bt_buf_pos - base;
+            let bt_limit = l.bt_buf_pos_limit - base;
+            loop {
+                if MIN_LEN != 0 && avail >= MIN_LEN {
+                    let bytes = &win[cur..cur + MIN_LEN as usize];
+                    let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+                    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                    hash[h2] = pos;
+                    if MIN_LEN == 3 {
+                        let h3 =
+                            ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                        hash[K_FIX3_HASH_SIZE + h3] = pos;
+                    }
+                }
+                avail = avail.wrapping_sub(1);
+                pos += 1;
+                cur += 1;
+                bt_pos += bt[bt_pos] as usize + 1;
+                num -= 1;
+                if num == 0 || bt_pos == bt_limit {
+                    break;
                 }
             }
-            l.lz_pos += 1;
-            l.pointer_to_cur_pos += 1;
-            // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
-            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
-            l.bt_buf_pos += bt[l.bt_buf_pos - base] as usize + 1;
-            num -= 1;
+            l.bt_num_avail_bytes = avail;
+            l.pointer_to_cur_pos = cur;
+            l.lz_pos = pos;
+            l.bt_buf_pos = base + bt_pos;
             if num == 0 {
                 return;
             }
@@ -2773,6 +3373,47 @@ pub(crate) fn with_threads<T>(
     })
 }
 
+/// The indexed loop `get_heads` replaced, kept as the reference its
+/// differential test checks it against.
+#[cfg(test)]
+fn get_heads_indexed(
+    kind: Heads,
+    p: &[u8],
+    mut pos: u32,
+    hash: &mut [u32],
+    mask: u32,
+    heads: &mut [u32],
+    crc: &[u32; 256],
+) {
+    for (i, head) in heads.iter_mut().enumerate() {
+        let value = match kind {
+            Heads::H2 => ui16(p, i),
+            Heads::H3 => (crc[usize::from(p[i])] ^ ui16(p, i + 1)) & mask,
+            Heads::H3b => ui16(p, i) ^ (u32::from(p[i + 2]) << 16),
+            Heads::H4 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H4b => (crc[usize::from(p[i])] & mask) ^ ui24hi(p, i),
+            Heads::H5 => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 3])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_2) & mask)
+                    ^ ui16(p, i + 1)
+            }
+            Heads::H5b => {
+                (crc[usize::from(p[i])] & mask)
+                    ^ ((crc[usize::from(p[i + 4])] << K_LZ_HASH_CRC_SHIFT_1) & mask)
+                    ^ ui24hi(p, i)
+            }
+        } as usize;
+        *head = pos.wrapping_sub(hash[value]);
+        hash[value] = pos;
+        pos = pos.wrapping_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -2781,11 +3422,14 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        MatchFinderMt, get_matches_spec_n_2, get_matches_spec_n_2_checked, run_block, with_threads,
+        BT_BLOCK_SIZE, BT_BUFFER_SIZE, HASH_BLOCK_SIZE, HASH_BUFFER_SIZE, Heads, MatchFinder,
+        MatchFinderMt, Mix, get_heads, get_heads_indexed, get_matches_spec_n_2,
+        get_matches_spec_n_2_checked, mix_matches_kernel, mix_matches_kind, run_block,
+        with_threads,
     };
-    use crate::enc::consts::{K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
+    use crate::enc::consts::{K_FIX4_HASH_SIZE, K_HASH2_SIZE, K_NUM_OPTS, LZMA_MATCH_LEN_MAX};
     use crate::enc::lz_find::MatchFinderKind;
-    use crate::enc::stream::{SeqInStream, SliceStream};
+    use crate::enc::stream::{NoStream, SeqInStream, SliceStream};
     use crate::enc::{Lzma2Encoder, LzmaEncProps};
     use crate::error::Error;
 
@@ -2874,6 +3518,7 @@ mod tests {
             LZMA_MATCH_LEN_MAX + 1,
             u64::MAX,
             false,
+            false,
         )
         .expect("create");
         mt.init_mt().expect("init_mt");
@@ -2887,9 +3532,9 @@ mod tests {
             given: false,
         };
         let r = with_threads(&sh, &mut input, || {
-            let promised = mt.get_num_available_bytes();
+            let promised = mt.get_num_available_bytes(&mut NoStream);
             assert_eq!(promised as usize, src.len(), "first block's promise");
-            mt.skip(promised);
+            mt.skip(&mut NoStream, promised);
             Ok(mt.failed())
         });
         assert_eq!(r, Ok(true), "the stream panic was not reported");
@@ -2912,7 +3557,167 @@ mod tests {
         }
     }
 
+    /// The low hash cursor reads and writes exactly what the checked mixer
+    /// does, including all early returns after two-, three- and four-byte
+    /// matches, expired candidates and a nonzero output offset.
+    #[test]
+    fn the_mix_matches_kernel_matches_checked_tables() {
+        let mut rng = Rng(0x5EED_1234_5678_9000);
+        let crc: [u32; 256] = core::array::from_fn(|_| rng.next());
+        for mix in [Mix::Two, Mix::Three, Mix::Four] {
+            for case_no in 0..if cfg!(miri) { 6 } else { 300 } {
+                let size = if mix == Mix::Two {
+                    K_HASH2_SIZE as usize
+                } else {
+                    K_FIX4_HASH_SIZE
+                };
+                let m = 1024;
+                let mut hash: Vec<u32> = (0..size).map(|_| rng.below(m)).collect();
+                let mut checked_hash = hash.clone();
+                let mut trusted_hash = hash.clone();
+                let alphabet = [1, 2, 4, 256][case_no % 4];
+                let win: Vec<u8> = (0..260).map(|_| rng.below(alphabet) as u8).collect();
+                let mut out = [0xDEAD_BEEF; 8];
+                let mut checked_out = out;
+                let mut trusted_out = out;
+                let min = m - 256 + rng.below(256);
+                // SAFETY: every generated hash entry is below m. The
+                // retained 256 bytes cover min, and the window/output
+                // allocations include the kernel's lookahead and margin.
+                let got = unsafe {
+                    match mix {
+                        Mix::Two => mix_matches_kind::<false, 2, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::Three => mix_matches_kind::<false, 3, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::Four => mix_matches_kind::<false, 4, false>(
+                            &crc, &mut hash, &win, 256, m, min, &mut out, 2,
+                        ),
+                        Mix::None => unreachable!(),
+                    }
+                };
+                // SAFETY: the same generated table, history, lookahead and
+                // output margins stated above satisfy the trusted contract.
+                let trusted = unsafe {
+                    match mix {
+                        Mix::Two => mix_matches_kind::<false, 2, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::Three => mix_matches_kind::<false, 3, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::Four => mix_matches_kind::<false, 4, true>(
+                            &crc,
+                            &mut trusted_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut trusted_out,
+                            2,
+                        ),
+                        Mix::None => unreachable!(),
+                    }
+                };
+                let want = mix_matches_kernel::<true>(
+                    mix,
+                    &crc,
+                    &mut checked_hash,
+                    &win,
+                    256,
+                    m,
+                    min,
+                    &mut checked_out,
+                    2,
+                );
+                assert_eq!(got, want);
+                assert_eq!(trusted, want);
+                assert_eq!(trusted_out, checked_out);
+                assert_eq!(trusted_hash, checked_hash);
+                assert_eq!(out, checked_out);
+                assert_eq!(hash, checked_hash);
+            }
+        }
+    }
+
+    /// The hash thread's loop, one kind per call, against the indexed loop
+    /// it replaced: the same heads and the same table, on windows with few
+    /// distinct bytes (so that values repeat and heads point back into the
+    /// run) and with many, from a table that already holds positions.
+    #[test]
+    fn get_heads_matches_the_indexed_loop() {
+        const KINDS: [(Heads, usize, bool); 7] = [
+            (Heads::H2, 2, false),
+            (Heads::H3, 3, false),
+            (Heads::H3b, 3, true),
+            (Heads::H4, 4, false),
+            (Heads::H4b, 4, true),
+            (Heads::H5, 5, false),
+            (Heads::H5b, 5, true),
+        ];
+        let mut rng = Rng(0x5EED_4EAD_5000_0001);
+        let crc: [u32; 256] = core::array::from_fn(|_| rng.next());
+        for (kind, bytes, big) in KINDS {
+            let cases = if big { 2 } else { 12 };
+            for case_no in 0..cases {
+                // C: `hashMask` keeps its low 16 bits set, and 24 for the
+                // `bigHash` kinds that mix in an unmasked 24-bit value.
+                let mask: u32 = if big {
+                    0x00FF_FFFF
+                } else {
+                    (1 << (16 + rng.below(7))) - 1
+                };
+                let n = rng.below(3000) as usize;
+                let alphabet = if case_no % 2 == 0 { 3 } else { 256 };
+                let p: Vec<u8> = (0..n + bytes - 1 + rng.below(3) as usize)
+                    .map(|_| rng.below(alphabet) as u8)
+                    .collect();
+                let pos = rng.next();
+                let mut hash = vec![0_u32; mask as usize + 1];
+                for _ in 0..64 {
+                    let at = rng.below(mask + 1) as usize;
+                    hash[at] = rng.next();
+                }
+                let mut want_hash = hash.clone();
+                let mut heads = vec![0_u32; n];
+                let mut want = vec![0_u32; n];
+                get_heads(kind, &p, pos, &mut hash, mask, &mut heads, &crc);
+                get_heads_indexed(kind, &p, pos, &mut want_hash, mask, &mut want, &crc);
+                assert!(heads == want, "{kind:?} case {case_no}: heads differ");
+                assert!(hash == want_hash, "{kind:?} case {case_no}: tables differ");
+            }
+        }
+    }
+
+    /// A window that ends before the last byte a head hashes is refused, as
+    /// the indexed loop refused it.
+    #[test]
+    #[should_panic(expected = "the window ends before the last hashed byte")]
+    fn get_heads_refuses_a_short_window() {
+        let crc = [0_u32; 256];
+        let mut hash = vec![0_u32; 1 << 16];
+        let mut heads = vec![0_u32; 8];
+        get_heads(Heads::H4, &[0; 10], 1, &mut hash, 0xFFFF, &mut heads, &crc);
+    }
+
     /// One call's arguments.
+    #[derive(Clone)]
     struct Case {
         win: Vec<u8>,
         len_limit_0: usize,
@@ -3132,6 +3937,198 @@ mod tests {
         }
     }
 
+    /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
+    /// every access checked, on the same generated tables and under the same
+    /// conditions: the same answer, the same tree, the same matches. It runs
+    /// natively against the x86 assembly where available. In the Miri job it
+    /// exercises the same margin wrapper and the portable pointer walk.
+    #[test]
+    fn the_register_walk_is_the_checked_walk_on_any_tables() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut walked, mut refused) = (0_u32, 0_u32);
+        for case_no in 0..WALK_CASES {
+            let c = case(&mut rng);
+            let want = walk(&c, get_matches_spec_n_2_checked);
+            let got = walk(&c, crate::enc::bt_kernel::get_matches_spec_n_2_reg);
+            assert!(got == want, "case {case_no}");
+            if want.0.is_some() {
+                walked += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        assert!(
+            walked > WALK_CASES / 30 && refused > WALK_CASES / 30,
+            "{walked} walked, {refused} refused"
+        );
+    }
+
+    /// The register walk refuses each of the five broken conditions before it
+    /// touches anything, as the slice walk does.
+    #[test]
+    fn the_register_walk_refuses_what_it_cannot_vouch_for() {
+        let mut rng = Rng(11);
+        let base = loop {
+            let c = case(&mut rng);
+            if c.cyclic >= 16 && c.hsize - c.hi >= 2 {
+                break c;
+            }
+        };
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        assert_eq!(walk(&base, reg), walk(&base, get_matches_spec_n_2_checked));
+        type Break = (&'static str, fn(&mut Case));
+        let breaks: [Break; 6] = [
+            ("heads", |c| c.heads.truncate(c.hsize - 1)),
+            ("A", |c| c.cbp = c.cyclic - (c.hsize - c.hi) as u32 + 1),
+            ("B", |c| c.son.truncate(2 * c.cyclic as usize - 1)),
+            ("C", |c| c.max_len_0 = c.len_limit_0 - c.cur + 1),
+            ("D", |c| {
+                c.win.truncate(c.len_limit_0 + (c.hsize - c.hi) - 1)
+            }),
+            ("E", |c| {
+                c.cyclic = (c.cur + 2 + (c.hsize - c.hi)) as u32;
+                c.son = vec![0; 2 * c.cyclic as usize];
+                c.cbp = 0;
+                c.pos = c.cur as u32 + 2;
+            }),
+        ];
+        for (name, break_it) in breaks {
+            let mut c = base.clone();
+            break_it(&mut c);
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&c, reg)));
+            assert!(refused.is_err(), "condition {name} was not tested");
+        }
+    }
+
+    /// A short output buffer may fit the actual matches without fitting the
+    /// register walk's worst-case reservation. It must take the slice path.
+    /// Also cover exact long-match output, early limits, and oversized limits.
+    #[test]
+    fn the_register_walk_hands_short_output_to_the_slice_walk() {
+        let mut c = Case {
+            win: vec![7; 28],
+            len_limit_0: 24,
+            pos: 9,
+            cur: 8,
+            son: vec![0; 32],
+            cut: 16,
+            d_len: 3,
+            di: 0,
+            max_len_0: 3,
+            heads: vec![1; 4],
+            hi: 0,
+            limit: 1,
+            hsize: 4,
+            cbp: 8,
+            cyclic: 16,
+        };
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for (d_len, limit) in [(3, 0), (3, 1), (12, 10), (120, 1), (120, usize::MAX)] {
+            c.d_len = d_len;
+            c.limit = limit;
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+        }
+        c.d_len = 2;
+        c.limit = 1;
+        for kernel in [reg, get_matches_spec_n_2_checked] {
+            assert!(std::panic::catch_unwind(|| walk(&c, kernel)).is_err());
+        }
+    }
+
+    /// Exercise the assembly's direct/cyclic modes and the Rust fallbacks,
+    /// including a corrupt child on the last permitted tree iteration.
+    #[test]
+    fn the_register_walk_preserves_sdk_modes_and_error_order() {
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for (pos, cbp) in [(24, 24), (40, 8), (24, 8), (u32::MAX - 2, 4)] {
+            let mut c = Case {
+                win: vec![7; 99],
+                len_limit_0: 95,
+                pos,
+                cur: 64,
+                son: vec![pos - 1; 64],
+                cut: 1,
+                d_len: 300,
+                di: 2,
+                max_len_0: 3,
+                heads: vec![1; 4],
+                hi: 0,
+                limit: usize::MAX,
+                hsize: 4,
+                cbp,
+                cyclic: 32,
+            };
+            // Equal bytes reach the limit and copy a run of tree links.
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+            // A mismatch follows the corrupt child even when cut == 1.
+            c.win[64] = 8;
+            let want = walk(&c, get_matches_spec_n_2_checked);
+            assert!(want.0.is_none());
+            assert_eq!(walk(&c, reg), want);
+            c.heads[0] = 0;
+            assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+            c.heads[0] = 1;
+            c.son.fill(0);
+            c.cut = 0;
+            let got = std::panic::catch_unwind(|| walk(&c, reg));
+            let want = std::panic::catch_unwind(|| walk(&c, get_matches_spec_n_2_checked));
+            if cfg!(debug_assertions) {
+                assert!(got.is_err() && want.is_err());
+            } else {
+                assert_eq!(got.unwrap(), want.unwrap());
+            }
+        }
+    }
+
+    /// C: GetMatchesSpecN_2's length extension. Exercise every mismatch byte
+    /// around word boundaries, both ordering directions, and every alignment.
+    /// The current window ends exactly at the match limit: a word load must
+    /// fit completely, and the remaining bytes must use the scalar tail.
+    #[test]
+    fn the_register_walk_bounds_every_word_and_tail() {
+        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for alignment in 0..16 {
+            if cfg!(miri) && alignment != 0 && alignment != 15 {
+                continue;
+            }
+            for len in [3, 4, 7, 8, 9, 10, 15, 16, 17, 18, 31, 32, 33] {
+                for mismatch in 0..=len {
+                    for byte in [0x30, 0x32] {
+                        let cur = 64 + alignment;
+                        let mut win = vec![0x31; cur + len];
+                        if mismatch < len {
+                            win[cur + mismatch] = byte;
+                        }
+                        let c = Case {
+                            win,
+                            len_limit_0: cur + len - 1,
+                            pos: cur as u32 + 1,
+                            cur,
+                            son: vec![0; 128],
+                            cut: 32,
+                            d_len: 1 + 2 * len,
+                            di: 0,
+                            max_len_0: 2,
+                            heads: vec![48],
+                            hi: 0,
+                            limit: 1 + 2 * len,
+                            hsize: 1,
+                            cbp: alignment as u32,
+                            cyclic: 64,
+                        };
+                        let want = walk(&c, get_matches_spec_n_2_checked);
+                        assert!(want.0.is_some());
+                        assert_eq!(
+                            walk(&c, reg),
+                            want,
+                            "alignment={alignment} len={len} mismatch={mismatch} byte={byte}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Bytes with long and short repeats among noise, so that the finder
     /// reports matches of every length and none.
     fn block_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
@@ -3158,18 +4155,30 @@ mod tests {
     /// then `GetMatches` or a `Skip` within what is available - for at most
     /// `calls` positions, everything the finder answers written to `trace`.
     /// With `panics` set it ends in a panic, as a coder that failed would.
-    fn drive(mt: &mut MatchFinderMt, seed: u64, calls: usize, panics: bool, trace: &mut Vec<u32>) {
+    /// `stream` is what an inline finder reads; the threaded one ignores it.
+    fn drive(
+        mt: &mut MatchFinderMt,
+        stream: &mut dyn SeqInStream,
+        seed: u64,
+        calls: usize,
+        panics: bool,
+        trace: &mut Vec<u32>,
+    ) {
         let mut rng = Rng(seed);
         let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
         for _ in 0..calls {
-            let avail = mt.get_num_available_bytes();
-            trace.push(avail);
+            let avail = mt.get_num_available_bytes(stream);
+            // What a coder can see of it: the one-thread finder keeps
+            // `match_max_len + LZMA_MATCH_LEN_MAX + 1` bytes ahead (C
+            // `keepSizeAfter`), and no look-ahead limit in the coder exceeds
+            // that; past it each finder reads the stream in its own steps.
+            trace.push(avail.min(2 * LZMA_MATCH_LEN_MAX + 1));
             if avail == 0 {
                 break;
             }
             if rng.below(4) == 0 {
                 let n = 1 + rng.below(avail.min(40));
-                mt.skip(n);
+                mt.skip(stream, n);
                 trace.push(u32::MAX - n);
             } else {
                 let k = mt.get_matches(&mut d);
@@ -3181,9 +4190,41 @@ mod tests {
         assert!(!panics, "a coder that fails partway through its block");
     }
 
+    /// [`drive`] over the one-thread finder: the same calls from the same
+    /// seed, and the same trace.
+    fn drive_st(mf: &mut MatchFinder, stream: &mut dyn SeqInStream, seed: u64) -> Vec<u32> {
+        let mut rng = Rng(seed);
+        let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
+        let mut trace = Vec::new();
+        loop {
+            let avail = mf.get_num_available_bytes();
+            trace.push(avail.min(2 * LZMA_MATCH_LEN_MAX + 1));
+            if avail == 0 {
+                return trace;
+            }
+            if rng.below(4) == 0 {
+                let n = 1 + rng.below(avail.min(40));
+                mf.skip(stream, n);
+                trace.push(u32::MAX - n);
+            } else {
+                let k = mf.get_matches(stream, &mut d);
+                trace.push(k as u32);
+                trace.extend_from_slice(&d[..k]);
+            }
+            trace.push(u32::from(mf.buf_base[mf.cur() - 1]));
+        }
+    }
+
     /// `create`, `InitMt` and `Init` for one block of `len` bytes, the window
-    /// cut to it as `encode_slice` cuts it, or no window with `direct`.
-    fn prepare(mt: &mut MatchFinderMt, kind: MatchFinderKind, len: usize, direct: bool) {
+    /// cut to it as `encode_slice` cuts it, or no window with `direct`;
+    /// with no threads at all with `inline`.
+    fn prepare(
+        mt: &mut MatchFinderMt,
+        kind: MatchFinderKind,
+        len: usize,
+        direct: bool,
+        inline: bool,
+    ) {
         mt.mfb.kind = kind;
         mt.mfb.num_hash_bytes = match kind {
             MatchFinderKind::Bt2 => 2,
@@ -3202,6 +4243,7 @@ mod tests {
             LZMA_MATCH_LEN_MAX + 1,
             len as u64,
             direct,
+            inline,
         )
         .expect("create");
         mt.init_mt().expect("init_mt");
@@ -3271,24 +4313,24 @@ mod tests {
                 let seed = u64::from(rng.next()) | 1;
                 let what = format!("{kind:?}, block {i}");
 
-                prepare(&mut copied, kind, len, false);
+                prepare(&mut copied, kind, len, false, false);
                 let sh = copied.stream_handle().expect("created");
                 let mut want = Vec::new();
                 let mut input = SliceStream::new(&src);
                 let copied_run = catch_unwind(AssertUnwindSafe(|| {
                     with_threads(&sh, &mut input, || {
-                        drive(&mut copied, seed, calls, panics, &mut want);
+                        drive(&mut copied, &mut NoStream, seed, calls, panics, &mut want);
                         Ok(())
                     })
                 }));
 
-                prepare(&mut direct, kind, len, true);
+                prepare(&mut direct, kind, len, true, false);
                 let sh = direct.block_handle().expect("spawn").expect("created");
                 let mut got = Vec::new();
                 let block = src.clone();
                 let direct_run = catch_unwind(AssertUnwindSafe(|| {
                     run_block(&sh, &block, || {
-                        drive(&mut direct, seed, calls, panics, &mut got);
+                        drive(&mut direct, &mut NoStream, seed, calls, panics, &mut got);
                         Ok(())
                     })
                 }));
@@ -3339,5 +4381,324 @@ mod tests {
             .encode_send(&mut SliceStream::new(&src), &mut want)
             .unwrap();
         assert!(got == want, "reading blocks in place changed the output");
+    }
+
+    /// The inline finder runs the hash and bt stages on the caller's thread a
+    /// block at a time, and stands in for the one-thread finder, so it must
+    /// answer every call as that finder does: through its own window, read from the stream it is handed and
+    /// slid as the stream runs past it, and reading a block in place through
+    /// `run_block`, where no thread is started.
+    ///
+    /// Natively the window slides many times over each input (a small
+    /// dictionary, no data limit), and the high-hash and son tables wrap.
+    /// Under Miri the inputs are small; what it checks is the inline path's
+    /// borrows of the shared state, which the stages now take in turn on one
+    /// thread.
+    #[test]
+    fn the_inline_finder_finds_what_the_one_thread_finder_finds() {
+        // `prepare`'s dictionary, which the direct block is set up with.
+        let (lens, kinds, dict): (&[usize], &[MatchFinderKind], u32) = if cfg!(miri) {
+            (&[0, 1, 700], &[MatchFinderKind::Bt4], 1 << 12)
+        } else {
+            (
+                &[0, 1, 5, 4_000, 300_000, 1_500_000],
+                &[
+                    MatchFinderKind::Bt2,
+                    MatchFinderKind::Bt3,
+                    MatchFinderKind::Bt4,
+                    MatchFinderKind::Bt5,
+                ],
+                1 << 16,
+            )
+        };
+        let setup = |mt: &mut MatchFinderMt, kind: MatchFinderKind, inline: bool| {
+            mt.mfb.kind = kind;
+            mt.mfb.num_hash_bytes = kind.num_hash_bytes();
+            mt.mfb.cut_value = 32;
+            mt.create(
+                dict,
+                K_NUM_OPTS as u32,
+                LZMA_MATCH_LEN_MAX,
+                LZMA_MATCH_LEN_MAX + 1,
+                u64::MAX,
+                false,
+                inline,
+            )
+            .expect("create");
+            mt.init_mt().expect("init_mt");
+            mt.init();
+        };
+
+        let mut rng = Rng(0x1A1E_F1D0_5EED);
+        let mut inline = MatchFinderMt::new();
+        let mut direct = MatchFinderMt::new();
+        for &kind in kinds {
+            for &len in lens {
+                let src = block_bytes(&mut rng, len);
+                let seed = u64::from(rng.next()) | 1;
+                let what = format!("{kind:?}, {len} bytes");
+
+                let mut st = MatchFinder::new();
+                st.kind = kind;
+                st.num_hash_bytes = kind.num_hash_bytes();
+                st.cut_value = 32;
+                st.create(
+                    dict,
+                    K_NUM_OPTS as u32,
+                    LZMA_MATCH_LEN_MAX,
+                    LZMA_MATCH_LEN_MAX + 1,
+                    u64::MAX,
+                )
+                .expect("create");
+                let mut stream = SliceStream::new(&src);
+                st.init(&mut stream);
+                let want = drive_st(&mut st, &mut stream, seed);
+
+                setup(&mut inline, kind, true);
+                assert!(inline.is_inline(), "{what}");
+                assert!(inline.stream_handle().is_none(), "{what}: no threads");
+                let mut got = Vec::new();
+                drive(
+                    &mut inline,
+                    &mut SliceStream::new(&src),
+                    seed,
+                    usize::MAX,
+                    false,
+                    &mut got,
+                );
+                assert!(!inline.failed(), "{what}");
+                assert!(got == want, "{what}: the inline finder found other matches");
+
+                prepare(&mut direct, kind, len, true, true);
+                let sh = direct.block_handle().expect("no spawn").expect("created");
+                let mut got = Vec::new();
+                run_block(&sh, &src, || {
+                    drive(
+                        &mut direct,
+                        &mut NoStream,
+                        seed,
+                        usize::MAX,
+                        false,
+                        &mut got,
+                    );
+                    Ok(())
+                })
+                .expect("direct");
+                drop(sh);
+                assert_eq!(
+                    direct.spawns, 0,
+                    "{what}: the inline finder started a thread"
+                );
+                assert_eq!(direct.windows(), (0, 0), "{what}: the block is still held");
+                assert!(
+                    got == want,
+                    "{what}: the inline finder read the block otherwise"
+                );
+            }
+        }
+    }
+
+    /// The inline finder holds one hash block and one bt block, not the
+    /// threaded finder's rings, and its window keeps one bt block more than
+    /// the single-threaded finder's rather than both rings.
+    #[test]
+    fn the_inline_finder_holds_one_block_of_each_buffer() {
+        let dict = 1u32 << 16;
+        let make = |inline: bool| {
+            let mut mt = MatchFinderMt::new();
+            mt.mfb.kind = MatchFinderKind::Bt4;
+            mt.mfb.num_hash_bytes = 4;
+            mt.mfb.cut_value = 32;
+            mt.create(
+                dict,
+                K_NUM_OPTS as u32,
+                LZMA_MATCH_LEN_MAX,
+                LZMA_MATCH_LEN_MAX + 1,
+                u64::MAX,
+                false,
+                inline,
+            )
+            .expect("create");
+            mt
+        };
+        let threaded = make(false);
+        let inline = make(true);
+        // SAFETY: no thread has been started.
+        let words = |mt: &MatchFinderMt| unsafe { (*mt.shared().own.get()).bufs.len() };
+        assert_eq!(words(&threaded), HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2);
+        assert_eq!(
+            words(&inline),
+            (HASH_BLOCK_SIZE + BT_BLOCK_SIZE) as usize + 2
+        );
+        let (inline_win, _) = inline.windows();
+        let (threaded_win, _) = threaded.windows();
+        assert!(inline_win < threaded_win, "{inline_win} {threaded_win}");
+        let mut est = MatchFinder::new();
+        est.kind = MatchFinderKind::Bt4;
+        est.num_hash_bytes = 4;
+        est.cut_value = 32;
+        let estimate = MatchFinderMt::mem_usage(
+            &mut est,
+            dict,
+            K_NUM_OPTS as u32,
+            LZMA_MATCH_LEN_MAX,
+            LZMA_MATCH_LEN_MAX + 1,
+            false,
+            true,
+        )
+        .expect("estimate");
+        assert!(
+            estimate >= inline.allocated(),
+            "{estimate} {}",
+            inline.allocated()
+        );
+    }
+
+    /// Every coder held to one thread now takes the inline finder, and must
+    /// write the single-threaded finder's bytes: LZMA through a stream, LZMA2
+    /// through a stream, and LZMA2 block coders reading their blocks in
+    /// place. Random windows of a mixed input at random settings, plus the
+    /// shapes that sit on the buffer edges.
+    #[test]
+    fn one_thread_writes_the_single_threaded_finders_bytes() {
+        use crate::enc::LzmaEncoder;
+
+        let mut rng = Rng(0x0E7E_1A7E_B17E);
+        let pool = block_bytes(&mut rng, 3 << 20);
+        let mut cases: Vec<(String, Vec<u8>)> = vec![
+            ("empty".into(), Vec::new()),
+            ("one".into(), vec![0x2A]),
+            ("zeros".into(), vec![0; 300_001]),
+            ("pool".into(), pool.clone()),
+        ];
+        let windows = if cfg!(miri) { 0 } else { 24 };
+        for i in 0..windows {
+            let len = match i % 4 {
+                0 => 1 + rng.below(300) as usize,
+                1 => 60_000 + rng.below(20_000) as usize,
+                2 => 200_000 + rng.below(400_000) as usize,
+                _ => 1_000_000 + rng.below(1 << 20) as usize,
+            };
+            let at = rng.below((pool.len() - len) as u32) as usize;
+            cases.push((format!("window {i} at {at}"), pool[at..at + len].to_vec()));
+        }
+        let kinds = [
+            MatchFinderKind::Bt2,
+            MatchFinderKind::Bt3,
+            MatchFinderKind::Bt4,
+            MatchFinderKind::Bt5,
+        ];
+        for (i, (name, src)) in cases.iter().enumerate() {
+            let kind = kinds[i % kinds.len()];
+            let level = 5 + rng.below(5);
+            let dict = 1u32 << (12 + rng.below(9));
+            let fb = [5u32, 32, 64, 273][rng.below(4) as usize];
+            let props = LzmaEncProps::new()
+                .with_level(level)
+                .with_dict_size(dict)
+                .with_match_finder(kind)
+                .with_fast_bytes(fb)
+                .with_num_threads(1);
+            let what = format!("{name}: {kind:?} level {level} dict {dict} fb {fb}");
+
+            // LZMA through a stream.
+            let mut st = LzmaEncoder::new(&props).unwrap();
+            st.inner.inline_finder = false;
+            let mut want = Vec::new();
+            st.encode(&mut SliceStream::new(src), &mut want).unwrap();
+            assert!(!st.inner.mf.is_inline(), "{what}");
+            let mut inline = LzmaEncoder::new(&props).unwrap();
+            let mut got = Vec::new();
+            inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
+            assert!(inline.inner.mf.is_inline(), "{what}");
+            assert!(got == want, "{what}: LZMA");
+
+            // LZMA2 through a stream, in blocks, and the same blocks coded
+            // in place on block threads.
+            let block = [1u64 << 16, 1 << 18, 3 << 19][rng.below(3) as usize];
+            let mut st = Lzma2Encoder::new(&props).unwrap();
+            st.set_block_size(block);
+            st.sync_coder().unwrap();
+            st.coder.set_inline_finder(false);
+            let mut want = Vec::new();
+            st.encode(&mut SliceStream::new(src), &mut want).unwrap();
+            assert!(!st.coder.finder_is_inline(), "{what}");
+
+            let mut inline = Lzma2Encoder::new(&props).unwrap();
+            inline.set_block_size(block);
+            let mut got = Vec::new();
+            inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
+            assert!(inline.coder.finder_is_inline(), "{what}");
+            assert!(got == want, "{what}: LZMA2 stream, block {block}");
+
+            let mut blocks = Lzma2Encoder::new(&props).unwrap();
+            blocks.set_block_size(block);
+            blocks.set_threads(3);
+            let mut got = Vec::new();
+            blocks.encode_slice(src, &mut got).unwrap();
+            assert!(got == want, "{what}: LZMA2 blocks in place, block {block}");
+        }
+    }
+
+    /// The hash-chain finder taking its heads a run of positions ahead finds
+    /// what it found looking each up as it got there, through a window that
+    /// slides many times, at the end of the stream, and with skips of every
+    /// length between the calls; and an encoder writes the same bytes with
+    /// it at every hash-chain level.
+    #[test]
+    fn hash_chain_heads_taken_ahead_find_the_same_matches() {
+        let mut rng = Rng(0x4EAD_5EED);
+        for kind in [MatchFinderKind::Hc4, MatchFinderKind::Hc5] {
+            for len in [0usize, 1, 4, 5, 6, 4_000, 300_000, 1_500_000] {
+                let src = block_bytes(&mut rng, len);
+                let seed = u64::from(rng.next()) | 1;
+                let mut traces = Vec::new();
+                for ahead in [false, true] {
+                    let mut mf = MatchFinder::new();
+                    mf.kind = kind;
+                    mf.num_hash_bytes = kind.num_hash_bytes();
+                    mf.cut_value = 16;
+                    mf.hc_heads = ahead;
+                    mf.create(
+                        1 << 16,
+                        K_NUM_OPTS as u32,
+                        64,
+                        LZMA_MATCH_LEN_MAX + 1,
+                        u64::MAX,
+                    )
+                    .expect("create");
+                    let mut stream = SliceStream::new(&src);
+                    mf.init(&mut stream);
+                    traces.push(drive_st(&mut mf, &mut stream, seed));
+                }
+                assert!(traces[0] == traces[1], "{kind:?}, {len} bytes");
+            }
+        }
+
+        let pool = block_bytes(&mut rng, 3 << 20);
+        for case in 0..16 {
+            let at = rng.below((pool.len() - (1 << 20)) as u32) as usize;
+            let src = &pool[at..at + rng.below(1 << 20) as usize];
+            let level = rng.below(5);
+            let dict = 1u32 << (12 + rng.below(9));
+            let props = LzmaEncProps::new().with_level(level).with_dict_size(dict);
+            let mut out = Vec::new();
+            for ahead in [false, true] {
+                let mut enc = crate::enc::LzmaEncoder::new(&props).unwrap();
+                enc.inner.mf.cfg().hc_heads = ahead;
+                let mut bytes = Vec::new();
+                enc.encode(&mut SliceStream::new(src), &mut bytes).unwrap();
+                assert!(
+                    !enc.inner.mf.cfg().kind.bt_mode(),
+                    "level {level} is a hash chain"
+                );
+                out.push(bytes);
+            }
+            assert!(
+                out[0] == out[1],
+                "case {case}: level {level} dict {dict}, {} bytes",
+                src.len()
+            );
+        }
     }
 }

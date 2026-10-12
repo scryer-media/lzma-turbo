@@ -26,7 +26,9 @@ use crate::enc::lzma_enc::LzmaEnc;
 use crate::enc::props::LzmaEncProps;
 #[cfg(feature = "std")]
 use crate::enc::stream::NoStream;
-use crate::enc::stream::{LimitedSeqInStream, SeqInStream, SeqOutStream, SliceStream};
+use crate::enc::stream::{
+    CappedInStream, LimitedSeqInStream, SeqInStream, SeqOutStream, SliceStream,
+};
 use crate::error::Error;
 
 #[cfg(feature = "std")]
@@ -117,10 +119,6 @@ impl Lzma2EncInt {
         let props_byte = enc.write_properties()[0];
         let dict_size = enc.dict_size;
 
-        let mut temp = Vec::new();
-        temp.try_reserve_exact(CHUNK_SIZE_COMPRESSED_MAX)
-            .map_err(|_| Error::Alloc)?;
-
         Ok(Lzma2EncInt {
             enc,
             props_byte,
@@ -128,7 +126,9 @@ impl Lzma2EncInt {
             need_init_state: true,
             need_init_prop: true,
             src_pos: 0,
-            temp,
+            // C: tempBufLzma is allocated only for outStream; outBuf
+            // destinations encode directly into their caller's storage.
+            temp: Vec::new(),
         })
     }
 
@@ -151,6 +151,18 @@ impl Lzma2EncInt {
         self.enc.check_alloc(UNPACK_SIZE_MAX)
     }
 
+    /// Whether one thread may run the threaded finder inline; see
+    /// [`LzmaEnc::inline_finder`].
+    pub(crate) fn set_inline_finder(&mut self, on: bool) {
+        self.enc.inline_finder = on;
+    }
+
+    /// Whether the finder in use runs inline.
+    #[cfg(test)]
+    pub(crate) fn finder_is_inline(&self) -> bool {
+        self.enc.mf.is_inline()
+    }
+
     /// How many times the match finder has allocated a window or its tables.
     #[cfg(test)]
     pub(crate) fn finder_allocs(&mut self) -> u32 {
@@ -166,7 +178,8 @@ impl Lzma2EncInt {
 /// `std::thread::scope`, so that the borrow is checked - and a stream can only
 /// be handed over when it is [`Send`]. The two impls are what that distinction
 /// costs: one for an input that can be sent, one for an input that cannot and
-/// therefore always uses the single-threaded finder.
+/// therefore never has a finder thread read it; its finder, the
+/// single-threaded or the inline one, reads it on the coding thread.
 pub(crate) trait DriveBlock {
     /// Runs `coder`'s subblock loop over this block.
     ///
@@ -319,6 +332,107 @@ impl Lzma2EncInt {
         Ok(())
     }
 
+    /// C: `Lzma2Enc_EncodeMt1` with both `inData` and `outBuf`.
+    #[cfg(feature = "std")]
+    fn encode_mt1_mem_into(
+        &mut self,
+        src: &[u8],
+        out: &mut MemoryOutput<'_>,
+        finished: bool,
+    ) -> Result<(), Error> {
+        self.init_block();
+        self.enc.set_data_limit(src.len() as u64);
+        self.enc
+            .mem_prepare_direct(src.len() as u64, UNPACK_SIZE_MAX)?;
+        let handle = self.enc.mt_block_handle()?;
+        let mut drive = |input: &mut dyn SeqInStream| {
+            while self.encode_subblock_into(input, out)? != 0 {}
+            Ok(())
+        };
+        match handle {
+            Some(sh) => lz_find_mt::run_block(&sh, src, || drive(&mut NoStream))?,
+            None => drive(&mut SliceStream::new(src))?,
+        }
+        if self.src_pos != src.len() as u64 {
+            return Err(Error::InternalFailure);
+        }
+        if finished {
+            out.write(&[CONTROL_EOF])?;
+        }
+        Ok(())
+    }
+
+    /// C: `Lzma2EncInt_EncodeSubblock`'s `outBuf` form. Compressed data
+    /// lands after its header in the final allocation. A stored chunk
+    /// overwrites that attempt, as in the C, without a staging allocation.
+    #[cfg(feature = "std")]
+    fn encode_subblock_into(
+        &mut self,
+        input: &mut dyn SeqInStream,
+        out: &mut MemoryOutput<'_>,
+    ) -> Result<usize, Error> {
+        let header_size = 5 + usize::from(self.need_init_prop);
+        let start = out.written;
+        let remaining = out.data.len() - start;
+        if remaining < header_size {
+            return Err(Error::Write);
+        }
+        let mut unpack_size = UNPACK_SIZE_MAX;
+        self.enc.save_state();
+        let (pack_size, overflowed) = self.enc.code_one_mem_block(
+            input,
+            self.need_init_state,
+            &mut out.data[start + header_size..],
+            PACK_SIZE_MAX,
+            &mut unpack_size,
+        )?;
+        if unpack_size == 0 {
+            return Ok(0);
+        }
+        if overflowed || pack_size + 2 >= unpack_size as usize || pack_size > PACK_SIZE_MAX {
+            let mut remaining = unpack_size;
+            let mut at = self.enc.get_cur_buf() - unpack_size as usize;
+            while remaining != 0 {
+                let u = remaining.min(PACK_SIZE_MAX as u32);
+                let control = if self.src_pos == 0 {
+                    CONTROL_COPY_RESET_DIC
+                } else {
+                    CONTROL_COPY_NO_RESET
+                };
+                out.write(&[control, ((u - 1) >> 8) as u8, (u - 1) as u8])?;
+                out.write(&self.enc.window()[at..at + u as usize])?;
+                at += u as usize;
+                remaining -= u;
+                self.src_pos += u64::from(u);
+            }
+            self.enc.restore_state();
+            return Ok(out.written - start);
+        }
+        let u = unpack_size - 1;
+        let pm = (pack_size - 1) as u32;
+        let mode: u8 = if self.src_pos == 0 {
+            3
+        } else if self.need_init_state {
+            if self.need_init_prop { 2 } else { 1 }
+        } else {
+            0
+        };
+        let header = &mut out.data[start..start + header_size];
+        header[0] = CONTROL_LZMA | (mode << 5) | ((u >> 16) & 0x1F) as u8;
+        header[1] = (u >> 8) as u8;
+        header[2] = u as u8;
+        header[3] = (pm >> 8) as u8;
+        header[4] = pm as u8;
+        if self.need_init_prop {
+            header[5] = self.props_byte;
+        }
+        out.written += header_size + pack_size;
+        self.need_init_prop = false;
+        self.need_init_state = false;
+        self.src_pos += u64::from(unpack_size);
+        Ok(header_size + pack_size)
+    }
+
     /// C: the `for (;;) { Lzma2EncInt_EncodeSubblock(...) }` loop both
     /// `Lzma2Enc_EncodeMt1` paths run over one block.
     fn subblock_loop(
@@ -345,19 +459,22 @@ impl Lzma2EncInt {
         let mut unpack_size = UNPACK_SIZE_MAX;
 
         self.enc.save_state();
-        self.temp.clear();
+        if self.temp.is_empty() {
+            self.temp
+                .try_reserve_exact(CHUNK_SIZE_COMPRESSED_MAX)
+                .map_err(|_| Error::Alloc)?;
+            self.temp.resize(CHUNK_SIZE_COMPRESSED_MAX, 0);
+        }
         let res = self.enc.code_one_mem_block(
             input,
             self.need_init_state,
-            &mut self.temp,
-            CHUNK_SIZE_COMPRESSED_MAX - lz_header_size,
+            &mut self.temp[..CHUNK_SIZE_COMPRESSED_MAX - lz_header_size],
             PACK_SIZE_MAX,
             &mut unpack_size,
         );
         // C: an output overflow is not an error here — it is the signal to
         // store the chunk instead.
-        let overflowed = res?;
-        let pack_size = self.temp.len();
+        let (pack_size, overflowed) = res?;
 
         if unpack_size == 0 {
             return Ok(0);
@@ -409,7 +526,7 @@ impl Lzma2EncInt {
             header[5] = self.props_byte;
         }
         out.write(&header[..lz_header_size])?;
-        out.write(&self.temp)?;
+        out.write(&self.temp[..pack_size])?;
 
         self.need_init_prop = false;
         self.need_init_state = false;
@@ -442,6 +559,9 @@ pub struct Lzma2Encoder {
     mem_limit: u64,
     /// C: `me->expectedDataSize`.
     expected_data_size: u64,
+    /// The most a streamed input may supply, `u64::MAX` when the caller
+    /// cannot say; see [`Lzma2Encoder::set_data_limit`].
+    data_limit: u64,
     /// What [`Lzma2Encoder::coder`] was built with, so that a change of block
     /// size can be noticed.
     coder_props: LzmaEncProps,
@@ -488,6 +608,7 @@ impl Lzma2Encoder {
             total_threads: 0,
             mem_limit: u64::MAX,
             expected_data_size: u64::MAX,
+            data_limit: u64::MAX,
             coder_props: *props,
             coder_reconfigured: false,
             #[cfg(feature = "std")]
@@ -590,29 +711,41 @@ impl Lzma2Encoder {
     /// for that.
     pub(crate) fn sync_coder(&mut self) -> Result<(), Error> {
         let want = self.effective_props();
-        if want != self.coder_props {
+        if (want != self.coder_props || self.coder_reconfigured) && self.mem_limit != u64::MAX {
+            // Build first: allocation failure must leave both the live coder
+            // and its settings intact so set_props can roll back its input.
+            let replacement = Lzma2EncInt::new(&want)?;
+            self.coder = replacement;
+            self.dict_size = self.coder.dict_size;
+            self.coder_props = want;
+            self.coder_reconfigured = false;
+        } else if want != self.coder_props {
             self.coder.set_props(&want)?;
             self.dict_size = self.coder.dict_size;
             self.coder_props = want;
             self.coder_reconfigured = true;
-        }
-        if self.coder_reconfigured && self.mem_limit != u64::MAX {
-            self.coder = Lzma2EncInt::new(&want)?;
-            self.coder_reconfigured = false;
         }
         Ok(())
     }
 
     /// C: `Lzma2Enc_SetProps` on a handle that has been used: `props` in place
     /// of the settings [`Lzma2Encoder::new`] was given. The block size, the
-    /// thread counts, the memory limit and the data size stay as they are, and
-    /// so does everything the encoder has allocated; the next stream is
-    /// written as a new encoder with these settings would write it.
+    /// thread counts, the memory limit, the data size and the data limit stay
+    /// as they are, and so does everything the encoder has allocated; the
+    /// next stream is written byte for byte as a new encoder with these
+    /// settings would write it.
+    ///
+    /// This is what an archiver writing many streams wants in place of a new
+    /// encoder each time, as 7-Zip's 7z writer builds one coder per write
+    /// and gives it each folder's settings: the match finder keeps its window
+    /// and tables while they are large enough for the new settings, as the
+    /// C's `MatchFinder_Create` keeps them, and allocates only when they are
+    /// not.
     ///
     /// # Errors
     ///
     /// As [`Lzma2Encoder::new`], with the encoder left as it was.
-    pub(crate) fn set_props(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
+    pub fn set_props(&mut self, props: &LzmaEncProps) -> Result<(), Error> {
         props.check_lclp_for_lzma2()?;
         let old = core::mem::replace(&mut self.props, *props);
         // `LzmaEnc_SetProps` checks every setting before it takes any, so a
@@ -651,6 +784,24 @@ impl Lzma2Encoder {
     /// C: `Lzma2Enc_SetDataSize`.
     pub fn set_data_size(&mut self, expected: u64) {
         self.expected_data_size = expected;
+    }
+
+    /// Promises that each stream given to [`Lzma2Encoder::encode`],
+    /// [`Lzma2Encoder::encode_send`] or [`Lzma2Encoder::encode_mt`] supplies
+    /// at most `limit` bytes, until another limit is set; `u64::MAX`, the
+    /// default, makes no promise.
+    ///
+    /// The window is then no longer than such a stream needs, as
+    /// [`Lzma2Encoder::encode_slice`] sizes it to its slice, and the output is
+    /// unchanged byte for byte. Unlike [`Lzma2Encoder::set_data_size`], which
+    /// is a hint that sizes the hash table and so changes the output, this
+    /// changes no byte; a stream that supplies more than the limit fails, as
+    /// one whose read fails does, rather than being read past it.
+    ///
+    /// C: none. The C sizes the window from the dictionary whatever the
+    /// input.
+    pub fn set_data_limit(&mut self, limit: u64) {
+        self.data_limit = limit;
     }
 
     /// How much input one block may cover.
@@ -736,9 +887,10 @@ impl Lzma2Encoder {
     /// 7-Zip's C++.
     ///
     /// It follows what a block thread allocates. A block coder reads its
-    /// block in place, so with the threaded match finder there is no window
-    /// to count, only its tables and hand-off buffers; the single-threaded
-    /// finder reads through a window, which is counted. The figure is the
+    /// block in place, so with the threaded or inline match finder only a
+    /// window retained from an earlier streamed input is counted, alongside
+    /// its tables and hand-off buffers. The single-threaded finder always
+    /// reads through a window, which is counted. The figure is the
     /// one for [`Lzma2Encoder::encode_mt`], whose block threads each hold a
     /// copy of the block they read from the stream;
     /// [`Lzma2Encoder::encode_slice`] hands them the caller's slice instead,
@@ -762,7 +914,7 @@ impl Lzma2Encoder {
         let bufs = block + (block >> 10) + 16 + copy;
         let _ = self.sync_coder();
         // A block coder prepares with `mem_prepare_direct`, which only the
-        // threaded finder (and so only `std`) takes up.
+        // threaded and inline finders (and so only `std`) take up.
         let direct = cfg!(feature = "std");
         self.coder.enc.mem_usage_for(direct).saturating_add(bufs)
     }
@@ -807,7 +959,10 @@ impl Lzma2Encoder {
     /// C: `Lzma2Enc_Encode2`'s `outStream` path, which is single-threaded
     /// whatever [`Lzma2Encoder::set_threads`] says: the C's `MtCoder` path
     /// takes its input as memory. [`Lzma2Encoder::encode_slice`] is the one
-    /// that threads.
+    /// that threads. The match finder runs on this thread too, whatever
+    /// [`LzmaEncProps::with_num_threads`] says, because a stream that is not
+    /// `Send` cannot be given to its threads; [`Lzma2Encoder::encode_send`]
+    /// is the one that starts them.
     ///
     /// # Errors
     ///
@@ -819,14 +974,22 @@ impl Lzma2Encoder {
     ) -> Result<(), Error> {
         self.sync_coder()?;
         let block_size = self.block_size();
-        self.coder.encode_mt1_stream(
-            input,
+        let data_limit = self.data_limit;
+        let mut capped = CappedInStream::new(input, data_limit);
+        // A stream that is not `Send` cannot be given to the threaded
+        // finder's threads, so this stream is coded with the finder one
+        // thread drives; see `LzmaEnc::finder_threads`.
+        self.coder.enc.finder_threads = false;
+        let res = self.coder.encode_mt1_stream(
+            &mut capped as &mut dyn SeqInStream,
             out,
             block_size,
             self.expected_data_size,
-            u64::MAX,
+            data_limit,
             true,
-        )
+        );
+        self.coder.enc.finder_threads = true;
+        res
     }
 
     /// [`Lzma2Encoder::encode`] for an input that can be handed to the
@@ -844,7 +1007,9 @@ impl Lzma2Encoder {
         input: &mut (dyn SeqInStream + Send),
         out: &mut dyn SeqOutStream,
     ) -> Result<(), Error> {
-        self.encode_send_limited(input, out, u64::MAX)
+        let data_limit = self.data_limit;
+        let mut capped = CappedInStream::new(input, data_limit);
+        self.encode_send_limited(&mut capped, out, data_limit)
     }
 
     /// [`Lzma2Encoder::encode_send`] for an input known to supply at most
@@ -911,10 +1076,119 @@ impl Lzma2Encoder {
     ///
     /// [`Error::Alloc`] if the output could not be grown.
     pub fn encode_to_vec(&mut self, src: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
         self.set_data_size(src.len() as u64);
+        #[cfg(feature = "std")]
+        {
+            self.sync_coder()?;
+            let threads = self.threads_reduced_for(false);
+            if threads > 1 {
+                return self.encode_slice_mt_to_vec(src, threads);
+            }
+            if self.block_size() == BLOCK_SIZE_SOLID {
+                return self.encode_solid_to_vec(src);
+            }
+        }
+        let mut out = Vec::new();
         self.encode_slice(src, &mut out)?;
         Ok(out)
+    }
+
+    /// C: `Lzma2Enc_EncodeMt1` with memory input and a bounded destination.
+    #[cfg(feature = "std")]
+    fn encode_solid_to_vec(&mut self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        let capacity = src
+            .len()
+            .checked_add(src.len() >> 10)
+            .and_then(|size| size.checked_add(16));
+        let Some(mut storage) =
+            capacity.and_then(|size| super::lz_find::zeroed_vec::<u8>(size).ok())
+        else {
+            // Highly compressible input may fit without reserving its
+            // worst-case output size. Keep direct input in this fallback.
+            let mut out = Vec::new();
+            self.coder.encode_mt1_mem(src, &mut out, true)?;
+            return Ok(out);
+        };
+        let mut out = MemoryOutput {
+            data: &mut storage,
+            written: 0,
+        };
+        self.coder.encode_mt1_mem_into(src, &mut out, true)?;
+        let written = out.written;
+        storage.truncate(written);
+        storage.shrink_to_fit();
+        Ok(storage)
+    }
+
+    /// C: `Lzma2Enc_MtCallback_Code`'s bounded memory destinations, laid out
+    /// in one allocation so `Lzma2Enc_MtCallback_Write` can compact in place.
+    #[cfg(feature = "std")]
+    fn encode_slice_mt_to_vec(&mut self, src: &[u8], threads: usize) -> Result<Vec<u8>, Error> {
+        let block_size = usize::try_from(self.block_size()).map_err(|_| Error::Param)?;
+        let blocks = src.len().div_ceil(block_size).max(1);
+        let stride = block_size.checked_add((block_size >> 10) + 16);
+        let capacity = stride.and_then(|stride| {
+            let last = src.len() - blocks.saturating_sub(1) * block_size;
+            let tail = last.checked_add((last >> 10) + 16)?;
+            blocks
+                .saturating_sub(1)
+                .checked_mul(stride)?
+                .checked_add(tail)
+        });
+        let Some((stride, mut storage)) = stride.zip(capacity).and_then(|(stride, capacity)| {
+            super::lz_find::zeroed_vec::<u8>(capacity)
+                .ok()
+                .map(|storage| (stride, storage))
+        }) else {
+            // A worst-case contiguous reservation may not fit the address
+            // space even when the actual compressed output would fit.
+            let mut out = VecOutput(Vec::new());
+            self.encode_slice_mt(src, &mut out, threads)?;
+            return Ok(out.0);
+        };
+        // The existing zeroed allocator leaves untouched gaps nonresident
+        // when the allocator supplies fresh pages, including compressible input.
+        let mut sizes = Vec::new();
+        sizes.try_reserve_exact(blocks).map_err(|_| Error::Alloc)?;
+        {
+            let mut regions = Vec::new();
+            regions
+                .try_reserve_exact(blocks)
+                .map_err(|_| Error::Alloc)?;
+            for data in storage.chunks_mut(stride) {
+                regions.push(Mutex::new(MemoryOutput { data, written: 0 }));
+            }
+            let expected_data_size = self.expected_data_size;
+            let mut unused = Vec::new();
+            let coders = self.mt_callback(&mut unused, threads)?;
+            let callback = MemoryMtCallback {
+                coders: &coders,
+                regions,
+                input_start: src.as_ptr().addr(),
+                block_size,
+            };
+            MtCoder {
+                block_size,
+                num_threads_max: threads,
+                expected_data_size,
+                input: MtInput::Data(src),
+                callback: &callback,
+            }
+            .code()?;
+            for region in &callback.regions {
+                sizes.push(region.lock().unwrap_or_else(|e| e.into_inner()).written);
+            }
+        }
+        let mut written = 0;
+        for (index, size) in sizes.into_iter().enumerate() {
+            let start = index * stride;
+            storage.copy_within(start..start + size, written);
+            written += size;
+        }
+        storage.truncate(written);
+        // Release the trailing block regions as well as their reservation.
+        storage.shrink_to_fit();
+        Ok(storage)
     }
 
     /// Encode a stream with block threads.
@@ -946,7 +1220,8 @@ impl Lzma2Encoder {
         if threads <= 1 {
             return self.encode_send(input, out);
         }
-        self.run_mt(MtInput::Stream(Mutex::new(input)), out, threads)
+        let mut capped = CappedInStream::new(input, self.data_limit);
+        self.run_mt(MtInput::Stream(Mutex::new(&mut capped)), out, threads)
     }
 
     /// C: the `p->props.numBlockThreads_Reduced > 1` arm of
@@ -1051,6 +1326,83 @@ impl Lzma2Encoder {
     }
 }
 
+/// The owned output of `encode_to_vec`. C: the memory-output destination of
+/// `Lzma2Enc_MtCallback_Write`. Rust can keep the first block's allocation
+/// instead of copying it into a second allocation while retaining both.
+#[cfg(feature = "std")]
+struct VecOutput(Vec<u8>);
+
+#[cfg(feature = "std")]
+impl SeqOutStream for VecOutput {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.0.write(data)
+    }
+
+    fn write_vec(&mut self, data: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.is_empty() {
+            core::mem::swap(&mut self.0, data);
+        } else {
+            self.0.write(data)?;
+            data.clear();
+        }
+        Ok(())
+    }
+}
+
+/// C: the bounded `outBuf` destination of `Lzma2Enc_EncodeMt1`.
+#[cfg(feature = "std")]
+struct MemoryOutput<'a> {
+    data: &'a mut [u8],
+    written: usize,
+}
+
+#[cfg(feature = "std")]
+impl SeqOutStream for MemoryOutput<'_> {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        let end = self.written.checked_add(data.len()).ok_or(Error::Write)?;
+        let dest = self.data.get_mut(self.written..end).ok_or(Error::Write)?;
+        dest.copy_from_slice(data);
+        self.written = end;
+        Ok(())
+    }
+}
+
+/// C: `Lzma2Enc_MtCallback_Code`, with disjoint destinations in the owned
+/// result. `Write` has no copy to do; the caller compacts after workers join.
+#[cfg(feature = "std")]
+struct MemoryMtCallback<'a, 'o> {
+    coders: &'a Lzma2MtCallback<'o>,
+    regions: Vec<Mutex<MemoryOutput<'a>>>,
+    input_start: usize,
+    block_size: usize,
+}
+
+#[cfg(feature = "std")]
+impl MtCoderCallback for MemoryMtCallback<'_, '_> {
+    fn code(&self, coder_index: usize, _: usize, src: &[u8], finished: bool) -> Result<(), Error> {
+        let offset = src
+            .as_ptr()
+            .addr()
+            .checked_sub(self.input_start)
+            .ok_or(Error::InternalFailure)?;
+        if !offset.is_multiple_of(self.block_size) {
+            return Err(Error::InternalFailure);
+        }
+        let region = self
+            .regions
+            .get(offset / self.block_size)
+            .ok_or(Error::InternalFailure)?;
+        let mut dest = region.lock().unwrap_or_else(|e| e.into_inner());
+        self.coders.with_coder(coder_index, |coder| {
+            coder.encode_mt1_mem_into(src, &mut dest, finished)
+        })
+    }
+
+    fn write(&self, _: usize) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// C: `Lzma2Enc_MtCallback_Code` and `Lzma2Enc_MtCallback_Write`.
 #[cfg(feature = "std")]
 struct Lzma2MtCallback<'o> {
@@ -1088,20 +1440,7 @@ impl MtCoderCallback for Lzma2MtCallback<'_> {
             dest.try_reserve_exact(room).map_err(|_| Error::Alloc)?;
         }
 
-        if coder_index == 0 {
-            let mut coder = self.first.lock().unwrap_or_else(|e| e.into_inner());
-            return coder.encode_mt1_mem(src, &mut *dest, finished);
-        }
-        let mut slot = self.rest[coder_index - 1]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let coder = match &mut *slot {
-            Some(coder) => coder,
-            // C: `if (!p->enc) p->enc = LzmaEnc_Create(...)`, at the head
-            // of `Lzma2Enc_EncodeMt1`.
-            None => slot.insert(Lzma2EncInt::new(&self.props)?),
-        };
-        coder.encode_mt1_mem(src, &mut *dest, finished)
+        self.code_to(coder_index, src, &mut *dest, finished)
     }
 
     /// C: `Lzma2Enc_MtCallback_Write`.
@@ -1115,6 +1454,46 @@ impl MtCoderCallback for Lzma2MtCallback<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .write_vec(&mut data)
+    }
+}
+
+#[cfg(feature = "std")]
+impl Lzma2MtCallback<'_> {
+    /// C: the coder selection and `Lzma2Enc_EncodeMt1` call shared by both
+    /// forms of `Lzma2Enc_MtCallback_Code`'s memory destination.
+    fn code_to(
+        &self,
+        coder_index: usize,
+        src: &[u8],
+        out: &mut dyn SeqOutStream,
+        finished: bool,
+    ) -> Result<(), Error> {
+        self.with_coder(coder_index, |coder| {
+            coder.encode_mt1_mem(src, out, finished)
+        })
+    }
+
+    /// C: the lazy coder selection shared by both output forms of
+    /// `Lzma2Enc_MtCallback_Code`.
+    fn with_coder(
+        &self,
+        coder_index: usize,
+        code: impl FnOnce(&mut Lzma2EncInt) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if coder_index == 0 {
+            let mut coder = self.first.lock().unwrap_or_else(|e| e.into_inner());
+            return code(&mut coder);
+        }
+        let mut slot = self.rest[coder_index - 1]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let coder = match &mut *slot {
+            Some(coder) => coder,
+            // C: `if (!p->enc) p->enc = LzmaEnc_Create(...)`, at the head
+            // of `Lzma2Enc_EncodeMt1`.
+            None => slot.insert(Lzma2EncInt::new(&self.props)?),
+        };
+        code(coder)
     }
 }
 
@@ -1296,6 +1675,47 @@ mod tests {
         assert_eq!(enc.threads_reduced(), 1);
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_streamed_window_is_counted_when_reusing_a_block_coder() {
+        let block = 1 << 16;
+        let src = mixed(block * 4);
+        for mf_threads in [1, 2] {
+            let props = LzmaEncProps::new()
+                .with_dict_size(1 << 15)
+                .with_num_threads(mf_threads);
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_block_size(block as u64);
+            enc.set_threads(2);
+            enc.set_data_size(src.len() as u64);
+            // Configure under a finite cap before allocating the streamed
+            // window, so entering the block path reuses the same coder.
+            enc.set_mem_limit(128 << 20);
+            let fresh_per = enc.mem_usage_per_thread();
+            let mut want = Vec::new();
+            enc.encode_send(&mut SliceStream::new(&src), &mut want)
+                .unwrap();
+            let retained = match &enc.coder.enc.mf {
+                crate::enc::finder::Finder::Mt(mt) => mt.windows().0 as u64,
+                _ => panic!("expected an inline or threaded finder"),
+            };
+            assert!(retained > 0);
+            let reused_per = enc.mem_usage_per_thread();
+            assert_eq!(reused_per, fresh_per + retained);
+            enc.set_mem_limit(2 * fresh_per);
+            assert_eq!(enc.threads_reduced(), 1, "retained window was omitted");
+
+            enc.set_mem_limit(2 * reused_per);
+            assert_eq!(enc.threads_reduced(), 2);
+            let mut got = Vec::new();
+            enc.encode_mt(&mut SliceStream::new(&src), &mut got)
+                .unwrap();
+            assert!(got == want, "finder threads {mf_threads}");
+            assert!(enc.coder.enc.allocated() <= reused_per);
+            assert_eq!(enc.mem_usage_per_thread(), reused_per);
+        }
+    }
+
     /// The estimate covers what a block's coder really allocates, with and
     /// without the threaded match finder: the coder is prepared as a block
     /// thread prepares it, reading its block in place, so the threaded finder
@@ -1349,8 +1769,9 @@ mod tests {
 
     /// A limit that pays for `n` block coders reading their blocks in place
     /// gives `n` threads, where counting the threaded finder's window and a
-    /// copy of each block gave fewer; and the single-threaded finder's
-    /// estimate, window and input copy included, is what it always was.
+    /// copy of each block gave fewer; the inline finder at one thread counts
+    /// no window either; and the single-threaded finder's estimate, window
+    /// and input copy included, is what it always was.
     #[cfg(feature = "std")]
     #[test]
     fn a_limit_that_fits_n_direct_block_coders_gives_n_threads() {
@@ -1401,14 +1822,21 @@ mod tests {
             );
         }
 
-        // The single-threaded finder reads through a window, and the
-        // estimate is the one it always had.
+        // One finder thread is the inline finder, which reads a block in
+        // place as the threads do, so its estimate counts no window either.
         let props = LzmaEncProps::new()
             .with_dict_size(dict_size)
             .with_num_threads(1);
         let mut enc = Lzma2Encoder::new(&props).unwrap();
         enc.set_block_size(block);
         enc.set_threads(8);
+        let inline = enc.coder.enc.mem_usage_for(true);
+        assert!(inline < enc.coder.enc.mem_usage());
+        assert_eq!(enc.mem_usage_per_thread(), inline + out + block);
+
+        // The single-threaded finder reads through a window, and the
+        // estimate is the one it always had.
+        enc.coder.set_inline_finder(false);
         let old = enc.coder.enc.mem_usage() + out + block;
         assert_eq!(enc.mem_usage_per_thread(), old);
         assert_eq!(enc.coder.enc.mem_usage_for(true), enc.coder.enc.mem_usage());
@@ -1525,6 +1953,75 @@ mod tests {
             enc.set_total_threads(0);
             assert_eq!(enc.split_threads(), before);
             assert_eq!(before, (1, blocks(named.unwrap_or(1))));
+        }
+    }
+
+    /// A bare total is split as the SDK's own code splits it, at 1, 2, 3, 4,
+    /// 8 and 18 threads, for every kind of finder and for the finder counts
+    /// that a finder can use (none, one and two named).
+    ///
+    /// `reference` is a transcription of the C, not of `split_threads`: the
+    /// `t1` / `t2` / `t3` head of `Lzma2EncProps_Normalize` (`Lzma2Enc.c`,
+    /// `t1n` from a normalize of a copy, then the `t3 > 0 && t2 <= 0` arm),
+    /// the `numThreads` default of `LzmaEncProps_Normalize` (`LzmaEnc.c`,
+    /// `(btMode && algo) ? 2 : 1`) that the second normalize applies to a `t1`
+    /// still unset, and `LzmaEnc_SetProps`' `multiThread = numThreads > 1`,
+    /// which is what the finder thread count means to the coder.
+    #[test]
+    fn a_bare_total_is_split_by_the_reference_rule() {
+        use crate::enc::MatchFinderKind;
+
+        fn reference(props: &LzmaEncProps, total: usize) -> (usize, usize) {
+            let mut normal = *props;
+            normal.normalize();
+            let t1n = if props.num_threads >= 0 {
+                props.num_threads
+            } else if normal.bt_mode != 0 && normal.algo != 0 {
+                2
+            } else {
+                1
+            };
+            let mut t1 = props.num_threads;
+            let t3 = total as i32;
+            let mut t2 = t3 / t1n;
+            if t2 == 0 {
+                t1 = 1;
+                t2 = t3;
+            }
+            let t2 = (t2 as usize).min(THREADS_LIMIT);
+            let t1 = if t1 < 0 { t1n } else { t1 };
+            let finder = if t1 > 1 && normal.bt_mode != 0 && normal.algo != 0 {
+                2
+            } else {
+                1
+            };
+            (finder, t2)
+        }
+
+        let tree = LzmaEncProps::new().with_level(5);
+        let chain = tree.with_match_finder(MatchFinderKind::Hc4);
+        let fast = LzmaEncProps::new().with_level(1);
+        let fast_tree = fast.with_match_finder(MatchFinderKind::Bt4);
+        let cases = [
+            ("tree", tree),
+            ("tree, one named", tree.with_num_threads(1)),
+            ("tree, two named", tree.with_num_threads(2)),
+            ("chain", chain),
+            ("chain, one named", chain.with_num_threads(1)),
+            ("fast", fast),
+            ("fast, one named", fast.with_num_threads(1)),
+            ("fast tree", fast_tree),
+        ];
+        for (name, props) in cases {
+            for total in [1usize, 2, 3, 4, 8, 18] {
+                let mut enc = Lzma2Encoder::new(&props).unwrap();
+                enc.set_total_threads(total);
+                assert_eq!(
+                    enc.split_threads(),
+                    reference(&props, total),
+                    "{name}, a total of {total}"
+                );
+            }
         }
     }
 
@@ -1740,6 +2237,370 @@ mod tests {
         }
     }
 
+    /// One LZMA2 encoder given new settings before each stream, as 7-Zip's
+    /// 7z writer gives its one coder each folder's: every stream is what a
+    /// new encoder with those settings writes, and once the first, largest
+    /// setting has allocated, none after it allocates again.
+    #[cfg(feature = "std")]
+    #[test]
+    fn new_settings_on_a_used_encoder_write_what_a_new_encoder_writes() {
+        let whole = mixed(600_000);
+        // (level, reduce size, lc, lp, pb, input length): the first sets the
+        // largest window and table; the rest vary everything the props carry.
+        type Step = (u32, u64, u8, u8, u8, usize);
+        let inline: [Step; 6] = [
+            (9, 1 << 19, 3, 0, 2, 500_000),
+            (5, 100_000, 3, 0, 2, 100_000),
+            (7, 70_000, 0, 2, 0, 70_000),
+            (6, 1 << 18, 4, 0, 4, 250_000),
+            (9, 60_000, 1, 1, 1, 60_000),
+            (5, 1, 3, 0, 2, 1),
+        ];
+        let st: [Step; 5] = [
+            (4, 1 << 19, 3, 0, 2, 500_000),
+            (1, 90_000, 3, 0, 2, 90_000),
+            (3, 50_000, 0, 4, 1, 50_000),
+            (2, 200_000, 2, 2, 3, 200_000),
+            (4, 0, 3, 0, 2, 0),
+        ];
+        for (name, steps) in [("inline", &inline[..]), ("st", &st[..])] {
+            let props_of = |&(level, reduce, lc, lp, pb, _): &Step| {
+                LzmaEncProps::new()
+                    .with_level(level)
+                    .with_reduce_size(reduce)
+                    .with_lclppb(lc, lp, pb)
+            };
+            let mut reused = Lzma2Encoder::new(&props_of(&steps[0])).unwrap();
+            let mut first_allocs = None;
+            for (i, step) in steps.iter().enumerate() {
+                let props = props_of(step);
+                let src = &whole[600_000 - step.5..];
+                reused.set_props(&props).unwrap();
+                let mut got = Vec::new();
+                reused
+                    .encode_send(&mut SliceStream::new(src), &mut got)
+                    .unwrap();
+                assert_eq!(
+                    reused.coder.enc.mf.is_inline(),
+                    name == "inline",
+                    "{name} {i}"
+                );
+                let allocs = reused.coder.enc.mf.cfg().allocs;
+                assert_eq!(*first_allocs.get_or_insert(allocs), allocs, "{name} {i}");
+
+                let mut fresh = Lzma2Encoder::new(&props).unwrap();
+                let mut want = Vec::new();
+                fresh
+                    .encode_send(&mut SliceStream::new(src), &mut want)
+                    .unwrap();
+                assert!(got == want, "{name} {i}");
+                assert_eq!(reused.properties(), fresh.properties(), "{name} {i}");
+            }
+            assert!(first_allocs.unwrap() > 0, "{name}");
+        }
+    }
+
+    /// A setting that does not fit what the encoder holds is allocated for,
+    /// and the stream is still what a new encoder writes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_larger_setting_on_a_used_encoder_allocates_for_it() {
+        let src = mixed(400_000);
+        let small = LzmaEncProps::new().with_level(5).with_reduce_size(50_000);
+        let large = LzmaEncProps::new().with_level(5).with_reduce_size(400_000);
+        let mut reused = Lzma2Encoder::new(&small).unwrap();
+        let mut got = Vec::new();
+        reused
+            .encode_send(&mut SliceStream::new(&src[..50_000]), &mut got)
+            .unwrap();
+        let before = reused.coder.enc.mf.cfg().allocs;
+        reused.set_props(&large).unwrap();
+        got.clear();
+        reused
+            .encode_send(&mut SliceStream::new(&src), &mut got)
+            .unwrap();
+        assert!(reused.coder.enc.mf.cfg().allocs > before);
+        let mut want = Vec::new();
+        Lzma2Encoder::new(&large)
+            .unwrap()
+            .encode_send(&mut SliceStream::new(&src), &mut want)
+            .unwrap();
+        assert!(got == want);
+    }
+
+    /// A setting out of range is refused and leaves the encoder writing what
+    /// it wrote before.
+    #[test]
+    fn a_refused_setting_leaves_the_encoder_as_it_was() {
+        let src = mixed(80_000);
+        let props = LzmaEncProps::new().with_level(5).with_reduce_size(80_000);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        let mut want = Vec::new();
+        enc.encode(&mut SliceStream::new(&src), &mut want).unwrap();
+        assert!(enc.set_props(&props.with_lclppb(4, 1, 2)).is_err());
+        assert!(enc.set_props(&props.with_lclppb(9, 0, 2)).is_err());
+        let mut got = Vec::new();
+        enc.encode(&mut SliceStream::new(&src), &mut got).unwrap();
+        assert!(got == want);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn unsized_lzma_streams_forget_previous_size_hints() {
+        use crate::enc::MatchFinderKind;
+
+        let src = mixed(300_000);
+        for kind in [MatchFinderKind::Hc4, MatchFinderKind::Bt4] {
+            for send in [false, true] {
+                for reconfigure in [false, true] {
+                    let props = LzmaEncProps::new()
+                        .with_dict_size(1 << 18)
+                        .with_match_finder(kind)
+                        .with_num_threads(2);
+                    let mut reused = crate::enc::LzmaEncoder::new(&props).unwrap();
+                    reused.encode_to_vec(&src[..100]).unwrap();
+                    let props = if reconfigure {
+                        props.with_level(9)
+                    } else {
+                        props
+                    };
+                    if reconfigure {
+                        reused.set_props(&props).unwrap();
+                    }
+                    let mut fresh = crate::enc::LzmaEncoder::new(&props).unwrap();
+                    let mut got = Vec::new();
+                    let mut want = Vec::new();
+                    if send {
+                        reused
+                            .encode_send(&mut SliceStream::new(&src), &mut got)
+                            .unwrap();
+                        fresh
+                            .encode_send(&mut SliceStream::new(&src), &mut want)
+                            .unwrap();
+                    } else {
+                        reused
+                            .encode(&mut SliceStream::new(&src), &mut got)
+                            .unwrap();
+                        fresh
+                            .encode(&mut SliceStream::new(&src), &mut want)
+                            .unwrap();
+                    }
+                    assert_eq!(reused.inner.mf.cfg().expected_data_size, u64::MAX);
+                    assert!(
+                        got == want,
+                        "{kind:?}, send {send}, reconfigure {reconfigure}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same for the LZMA1 encoder.
+    #[test]
+    fn new_settings_on_a_used_lzma_encoder_write_what_a_new_encoder_writes() {
+        let whole = mixed(300_000);
+        let steps: [(u32, u64, u8, u8, u8, usize); 4] = [
+            (9, 1 << 18, 3, 0, 2, 250_000),
+            (6, 70_000, 8, 0, 2, 70_000),
+            (5, 100_000, 0, 4, 0, 100_000),
+            (7, 60_000, 1, 2, 3, 60_000),
+        ];
+        let props_of = |&(level, reduce, lc, lp, pb, _): &(u32, u64, u8, u8, u8, usize)| {
+            LzmaEncProps::new()
+                .with_level(level)
+                .with_reduce_size(reduce)
+                .with_lclppb(lc, lp, pb)
+        };
+        let mut reused = crate::enc::LzmaEncoder::new(&props_of(&steps[0])).unwrap();
+        let mut first_allocs = None;
+        for (i, step) in steps.iter().enumerate() {
+            let props = props_of(step);
+            let src = &whole[300_000 - step.5..];
+            reused.set_props(&props).unwrap();
+            let got = reused.encode_to_vec(src).unwrap();
+            let allocs = reused.inner.mf.cfg().allocs;
+            assert_eq!(*first_allocs.get_or_insert(allocs), allocs, "{i}");
+            let mut fresh = crate::enc::LzmaEncoder::new(&props).unwrap();
+            assert!(got == fresh.encode_to_vec(src).unwrap(), "{i}");
+            assert_eq!(reused.properties(), fresh.properties(), "{i}");
+        }
+        assert!(first_allocs.unwrap() > 0);
+    }
+
+    /// A data limit sizes the window to the input and changes no byte; an
+    /// input longer than the limit is refused.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_data_limit_shortens_the_window_and_changes_no_byte() {
+        let src = mixed(300_000);
+        for mf_threads in [1u32, 2] {
+            for level in [3u32, 5, 9] {
+                let props = LzmaEncProps::new()
+                    .with_level(level)
+                    .with_num_threads(mf_threads);
+                let mut plain = Lzma2Encoder::new(&props).unwrap();
+                let mut want = Vec::new();
+                plain
+                    .encode_send(&mut SliceStream::new(&src), &mut want)
+                    .unwrap();
+
+                let mut limited = Lzma2Encoder::new(&props).unwrap();
+                limited.set_data_limit(src.len() as u64);
+                let mut got = Vec::new();
+                limited
+                    .encode_send(&mut SliceStream::new(&src), &mut got)
+                    .unwrap();
+                assert!(got == want, "{mf_threads} {level} send");
+                assert!(
+                    limited.coder.enc.mf.allocated() < plain.coder.enc.mf.allocated(),
+                    "{mf_threads} {level}"
+                );
+                // `encode` codes with the finder one thread drives whatever
+                // was asked, so its bytes are compared on one thread.
+                if mf_threads == 1 {
+                    got.clear();
+                    limited
+                        .encode(&mut SliceStream::new(&src), &mut got)
+                        .unwrap();
+                    assert!(got == want, "{mf_threads} {level} encode");
+                }
+
+                limited.set_data_limit(src.len() as u64 - 1);
+                got.clear();
+                let res = limited.encode_send(&mut SliceStream::new(&src), &mut got);
+                assert!(res.is_err(), "{mf_threads} {level}");
+                got.clear();
+                let res = limited.encode(&mut SliceStream::new(&src), &mut got);
+                assert!(res.is_err(), "{mf_threads} {level}");
+            }
+        }
+    }
+
+    /// One encoder moving between the inline and the single-threaded finder,
+    /// as it does when its settings move between the two: the window, the
+    /// tables and the hand-off buffers are allocated once, as the C's one
+    /// `MFB` and its `hashBuf` are, and every stream is what a new encoder
+    /// writes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn switching_finders_keeps_what_either_allocated() {
+        let whole = mixed(500_000);
+        let props = LzmaEncProps::new().with_level(6).with_reduce_size(1 << 19);
+        let steps: [(bool, usize); 6] = [
+            (true, 500_000),
+            (false, 400_000),
+            (true, 90_000),
+            (false, 1),
+            (true, 300_000),
+            (false, 500_000),
+        ];
+        let mut reused = Lzma2Encoder::new(&props).unwrap();
+        for (i, &(inline, len)) in steps.iter().enumerate() {
+            let src = &whole[..len];
+            reused.coder.set_inline_finder(inline);
+            let mut got = Vec::new();
+            reused
+                .encode_send(&mut SliceStream::new(src), &mut got)
+                .unwrap();
+            assert_eq!(reused.coder.enc.mf.is_inline(), inline, "{i}");
+            assert_eq!(reused.coder.enc.mf.cfg().allocs, 3, "{i}");
+
+            let mut fresh = Lzma2Encoder::new(&props).unwrap();
+            fresh.coder.set_inline_finder(inline);
+            let mut want = Vec::new();
+            fresh
+                .encode_send(&mut SliceStream::new(src), &mut want)
+                .unwrap();
+            assert!(got == want, "{i}");
+        }
+    }
+
+    /// `encode` takes a stream the threaded finder's threads cannot be
+    /// given. With two finder threads asked for it codes with the finder one
+    /// thread drives, and writes what one finder thread writes, on a new
+    /// encoder and on one whose last stream used the threads.
+    #[cfg(feature = "std")]
+    #[test]
+    fn encode_with_two_finder_threads_writes_the_one_thread_bytes() {
+        let src = mixed(400_000);
+        for level in [5u32, 9] {
+            let one = LzmaEncProps::new().with_level(level);
+            let two = one.with_num_threads(2);
+            let mut want = Vec::new();
+            Lzma2Encoder::new(&one)
+                .unwrap()
+                .encode_send(&mut SliceStream::new(&src), &mut want)
+                .unwrap();
+
+            let mut enc = Lzma2Encoder::new(&two).unwrap();
+            let mut got = Vec::new();
+            enc.encode(&mut SliceStream::new(&src), &mut got).unwrap();
+            assert!(got == want, "lzma2 {level} new");
+            let mut threaded = Vec::new();
+            enc.encode_send(&mut SliceStream::new(&src), &mut threaded)
+                .unwrap();
+            got.clear();
+            enc.encode(&mut SliceStream::new(&src), &mut got).unwrap();
+            assert!(got == want, "lzma2 {level} after threads");
+
+            let mut lzma_one = crate::enc::LzmaEncoder::new(&one).unwrap();
+            let mut lzma_two = crate::enc::LzmaEncoder::new(&two).unwrap();
+            let mut want = Vec::new();
+            lzma_one
+                .encode(&mut SliceStream::new(&src), &mut want)
+                .unwrap();
+            let mut got = Vec::new();
+            lzma_two
+                .encode(&mut SliceStream::new(&src), &mut got)
+                .unwrap();
+            assert!(got == want, "lzma {level}");
+            let mut want = Vec::new();
+            lzma_one
+                .encode_sized(&mut SliceStream::new(&src), &mut want, src.len() as u64)
+                .unwrap();
+            let mut got = Vec::new();
+            lzma_two
+                .encode_sized(&mut SliceStream::new(&src), &mut got, src.len() as u64)
+                .unwrap();
+            assert!(got == want, "lzma sized {level}");
+        }
+    }
+
+    /// The paths that cannot hand the finder's threads their input never
+    /// pick the threaded finder, and the path that can still does.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_stream_that_is_not_send_never_gets_the_threaded_finder() {
+        let src = mixed(200_000);
+        let two = LzmaEncProps::new().with_level(5).with_num_threads(2);
+
+        let mut enc = Lzma2Encoder::new(&two).unwrap();
+        let mut out = Vec::new();
+        enc.encode(&mut SliceStream::new(&src), &mut out).unwrap();
+        assert!(!enc.coder.enc.mf.is_mt());
+        assert!(enc.coder.enc.mf.is_inline());
+        out.clear();
+        enc.encode_send(&mut SliceStream::new(&src), &mut out)
+            .unwrap();
+        assert!(enc.coder.enc.mf.is_mt());
+        out.clear();
+        enc.encode(&mut SliceStream::new(&src), &mut out).unwrap();
+        assert!(!enc.coder.enc.mf.is_mt());
+
+        let mut lzma = crate::enc::LzmaEncoder::new(&two).unwrap();
+        out.clear();
+        lzma.encode(&mut SliceStream::new(&src), &mut out).unwrap();
+        assert!(!lzma.inner.mf.is_mt());
+        out.clear();
+        lzma.encode_sized(&mut SliceStream::new(&src), &mut out, src.len() as u64)
+            .unwrap();
+        assert!(!lzma.inner.mf.is_mt());
+        out.clear();
+        lzma.encode_send(&mut SliceStream::new(&src), &mut out)
+            .unwrap();
+        assert!(lzma.inner.mf.is_mt());
+    }
+
     /// A block thread's coder is built when that thread first has a block,
     /// and is the same coder for every stream after: with new settings it
     /// writes what a coder built with them writes.
@@ -1923,13 +2784,13 @@ mod tests {
         /// The window each coder holds, the first thread's first; `None` for
         /// a block thread whose coder has not been built.
         fn windows(enc: &mut Lzma2Encoder) -> Vec<Option<u64>> {
-            let mut held = vec![Some(enc.coder.enc.mf.cfg().allocated())];
+            let mut held = vec![Some(enc.coder.enc.mf.allocated())];
             for slot in &mut enc.block_coders {
                 held.push(
                     slot.get_mut()
                         .unwrap()
                         .as_mut()
-                        .map(|coder| coder.enc.mf.cfg().allocated()),
+                        .map(|coder| coder.enc.mf.allocated()),
                 );
             }
             held
@@ -1966,7 +2827,7 @@ mod tests {
             let cb = fresh.mt_callback(&mut out, 1).unwrap();
             cb.code(0, 0, &src[..block], true).unwrap();
             drop(cb);
-            fresh.coder.enc.mf.cfg().allocated()
+            fresh.coder.enc.mf.allocated()
         };
         assert!(want < large[0].unwrap(), "{want} {large:?}");
 
@@ -2051,6 +2912,7 @@ mod tests {
         enc.set_threads(3);
 
         let mut copied = Vec::new();
+        enc.set_data_size(src.len() as u64);
         enc.encode_slice(&src, &mut copied).unwrap();
 
         let mut kept = Keeps::default();
@@ -2058,6 +2920,24 @@ mod tests {
         assert_eq!(kept.writes, 0);
         assert_eq!(kept.blocks.len(), src.len().div_ceil(1 << 16));
         assert!(kept.blocks.concat() == copied);
+        assert_eq!(enc.encode_to_vec(&src).unwrap(), copied);
+
+        // The owned API reuses the first allocation, then appends blocks in
+        // order without retaining a duplicate of that first block.
+        let mut owned = VecOutput(Vec::new());
+        let mut first = Vec::with_capacity(64);
+        first.extend_from_slice(b"first");
+        let allocation = first.as_ptr();
+        let capacity = first.capacity();
+        owned.write_vec(&mut first).unwrap();
+        assert_eq!(owned.0.as_ptr(), allocation);
+        assert_eq!(owned.0.capacity(), capacity);
+        assert_eq!(first.capacity(), 0);
+        assert!(first.is_empty());
+        let mut second = b" second".to_vec();
+        owned.write_vec(&mut second).unwrap();
+        assert_eq!(owned.0, b"first second");
+        assert!(second.is_empty());
 
         // The default leaves the caller its buffer, emptied.
         let mut sink = Vec::new();
@@ -2066,6 +2946,138 @@ mod tests {
         SeqOutStream::write_vec(&mut sink, &mut block).unwrap();
         assert_eq!(sink, b"one block");
         assert!(block.is_empty() && block.capacity() >= 64);
+    }
+
+    /// The owned solid-block API uses the same bytes as the copying stream
+    /// path, including empty input, chunk boundaries and dictionary wrap.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_buffered_solid_block_matches_the_copying_stream() {
+        for (level, threads) in [(0, 1), (0, 2), (5, 1), (5, 2)] {
+            let props = LzmaEncProps::new()
+                .with_level(level)
+                .with_dict_size(1 << 16)
+                .with_num_threads(threads);
+            let mut owned = Lzma2Encoder::new(&props).unwrap();
+            owned.set_total_threads(threads as usize);
+            owned.set_block_size(BLOCK_SIZE_SOLID);
+            for data in [
+                mixed(3 * (1 << 16) + 37),
+                pseudo_random(3 * (1 << 16) + 37),
+                vec![0; 3 * (1 << 16) + 37],
+            ] {
+                for len in [0, 1, 31, 65535, 65536, 65537, data.len()] {
+                    let src = &data[..len];
+                    let mut stream = Lzma2Encoder::new(&props).unwrap();
+                    stream.set_total_threads(threads as usize);
+                    stream.set_block_size(BLOCK_SIZE_SOLID);
+                    stream.set_data_size(src.len() as u64);
+                    let mut expected = Vec::new();
+                    stream.encode_slice(src, &mut expected).unwrap();
+                    assert_eq!(owned.encode_to_vec(src).unwrap(), expected);
+                    // Reusing the same finder across direct input and its
+                    // owned stream window must preserve bytes in both modes.
+                    let mut copied = Vec::new();
+                    owned.encode_slice(src, &mut copied).unwrap();
+                    assert_eq!(copied, expected);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_solid_memory_destination_avoids_staging_and_checks_its_bound() {
+        let props = LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(1 << 16)
+            .with_num_threads(2);
+        let src = pseudo_random(3 * (1 << 16) + 37);
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        let output = enc.encode_to_vec(&src).unwrap();
+        assert!(!output.is_empty());
+        assert_eq!(enc.coder.temp.capacity(), 0);
+        match &enc.coder.enc.mf {
+            crate::enc::finder::Finder::Mt(mt) => assert_eq!(mt.windows().0, 0),
+            _ => panic!("expected a threaded finder"),
+        }
+        let mut guarded = [0xa5; 34];
+        let mut out = MemoryOutput {
+            data: &mut guarded[1..33],
+            written: 0,
+        };
+        assert_eq!(
+            enc.coder.encode_mt1_mem_into(&src, &mut out, true),
+            Err(Error::Write)
+        );
+        assert_eq!(guarded[0], 0xa5);
+        assert_eq!(guarded[33], 0xa5);
+        assert_eq!(enc.encode_to_vec(&src).unwrap(), output);
+    }
+
+    /// Disjoint block destinations compact to the copying stream's bytes,
+    /// including partial final blocks, sparse output and reused coders.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_buffered_block_layout_matches_the_copying_stream() {
+        const BLOCK: usize = 1 << 16;
+        for finder_threads in [1, 2] {
+            let props = LzmaEncProps::new()
+                .with_level(5)
+                .with_dict_size(BLOCK as u32)
+                .with_num_threads(finder_threads);
+            let mut owned = Lzma2Encoder::new(&props).unwrap();
+            owned.set_threads(3);
+            owned.set_block_size(BLOCK as u64);
+            for data in [
+                vec![0; 5 * BLOCK + 37],
+                mixed(5 * BLOCK + 37),
+                pseudo_random(5 * BLOCK + 37),
+            ] {
+                for len in [
+                    0,
+                    1,
+                    BLOCK - 1,
+                    BLOCK,
+                    BLOCK + 1,
+                    2 * BLOCK,
+                    3 * BLOCK + 1,
+                    data.len(),
+                ] {
+                    let src = &data[..len];
+                    let mut stream = Lzma2Encoder::new(&props).unwrap();
+                    stream.set_threads(3);
+                    stream.set_block_size(BLOCK as u64);
+                    stream.set_data_size(src.len() as u64);
+                    let mut expected = Vec::new();
+                    stream.encode_slice(src, &mut expected).unwrap();
+                    assert_eq!(owned.encode_to_vec(src).unwrap(), expected);
+                    for slot in &owned.block_coders {
+                        if let Some(coder) = &*slot.lock().unwrap() {
+                            assert!(coder.temp.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_memory_output_rejects_writes_past_its_region() {
+        let mut data = [0xcc; 8];
+        let mut out = MemoryOutput {
+            data: &mut data[2..6],
+            written: 0,
+        };
+        out.write(b"ab").unwrap();
+        assert_eq!(out.write(b"cde"), Err(Error::Write));
+        assert_eq!(out.written, 2);
+        out.write(b"cd").unwrap();
+        out.write(b"").unwrap();
+        assert_eq!(out.write(b"e"), Err(Error::Write));
+        assert_eq!(out.written, 4);
+        assert_eq!(data, [0xcc, 0xcc, b'a', b'b', b'c', b'd', 0xcc, 0xcc]);
     }
 
     /// Runs that compress and runs that do not, so that long matches, short
