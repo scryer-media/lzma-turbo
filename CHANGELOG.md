@@ -2,6 +2,14 @@
 
 ## 0.9.0 - 2026-10-10
 
+- Reusing an LZMA encoder for an unsized stream clears the previous stream's
+  size hint, preserving fresh-encoder output. Failed LZMA2 reconfiguration
+  leaves the existing coder usable, and hash-chain head allocation failures
+  return `Error::Alloc`. Block-thread memory estimates include retained
+  streamed windows. The adaptive decoder reports its temporary allowance
+  for already-buffered input without changing worker admission or exceeding
+  the caller's memory ceiling.
+
 - Streaming LZMA2 encoding takes 3.6–23% less wall time than official 7zz
   on the measured 256 MiB seeded/zero-filled T2/T4 cases on Zen 4 and
   Sapphire Rapids. Buffered encoding stays within 3% of reference wall and

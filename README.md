@@ -13,7 +13,7 @@ AWS-LC, for the SHA-256 check, and `native-crypto` replaces it with pure Rust
 
 ```toml
 [dependencies]
-lzma-turbo = "0.6"
+lzma-turbo = "0.9"
 ```
 
 ## Reading an `.xz` file
@@ -44,62 +44,59 @@ Every pure-Rust LZMA decoder descends from the Tukaani XZ-for-Java design: a
 readable object-oriented state machine that pays for per-bit method calls,
 bounds checks and struct-resident coder state. 7-Zip's own decoder is a
 different shape, one large loop with everything in registers and limits
-checked once per symbol, and it decodes the same streams 1.3x to 1.7x faster
-on a single core (lzma-rust2 and sevenz-rust2 against `7zz -mmt=1`, Apple M5
-Max, 2026-09-15, in [docs/benchmarking.md](docs/benchmarking.md)). This crate
-ports that shape rather than that lineage.
+checked once per symbol. This crate ports that shape rather than that lineage.
 
 ## Speed
 
-The current 0.9.0 encoder measurements cover level-5 LZMA2 on Linux x86-64
-Zen 4 and Sapphire Rapids. For 256 MiB seeded and zero-filled inputs at
-T2/T4, streaming uses 3.6–23% less wall time than official 7zz 26.03.
-Buffered wall and CPU time stay within 3% of 7zz, and peak RSS stays within
-3% of the matching SDK memory API; seeded T4 buffered RSS is about 15% lower.
-These are encoder API results, not archive-container or all-platform claims.
-The exact settings, T1 results and retained samples are in
-[docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md).
+The latest 0.9.0 encoder measurements cover level-5 LZMA2, a 32 MiB
+dictionary, and 256 MiB seeded and zero-filled inputs on Linux x86-64.
+T2/T4 are total encoder thread budgets. Wall time includes reading input,
+encoding and teardown; CPU time is user plus system time, and RSS is process
+peak memory. Negative deltas mean less time or memory.
 
-The decode tables below are historical, not rerun by that encoder audit:
-Linux x86_64, the 16-thread x86_64 bench box of
-[docs/perf-log.md](docs/perf-log.md), measured with `tools/lzma-bench` in
-September 2026 at commits before 0.6.0, median of three runs. Every row
-decodes the same bytes, checked against the oracle by length and CRC-32. To
-measure the current code on a machine of your own, or on several and merge
-them, use [`bench/lzma-turbo-bench`](bench/lzma-turbo-bench), which also
-records each process's peak RSS.
+Streaming API, medians of seven interleaved runs. All deltas compare official
+7zz 26.03 using matching file-stream paths:
 
-One thread, pinned to the first three performance cores (`taskset -c 0-5`):
+| CPU | Input / threads | lzma-turbo / 7zz wall, s | Wall delta | CPU delta | RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Zen 4 | Seeded T2 | 23.8382 / 25.3083 | -5.81% | -2.75% | -0.79% |
+| Zen 4 | Seeded T4 | 12.4523 / 13.2466 | -6.00% | -3.19% | -0.31% |
+| Zen 4 | Zeros T2 | 0.6610 / 0.8576 | -22.92% | -21.16% | -0.80% |
+| Zen 4 | Zeros T4 | 0.3759 / 0.4680 | -19.68% | -20.83% | -0.31% |
+| Sapphire Rapids | Seeded T2 | 31.1056 / 32.8723 | -5.37% | -2.09% | -0.80% |
+| Sapphire Rapids | Seeded T4 | 19.8918 / 20.6430 | -3.64% | -1.15% | -0.30% |
+| Sapphire Rapids | Zeros T2 | 0.9491 / 1.1496 | -17.44% | -16.52% | -0.79% |
+| Sapphire Rapids | Zeros T4 | 0.6885 / 0.7813 | -11.88% | -14.07% | -0.30% |
 
-| stream | lzma-turbo | `7zz -mmt=1` | `xz -T1` |
-| --- | --- | --- | --- |
-| 1 GiB LZMA1 | 19.6 s | 19.6 s | 20.5 s |
-| 256 MiB LZMA2 (.xz) | 4.9 s | 5.1 s | 5.1 s |
+Buffered API, retaining the complete input and output. Wall and CPU compare
+official 7zz; RSS compares the SDK's matching memory-input/memory-output API.
+Seeded timings are medians of seven runs, with three SDK RSS runs. The latest
+zero-input audit uses nine runs and a caller-owned input buffer advised for
+Linux huge pages before reading. That caller allocation policy is separate
+from the library's borrowed-slice API.
 
-LZMA2 in parallel, a 1 GiB stream written by `7zz -mmt=on`, unpinned:
+| CPU | Input / threads | lzma-turbo / 7zz wall, s | Wall delta | CPU delta | RSS delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Zen 4 | Seeded T2 | 25.0118 / 25.2907 | -1.10% | +1.29% | +0.15% |
+| Zen 4 | Seeded T4 | 13.0178 / 13.2951 | -2.09% | +0.21% | -15.18% |
+| Zen 4 | Zeros T2 | 0.647505 / 0.853685 | -24.15% | -20.63% | +0.07% |
+| Zen 4 | Zeros T4 | 0.378183 / 0.468652 | -19.30% | -21.36% | +0.31% |
+| Sapphire Rapids | Seeded T2 | 32.0219 / 32.9671 | -2.87% | +1.66% | +0.18% |
+| Sapphire Rapids | Seeded T4 | 20.7564 / 20.5869 | +0.82% | +1.85% | -15.20% |
+| Sapphire Rapids | Zeros T2 | 0.964172 / 1.190745 | -19.03% | -13.95% | +0.09% |
+| Sapphire Rapids | Zeros T4 | 0.713363 / 0.814438 | -12.41% | -16.46% | +0.32% |
 
-| threads | lzma-turbo | `7zz` | lzma-rust2 |
-| --- | --- | --- | --- |
-| 1 | 20.4 s | 20.5 s | 29.6 s |
-| 4 | 6.5 s | 6.5 s | 29.3 s |
-| 8 | 4.3 s | 3.9 s | 29.3 s |
-| 16 | 4.2 s | 3.9 s | 29.0 s |
+Single-thread coverage uses 16 MiB inputs and solid blocks, seven timing runs
+and three matching SDK RSS runs. Across both CPUs and APIs, wall and CPU time
+are 53–79% lower than 7zz; peak RSS is at most 1.92% above the matching
+reference.
 
-`.xz` in parallel, 256 MiB in 16 blocks, unpinned (2026-09-16):
-
-| threads | `XzParallelReader` | `xz -T<n>` |
-| --- | --- | --- |
-| 1 | 5.0 s | 5.2 s |
-| 4 | 1.6 s | 1.6 s |
-| 16 | 0.60 s | 0.69 s |
-
-In these historical tables, the 8- and 16-thread LZMA2 rows favor `7zz`, by how
-well its threads land on this machine's performance cores; pinned to those
-cores the two are within 5%. docs/perf-log.md names the machine behind the
-first two tables as a 12th-gen Core i5-1240P (Alder Lake-P) and the one behind
-the third as Arrow Lake-H. The full tables, with peak memory and the macOS
-and Windows rows, are in
-[docs/perf-log.md](https://github.com/scryer-media/lzma-turbo/blob/main/docs/perf-log.md).
+These measurements cover the named encoder configurations. The latest audit
+did not remeasure decoding or ARM, macOS and Windows performance. Settings,
+absolute CPU/RSS figures, source fingerprints and all retained samples are in
+[docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md), with the raw evidence
+in its linked `.json.zst` files. To measure your own machine, use
+[`bench/lzma-turbo-bench`](bench/lzma-turbo-bench), which records peak RSS too.
 
 ## Status
 
@@ -135,8 +132,7 @@ pass, and `crc::CrcFolder` folds the pieces into any range the consumer asks
 about without re-reading a byte. This is not a convenience: the ring's write
 callback is its one serialised section, so a CRC computed by the consumer as
 it receives the output costs the decode both its own time and the queueing it
-induces on every other worker — measured at 16% of an eight-thread decode
-(Apple M5 Max, in docs/perf-log.md).
+induces on every other worker.
 SHA-256 cannot be folded, so it is offered per whole block only, which is the
 unit an xz stream checks.
 
@@ -200,7 +196,7 @@ and a check is one of CRC-32, CRC-64/XZ or SHA-256. `crypto` builds AWS-LC,
 which needs a C toolchain and CMake; a build that wants neither takes
 
 ```toml
-lzma-turbo = { version = "0.6", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+lzma-turbo = { version = "0.9", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
 ```
 
 which is pure Rust and works wherever the decoder does. `native-crypto` wins
@@ -233,7 +229,7 @@ Two features hand those primitives back to the embedding program:
 | `crypto-host` | SHA-256, the check type 10 hash |
 
 ```toml
-lzma-turbo = { version = "0.6", default-features = false, features = [
+lzma-turbo = { version = "0.9", default-features = false, features = [
     "std", "asm", "crc-host", "crypto-host", "xz",
 ] }
 ```
@@ -295,7 +291,7 @@ windows-msvc x86-64. On Windows x86-64 AWS-LC is built with `aws-lc-sys`'s
 `prebuilt-nasm` feature, so its assembly comes from the prebuilt NASM objects
 and no assembler is installed. The test suite runs on every platform in the
 assembly build and in the portable (`--no-default-features --features std`)
-build, and `docs/perf-log.md` carries the Windows `.xz` numbers.
+build.
 
 ## How it is tested
 

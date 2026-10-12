@@ -667,7 +667,7 @@ impl MatchFinder {
         if self.kind.bt_mode() {
             self.heads = Vec::new();
         } else if self.heads.is_empty() {
-            self.heads = vec![0; HC_HEADS];
+            self.heads = zeroed_vec(HC_HEADS)?;
         }
 
         // C 22.02: "we don't reallocate buffer, if old size is enough"

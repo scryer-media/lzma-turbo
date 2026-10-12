@@ -43,6 +43,14 @@ port rules and what was left out are in `docs/encoder.md`.
      `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
      `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,
      cancellation and reuse tests cover the threaded lifecycle as well.
+     `a_streamed_window_is_counted_when_reusing_a_block_coder` also checks
+     retained-window accounting between streams, natively.
+   - The test-only allocator in `tests/encoder_alloc.rs` delegates successful
+     allocations and deallocations to `System`, and injects null returns for
+     selected layouts. Its native tests are
+     `hash_chain_head_allocation_failure_is_recoverable` and
+     `failed_reconfiguration_keeps_the_allocated_coder_usable`; this
+     allocator is not part of the library or the Miri kernel job.
    - Low-hash/table access in `mix_matches_kind`:
      `the_mix_matches_kernel_matches_checked_tables`, native and Miri.
    - `EncodeWindow` byte/word reads and parser `match_word!` / `opt!`

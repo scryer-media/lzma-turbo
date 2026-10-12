@@ -2236,7 +2236,7 @@ impl LzmaEnc {
     ///
     /// With `direct`, for an encoder `mem_prepare_direct` prepares: a
     /// threaded or inline finder then allocates no window, and the estimate
-    /// counts none.
+    /// counts only a window retained from an earlier streamed input.
     pub(crate) fn mem_usage_for(&mut self, direct: bool) -> u64 {
         self.mf.cfg().big_hash = self.dict_size > K_BIG_HASH_DIC_LIMIT;
         let lit_probs = (0x300u64 << (self.lc + self.lp)) * 2 * 2;

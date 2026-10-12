@@ -711,15 +711,19 @@ impl Lzma2Encoder {
     /// for that.
     pub(crate) fn sync_coder(&mut self) -> Result<(), Error> {
         let want = self.effective_props();
-        if want != self.coder_props {
+        if (want != self.coder_props || self.coder_reconfigured) && self.mem_limit != u64::MAX {
+            // Build first: allocation failure must leave both the live coder
+            // and its settings intact so set_props can roll back its input.
+            let replacement = Lzma2EncInt::new(&want)?;
+            self.coder = replacement;
+            self.dict_size = self.coder.dict_size;
+            self.coder_props = want;
+            self.coder_reconfigured = false;
+        } else if want != self.coder_props {
             self.coder.set_props(&want)?;
             self.dict_size = self.coder.dict_size;
             self.coder_props = want;
             self.coder_reconfigured = true;
-        }
-        if self.coder_reconfigured && self.mem_limit != u64::MAX {
-            self.coder = Lzma2EncInt::new(&want)?;
-            self.coder_reconfigured = false;
         }
         Ok(())
     }
@@ -883,9 +887,10 @@ impl Lzma2Encoder {
     /// 7-Zip's C++.
     ///
     /// It follows what a block thread allocates. A block coder reads its
-    /// block in place, so with the threaded match finder there is no window
-    /// to count, only its tables and hand-off buffers; the single-threaded
-    /// finder reads through a window, which is counted. The figure is the
+    /// block in place, so with the threaded or inline match finder only a
+    /// window retained from an earlier streamed input is counted, alongside
+    /// its tables and hand-off buffers. The single-threaded finder always
+    /// reads through a window, which is counted. The figure is the
     /// one for [`Lzma2Encoder::encode_mt`], whose block threads each hold a
     /// copy of the block they read from the stream;
     /// [`Lzma2Encoder::encode_slice`] hands them the caller's slice instead,
@@ -1670,6 +1675,47 @@ mod tests {
         assert_eq!(enc.threads_reduced(), 1);
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_streamed_window_is_counted_when_reusing_a_block_coder() {
+        let block = 1 << 16;
+        let src = mixed(block * 4);
+        for mf_threads in [1, 2] {
+            let props = LzmaEncProps::new()
+                .with_dict_size(1 << 15)
+                .with_num_threads(mf_threads);
+            let mut enc = Lzma2Encoder::new(&props).unwrap();
+            enc.set_block_size(block as u64);
+            enc.set_threads(2);
+            enc.set_data_size(src.len() as u64);
+            // Configure under a finite cap before allocating the streamed
+            // window, so entering the block path reuses the same coder.
+            enc.set_mem_limit(128 << 20);
+            let fresh_per = enc.mem_usage_per_thread();
+            let mut want = Vec::new();
+            enc.encode_send(&mut SliceStream::new(&src), &mut want)
+                .unwrap();
+            let retained = match &enc.coder.enc.mf {
+                crate::enc::finder::Finder::Mt(mt) => mt.windows().0 as u64,
+                _ => panic!("expected an inline or threaded finder"),
+            };
+            assert!(retained > 0);
+            let reused_per = enc.mem_usage_per_thread();
+            assert_eq!(reused_per, fresh_per + retained);
+            enc.set_mem_limit(2 * fresh_per);
+            assert_eq!(enc.threads_reduced(), 1, "retained window was omitted");
+
+            enc.set_mem_limit(2 * reused_per);
+            assert_eq!(enc.threads_reduced(), 2);
+            let mut got = Vec::new();
+            enc.encode_mt(&mut SliceStream::new(&src), &mut got)
+                .unwrap();
+            assert!(got == want, "finder threads {mf_threads}");
+            assert!(enc.coder.enc.allocated() <= reused_per);
+            assert_eq!(enc.mem_usage_per_thread(), reused_per);
+        }
+    }
+
     /// The estimate covers what a block's coder really allocates, with and
     /// without the threaded match finder: the coder is prepared as a block
     /// thread prepares it, reading its block in place, so the threaded finder
@@ -2296,6 +2342,57 @@ mod tests {
         let mut got = Vec::new();
         enc.encode(&mut SliceStream::new(&src), &mut got).unwrap();
         assert!(got == want);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn unsized_lzma_streams_forget_previous_size_hints() {
+        use crate::enc::MatchFinderKind;
+
+        let src = mixed(300_000);
+        for kind in [MatchFinderKind::Hc4, MatchFinderKind::Bt4] {
+            for send in [false, true] {
+                for reconfigure in [false, true] {
+                    let props = LzmaEncProps::new()
+                        .with_dict_size(1 << 18)
+                        .with_match_finder(kind)
+                        .with_num_threads(2);
+                    let mut reused = crate::enc::LzmaEncoder::new(&props).unwrap();
+                    reused.encode_to_vec(&src[..100]).unwrap();
+                    let props = if reconfigure {
+                        props.with_level(9)
+                    } else {
+                        props
+                    };
+                    if reconfigure {
+                        reused.set_props(&props).unwrap();
+                    }
+                    let mut fresh = crate::enc::LzmaEncoder::new(&props).unwrap();
+                    let mut got = Vec::new();
+                    let mut want = Vec::new();
+                    if send {
+                        reused
+                            .encode_send(&mut SliceStream::new(&src), &mut got)
+                            .unwrap();
+                        fresh
+                            .encode_send(&mut SliceStream::new(&src), &mut want)
+                            .unwrap();
+                    } else {
+                        reused
+                            .encode(&mut SliceStream::new(&src), &mut got)
+                            .unwrap();
+                        fresh
+                            .encode(&mut SliceStream::new(&src), &mut want)
+                            .unwrap();
+                    }
+                    assert_eq!(reused.inner.mf.cfg().expected_data_size, u64::MAX);
+                    assert!(
+                        got == want,
+                        "{kind:?}, send {send}, reconfigure {reconfigure}"
+                    );
+                }
+            }
+        }
     }
 
     /// The same for the LZMA1 encoder.

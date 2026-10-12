@@ -130,6 +130,7 @@ impl LzmaEncoder {
     ) -> Result<(), Error> {
         // A stream that is not `Send` cannot be given to the threaded
         // finder's threads; see `LzmaEnc::finder_threads`.
+        self.inner.set_data_size(u64::MAX);
         self.inner.finder_threads = false;
         let res = self.inner.prepare(0);
         self.inner.finder_threads = true;
@@ -215,6 +216,7 @@ impl LzmaEncoder {
         input: &mut (dyn SeqInStream + Send),
         out: &mut dyn SeqOutStream,
     ) -> Result<(), Error> {
+        self.inner.set_data_size(u64::MAX);
         self.inner.prepare(0)?;
         self.encode_prepared_send(input, out)
     }

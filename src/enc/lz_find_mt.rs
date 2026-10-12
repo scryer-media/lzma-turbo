@@ -2452,12 +2452,13 @@ impl MatchFinderMt {
 
     /// The window this finder has allocated, and the length of the one its
     /// threads read now, in bytes.
-    #[cfg(test)]
     pub(crate) fn windows(&self) -> (usize, usize) {
-        let sh = self.shared();
+        let Some(sh) = &self.sh else {
+            return (self.mfb.buf_base.len(), 0);
+        };
         // SAFETY: the lz thread, outside a stream; see `create`.
         let own = unsafe { &*sh.own.get() };
-        (own.win.len(), sh.common().win_len)
+        (own.win.len() + self.mfb.buf_base.len(), sh.common().win_len)
     }
 
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".

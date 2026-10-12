@@ -5,7 +5,19 @@ historical samples describe the binaries that were measured; they are not
 release declarations. The samples, source hashes and rejected candidates
 are retained. Machine identifiers have been replaced with role labels.
 
-Review follow-up validation: 369 workspace tests passed (366 in the main
+PR-review corrections preserve encoder state after failed replacement,
+clear stale size hints before unsized encoding, make HC head allocation
+fallible, count retained streamed windows in block-thread memory estimates,
+and report the adaptive decoder's temporary retained-input allowance.
+Validation: 373 workspace tests passed with two existing skips, four
+doctests passed, and all 20 release parity/golden tests passed with required
+external SDK oracles. Formatting, all-target/all-feature Clippy and the
+no-default-feature build passed. These corrections were not rebenchmarked;
+the measurements below retain their original source fingerprints. The JSON
+evidence is now zstd-compressed and was checked byte-for-byte against the
+committed originals after decompression.
+
+Prior review follow-up (`fecf6b3`): 369 workspace tests passed (366 in the main
 sweep plus three Wasm conformance tests), with two existing skipped tests;
 four doctests passed. Both adaptive read-ahead regressions passed 100
 repetitions each with retries disabled. Twenty release parity/golden tests
@@ -96,7 +108,7 @@ advised caller, streaming encoder and SDK buffered API on both hosts. Full
 decompression matches the entire 256 MiB input. Executable hashes match between
 hosts. All 756 samples, phase counters, compiler/kernel/page-policy metadata,
 build logs, binary and output hashes, and exact diagnostic sources/scripts are
-in `encoder-zero-audit-0.9.0.json`. The reusable fixed-file caller variant is
+in `encoder-zero-audit-0.9.0.json.zst`. The reusable fixed-file caller variant is
 `bench/encoder-buffered-huge-probe.rs`. No encoder source changed in this audit.
 
 Both round-10 hosts are confirmed terminated. This audit used 0.496
@@ -718,7 +730,9 @@ header. Raw output SHA-256
   two-thread finders, and checked rejection of writes past a region's end.
 
 Individual accepted measurements and source fingerprints are in
-[encoder-perf-0.9.0.json](encoder-perf-0.9.0.json). Full logs, source experiments,
+[encoder-perf-0.9.0.json.zst](encoder-perf-0.9.0.json.zst). Read either compressed
+JSON with `zstd -dc <file.json.zst>`; compression preserves every evidence byte.
+Full logs, source experiments,
 symbol reports, and native object disassembly are under ignored `target/`.
 Large perf recordings were audited remotely; durable results retain sample
 counts and zero-throttle/loss audits, not the recordings themselves.

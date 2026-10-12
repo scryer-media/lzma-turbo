@@ -899,18 +899,16 @@ fn a_thread_under_the_ceiling_is_not_kept_idle_by_input_read_ahead() {
             .expect("drain");
     }
     assert_eq!(dec.runs_claimed(), 3, "three threads");
-    let limit_at_three = dec.memory_limit();
-
     dec.set_threads(4);
     dec.set_read_ahead(4);
     assert!(
-        dec.held_bytes() + dec.dispatch_cost(1 << 20) > dec.memory_limit(),
-        "the read-ahead does not crowd the fourth thread out"
+        dec.held_bytes() + dec.dispatch_cost(1 << 20) <= dec.memory_limit(),
+        "the reported limit must cover the fourth worker"
     );
-    assert!(dec.memory_limit() < limit_at_three);
     dec.drain_upto(0, |_, _| panic!("handed bytes over"))
         .expect("drain");
     assert_eq!(dec.runs_claimed(), 4, "the fourth thread waited");
+    assert!(dec.held_bytes() <= dec.memory_limit());
     dec.drain_upto(0, |_, _| panic!("handed bytes over"))
         .expect("drain");
     assert!(

@@ -732,9 +732,23 @@ impl Lzma2AdaptiveDecoder {
     /// get to; it is input read early and output parked. So once the runs of
     /// the stream are known, the decoder works to that figure under any
     /// larger limit, an unlimited one included, and this reports it.
+    ///
+    /// After the thread ceiling or read-ahead shrinks, input already held
+    /// may temporarily exceed that target. The reported limit also covers
+    /// that input and the next permitted worker dispatch, while admission
+    /// of new input still uses the smaller target. It never exceeds the
+    /// caller's limit; lowering that limit below bytes already held stops
+    /// further admission until enough of those bytes have been released.
     #[must_use]
     pub fn memory_limit(&self) -> u64 {
-        self.limit()
+        let held = self.held_bytes();
+        let mut limit = self.limit().max(held);
+        if let Some(&run) = self.pending.front()
+            && self.room_with(held, run)
+        {
+            limit = limit.max(held.saturating_add(self.dispatch_cost(run.unpacked_len)));
+        }
+        limit.min(self.memory_limit)
     }
 
     /// The limit the decoder works to: the caller's, or the pair bound.
@@ -2210,7 +2224,14 @@ mod tests {
         d.set_threads(4);
         d.set_read_ahead(4);
         assert!(d.held_bytes() + d.dispatch_cost(MIB as u64) > d.limit());
+        let after = d.held_bytes() + d.dispatch_cost(MIB as u64);
+        d.set_memory_limit(after - 1);
+        assert!(!d.room_for(*d.pending.front().unwrap()));
+        assert!(d.memory_limit() < after, "caller ceiling must win");
+        d.set_memory_limit(u64::MAX);
+        assert!(after <= d.memory_limit(), "report the permitted dispatch");
         assert_eq!(d.dispatch().expect("fourth dispatch"), Dispatch::Sent);
+        assert!(d.held_bytes() <= d.memory_limit(), "count retained input");
         assert_eq!(d.outstanding, 4);
         assert_eq!(d.dispatch().expect("fifth dispatch"), Dispatch::Busy);
         assert_eq!(d.runs_claimed(), 4);

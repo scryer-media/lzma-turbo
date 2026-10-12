@@ -161,8 +161,8 @@ impl Finder {
     /// the estimate is taken before anything is allocated, when the finder is
     /// still the single-threaded one it was constructed as. `direct` is
     /// [`Finder::create`]'s: the threaded finder, inline or not, then counts
-    /// no window, and the single-threaded one, which always has one, ignores
-    /// it.
+    /// no new window but retains any previous stream's allocation. The
+    /// single-threaded one, which always has a window, ignores it.
     pub(crate) fn mem_usage(
         &mut self,
         mode: FinderMode,
@@ -174,6 +174,14 @@ impl Finder {
     ) -> Result<u64, Error> {
         #[cfg(feature = "std")]
         if mode != FinderMode::St {
+            let retained_window = if direct {
+                match self {
+                    Finder::St(mf) => mf.buf_base.len(),
+                    Finder::Mt(mt) => mt.windows().0,
+                }
+            } else {
+                0
+            };
             return MatchFinderMt::mem_usage(
                 self.cfg(),
                 history_size,
@@ -182,7 +190,8 @@ impl Finder {
                 keep_add_buffer_after,
                 direct,
                 mode == FinderMode::Inline,
-            );
+            )
+            .map(|bytes| bytes.saturating_add(retained_window as u64));
         }
         #[cfg(not(feature = "std"))]
         let _ = mode;
