@@ -45,12 +45,19 @@ port rules and what was left out are in `docs/encoder.md`.
      cancellation and reuse tests cover the threaded lifecycle as well.
      `a_streamed_window_is_counted_when_reusing_a_block_coder` also checks
      retained-window accounting between streams, natively.
+   - `shrink_result` owns a global-allocator byte vector and only reallocates
+     to a nonzero size below its capacity; a null return preserves ownership.
+     `shrinking_a_result_preserves_bytes_and_releases_capacity` checks empty,
+     full and shortened buffers natively and in the Miri kernel job.
+     `result_shrink_failure_preserves_solid_and_parallel_output` injects
+     failure in both encoder paths natively.
    - The test-only allocator in `tests/encoder_alloc.rs` delegates successful
-     allocations and deallocations to `System`, and injects null returns for
-     selected layouts. Its native tests are
-     `hash_chain_head_allocation_failure_is_recoverable` and
-     `failed_reconfiguration_keeps_the_allocated_coder_usable`; this
-     allocator is not part of the library or the Miri kernel job.
+     allocations, reallocations and deallocations to `System`, and injects
+     null returns for selected layouts. Its native tests are
+     `hash_chain_head_allocation_failure_is_recoverable`,
+     `failed_reconfiguration_keeps_the_allocated_coder_usable`, and the
+     result-shrink failure test above; this allocator is not part of the
+     library or the Miri kernel job.
    - Low-hash/table access in `mix_matches_kind`:
      `the_mix_matches_kernel_matches_checked_tables`, native and Miri.
    - `EncodeWindow` byte/word reads and parser `match_word!` / `opt!`
