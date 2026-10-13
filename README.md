@@ -48,26 +48,29 @@ checked once per symbol. This crate ports that shape rather than that lineage.
 
 ## Speed
 
-Fleet measurements of 0.9.0 against xz 5.8.3 and 7-Zip 26.03 on five CPUs,
-2026-10-13. Each cell is the geometric mean over every row that reference
-runs of reference / lzma-turbo, so above 1.00 means lzma-turbo took less
-wall time or less peak memory. 7-Zip decodes `.lzma` and `.7z`; xz decodes
-and encodes `.xz`, raw LZMA2 and the branch filters.
+Fleet measurements of 0.9.0 against xz 5.8.3 and 7-Zip 26.03 on four idle
+CPUs, 2026-10-13. Each cell is the geometric mean over every row that
+reference runs of reference / lzma-turbo, so above 1.00 means lzma-turbo
+took less wall time or less peak memory. 7-Zip decodes `.lzma` and `.7z`;
+xz decodes and encodes `.xz` and the branch filters. Every encode row
+produces output of the same size as the reference (size ratio 1.000), so
+the encode speedups are at the same compression ratio. A fifth host, an
+Apple M5 Max, ran beside other work and is shown on the benchmarks page as
+provisional only.
 
 | CPU | threads | vs xz: decode wall | encode wall | peak RSS | vs 7-Zip: decode wall | peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Zen 4 | 16 | 1.08 | 1.84 | 0.71 | 0.99 | 1.05 |
-| Graviton4 | 16 | 1.76 | 1.80 | 0.71 | 1.00 | 1.04 |
+| Graviton4 | 16 | 1.75 | 1.80 | 0.71 | 1.00 | 1.04 |
 | Alder Lake | 16 | 1.03 | 1.71 | 0.69 | 1.00 | 1.03 |
-| Zen 2 | 12 | 1.09 | 1.60 | 0.77 | 1.01 | 1.04 |
-| M5 Max | 18 | 1.59 | 1.84 | 0.65 | 1.01 | 1.06 |
+| Zen 2 | 12 | 1.09 | 1.60 | 0.76 | 1.01 | 1.04 |
 
-xz single-stream decode is 1.02 to 1.09x on x86-64 and 1.6 to 1.9x on ARM;
-encode is 1.3 to 3.1x faster than xz at every preset, thread count and
-filter. The
-rows that are not wins are the seven non-x86 branch filters on x86-64 CPUs
-(0.92 to 0.98 of xz) and peak RSS, where every encode row and the
-single-stream decode rows hold more than xz. Every row on every host, with
+xz single-stream decode is 1.02 to 1.09x on x86-64 and 1.9x on Graviton4;
+encode is 1.2 to 3.1x faster than xz at every preset, thread count and
+filter. The rows that are not wins are the seven non-x86 branch filters on
+x86-64 CPUs (0.92 to 0.98 of xz) and peak RSS: the single-stream decode
+rows, every single-thread encode row and the two- and four-thread encode
+rows hold more than xz, while eight-thread and all-thread encode hold less. Every row on every host, with
 CPU time and the lzma-rust2 and liblzma comparisons, is in
 [docs/benchmarks.md](docs/benchmarks.md); the 0.9.0 encoder audit with its
 retained samples is in [docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md).
