@@ -204,3 +204,9 @@ so these rows have no ratio.
 | `filter/raw/delta64/decode` | 21774 | 17041 | 14067 | 9670 | 19764 |
 | `filter/raw/bcj2/encode` | 748 | 776 | 937 | 714 | 1371 |
 | `filter/raw/bcj2/decode` | 719 | 948 | 1180 | 876 | 1588 |
+
+## Lane view
+
+The same run grouped by the rows that are still behind parity, one lane per gap, against the primary reference for each row (7-Zip for `.7z` and `.lzma` rows, xz otherwise). Click the image for the full-size version.
+
+[![lzma-turbo 0.9.0 vs primary reference, lane view](images/fleet-lanes.webp)](images/fleet-lanes.webp)
