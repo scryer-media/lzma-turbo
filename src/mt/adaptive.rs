@@ -814,12 +814,32 @@ impl Lzma2AdaptiveDecoder {
         } else {
             piece.saturating_mul(2)
         };
-        // A thread read ahead for beyond the ceiling holds a run's input
-        // until the ceiling reaches it; see `set_read_ahead`.
-        let ahead = self.read_ahead.saturating_sub(self.threads) as u64;
+        // Only idle active slots take runs from the front of pending. The
+        // additional slots hold input only, at their own packed sizes: a
+        // larger run behind small active runs must not inherit their bound.
+        let ahead = self.read_ahead.saturating_sub(self.threads);
+        let mut ahead_input = run_in.saturating_mul(ahead as u64);
+        for run in self.pending.iter().skip(idle).take(ahead) {
+            ahead_input = ahead_input.saturating_add(run.packed_len.saturating_sub(run_in));
+        }
+        // The scanner only queues complete runs. While filling an extra
+        // slot, its open run can already exceed the preceding run's size.
+        // Grow with the scanned bytes and the current header's payload;
+        // slack admits the next header. Stop growing once all slots are full.
+        if self.pending.len() >= idle
+            && self.pending.len() - idle < ahead
+            && let Some(start) = self.scanner.open_run_offset()
+        {
+            let packed = self
+                .scanner
+                .in_position()
+                .saturating_sub(start)
+                .saturating_add(self.scanner.payload_remaining());
+            ahead_input = ahead_input.saturating_add(packed.saturating_sub(run_in));
+        }
         pair.saturating_mul(self.threads as u64)
-            .saturating_add(run_in.saturating_mul(ahead))
             .max(in_hand)
+            .saturating_add(ahead_input)
             .saturating_add(slack)
     }
 
@@ -2205,6 +2225,108 @@ mod tests {
     /// state a test starts from, not the thing it tests.
     fn hold(d: &mut Lzma2AdaptiveDecoder, bytes: &[u8]) {
         d.segs.push_owned(exact(bytes));
+    }
+
+    #[test]
+    fn read_ahead_sizes_larger_pending_runs_without_reserving_their_output() {
+        let mut d = decoder(1, u64::MAX);
+        hold(&mut d, &run(1 << 15, 0));
+        hold(&mut d, &run(2 * MIB, 1));
+        hold(&mut d, &[1]);
+        d.scan().unwrap();
+        assert_eq!(d.pending.len(), 2);
+        let base = d.pair_bound();
+        let pair = d.run_pair();
+        d.set_read_ahead(2);
+        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+        assert_eq!(d.run_pair(), pair, "active output reservation is unchanged");
+        d.pending[1].unpacked_len *= 10;
+        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+    }
+
+    #[test]
+    fn read_ahead_completes_a_larger_open_run_with_workers_out() {
+        for limit in [u64::MAX, 512 * 1024] {
+            let mut d = decoder(2, limit);
+            d.set_read_ahead(3);
+            let small = run(1 << 15, 0);
+            hold(&mut d, &small);
+            hold(&mut d, &small);
+            let mut large = run(2 * MIB, 1);
+            // A following run declares the large one complete, but must not
+            // expand the allowance for a fourth slot.
+            large.extend_from_slice(&run(2 * MIB, 2));
+            large.push(0);
+            hold(&mut d, &large[..3]);
+            d.scan().unwrap();
+            for _ in 0..2 {
+                assert_eq!(d.dispatch().unwrap(), Dispatch::Sent);
+            }
+            let mut pos = 3;
+            let mut refused = false;
+            while d.pending.is_empty() {
+                let end = (pos + (1 << 15)).min(large.len());
+                let take = d.feed(&large[pos..end]).unwrap();
+                if take == 0 {
+                    refused = true;
+                    break;
+                }
+                pos += take;
+                d.scan().unwrap();
+                assert!(d.held_bytes() <= d.memory_limit());
+                assert!(d.memory_limit() <= limit);
+            }
+            // Completions stay uncollected, independently of worker timing.
+            assert_eq!(d.outstanding, 2);
+            if limit != u64::MAX {
+                assert!(refused, "the caller's hard cap still stops read-ahead");
+            } else {
+                assert!(
+                    !refused,
+                    "small active runs must not strand larger read-ahead"
+                );
+                assert_eq!(d.pending.len(), 1);
+                let bound = d.pair_bound();
+                // Scanning farther into a fourth run cannot grow the extra slot.
+                let end = (pos + (1 << 15)).min(large.len());
+                hold(&mut d, &large[pos..end]);
+                pos = end;
+                d.scan().unwrap();
+                assert_eq!(d.pair_bound(), bound);
+            }
+            // Widen after seeing the backlog, then prove that either budget
+            // state still delivers every byte, including the partial run.
+            d.set_threads(3);
+            let mut decoded = alloc::vec![0; (1 << 16) + 4 * MIB];
+            let mut emitted = 0;
+            let mut finished = false;
+            for _ in 0..10_000 {
+                let end = (pos + (1 << 15)).min(large.len());
+                pos += d.feed(&large[pos..end]).unwrap();
+                if pos == large.len() {
+                    d.end_of_input();
+                }
+                let status = d
+                    .drain(|offset, bytes| {
+                        let start = offset as usize;
+                        decoded[start..start + bytes.len()].copy_from_slice(bytes);
+                        emitted += bytes.len();
+                    })
+                    .unwrap();
+                if status == DrainStatus::Finished {
+                    finished = true;
+                    break;
+                }
+                d.wait_for_worker();
+            }
+            assert!(finished, "decode must converge after read-ahead");
+            assert_eq!(emitted, decoded.len());
+            let expected: Vec<u8> = [(1 << 15, 0u8), (1 << 15, 0), (2 * MIB, 1), (2 * MIB, 2)]
+                .into_iter()
+                .flat_map(|(len, seed)| (0..len).map(move |i| seed.wrapping_add(i as u8)))
+                .collect();
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]

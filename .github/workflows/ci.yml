@@ -595,12 +595,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: The tree walk's, the zeroed allocation's and the direct block's tests under Miri
+      - name: Portable encoder unsafe invariants under Miri
         run: |
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
             --no-default-features --features std,enc \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
             enc::lz_find_mt::tests::a_direct_block_ \
+            enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
             enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
       - name: The same tests in the release build
         run: |
@@ -608,6 +609,7 @@ jobs:
             --no-default-features --features std,enc \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
             enc::lz_find_mt::tests::a_direct_block_ \
+            enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
             enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
 
   # Two minutes of the differential fuzz target per assembly architecture;

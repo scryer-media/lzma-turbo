@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.1 - 2026-10-11
+
+- Buffered LZMA2 encoding retains its completed output if the allocator
+  cannot shrink the result buffer. Successful shrinking still releases the
+  unused capacity without an extra output copy, for solid and parallel input.
+- Adaptive read-ahead accounts for larger following runs, including a run
+  still being scanned, without reserving output for the additional slots or
+  exceeding the caller's memory ceiling.
+- The worker-wait regression test explicitly dispatches and collects a result,
+  preserving its coverage regardless of worker completion timing.
+
 ## 0.9.0 - 2026-10-10
 
 - Reusing an LZMA encoder for an unsized stream clears the previous stream's
