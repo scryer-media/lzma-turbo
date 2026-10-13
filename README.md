@@ -48,54 +48,33 @@ checked once per symbol. This crate ports that shape rather than that lineage.
 
 ## Speed
 
-The latest 0.9.0 encoder measurements cover level-5 LZMA2, a 32 MiB
-dictionary, and 256 MiB seeded and zero-filled inputs on Linux x86-64.
-T2/T4 are total encoder thread budgets. Wall time includes reading input,
-encoding and teardown; CPU time is user plus system time, and RSS is process
-peak memory. Negative deltas mean less time or memory.
+Fleet measurements of 0.9.0 against xz 5.8.3 and 7-Zip 26.03 on four idle
+CPUs, 2026-10-13. Each cell is the geometric mean over every row that
+reference runs of reference / lzma-turbo, so above 1.00 means lzma-turbo
+took less wall time or less peak memory. 7-Zip decodes `.lzma` and `.7z`;
+xz decodes and encodes `.xz` and the branch filters. Every encode row
+produces output of the same size as the reference (size ratio 1.000), so
+the encode speedups are at the same compression ratio. A fifth host, an
+Apple M5 Max, ran beside other work and is shown on the benchmarks page as
+provisional only.
 
-Streaming API, medians of seven interleaved runs. All deltas compare official
-7zz 26.03 using matching file-stream paths:
+| CPU | threads | vs xz: decode wall | encode wall | peak RSS | vs 7-Zip: decode wall | peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zen 4 | 16 | 1.08 | 1.84 | 0.71 | 0.99 | 1.05 |
+| Graviton4 | 16 | 1.75 | 1.80 | 0.71 | 1.00 | 1.04 |
+| Alder Lake | 16 | 1.03 | 1.71 | 0.69 | 1.00 | 1.03 |
+| Zen 2 | 12 | 1.09 | 1.60 | 0.76 | 1.01 | 1.04 |
 
-| CPU | Input / threads | lzma-turbo / 7zz wall, s | Wall delta | CPU delta | RSS delta |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Zen 4 | Seeded T2 | 23.8382 / 25.3083 | -5.81% | -2.75% | -0.79% |
-| Zen 4 | Seeded T4 | 12.4523 / 13.2466 | -6.00% | -3.19% | -0.31% |
-| Zen 4 | Zeros T2 | 0.6610 / 0.8576 | -22.92% | -21.16% | -0.80% |
-| Zen 4 | Zeros T4 | 0.3759 / 0.4680 | -19.68% | -20.83% | -0.31% |
-| Sapphire Rapids | Seeded T2 | 31.1056 / 32.8723 | -5.37% | -2.09% | -0.80% |
-| Sapphire Rapids | Seeded T4 | 19.8918 / 20.6430 | -3.64% | -1.15% | -0.30% |
-| Sapphire Rapids | Zeros T2 | 0.9491 / 1.1496 | -17.44% | -16.52% | -0.79% |
-| Sapphire Rapids | Zeros T4 | 0.6885 / 0.7813 | -11.88% | -14.07% | -0.30% |
-
-Buffered API, retaining the complete input and output. Wall and CPU compare
-official 7zz; RSS compares the SDK's matching memory-input/memory-output API.
-Seeded timings are medians of seven runs, with three SDK RSS runs. The latest
-zero-input audit uses nine runs and a caller-owned input buffer advised for
-Linux huge pages before reading. That caller allocation policy is separate
-from the library's borrowed-slice API.
-
-| CPU | Input / threads | lzma-turbo / 7zz wall, s | Wall delta | CPU delta | RSS delta |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Zen 4 | Seeded T2 | 25.0118 / 25.2907 | -1.10% | +1.29% | +0.15% |
-| Zen 4 | Seeded T4 | 13.0178 / 13.2951 | -2.09% | +0.21% | -15.18% |
-| Zen 4 | Zeros T2 | 0.647505 / 0.853685 | -24.15% | -20.63% | +0.07% |
-| Zen 4 | Zeros T4 | 0.378183 / 0.468652 | -19.30% | -21.36% | +0.31% |
-| Sapphire Rapids | Seeded T2 | 32.0219 / 32.9671 | -2.87% | +1.66% | +0.18% |
-| Sapphire Rapids | Seeded T4 | 20.7564 / 20.5869 | +0.82% | +1.85% | -15.20% |
-| Sapphire Rapids | Zeros T2 | 0.964172 / 1.190745 | -19.03% | -13.95% | +0.09% |
-| Sapphire Rapids | Zeros T4 | 0.713363 / 0.814438 | -12.41% | -16.46% | +0.32% |
-
-Single-thread coverage uses 16 MiB inputs and solid blocks, seven timing runs
-and three matching SDK RSS runs. Across both CPUs and APIs, wall and CPU time
-are 53–79% lower than 7zz; peak RSS is at most 1.92% above the matching
-reference.
-
-These measurements cover the named encoder configurations. The latest audit
-did not remeasure decoding or ARM, macOS and Windows performance. Settings,
-absolute CPU/RSS figures, source fingerprints and all retained samples are in
-[docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md), with the raw evidence
-in its linked `.json.zst` files. To measure your own machine, use
+xz single-stream decode is 1.02 to 1.09x on x86-64 and 1.9x on Graviton4;
+encode is 1.2 to 3.1x faster than xz at every preset, thread count and
+filter. The rows that are not wins are the seven non-x86 branch filters on
+x86-64 CPUs (0.92 to 0.98 of xz) and peak RSS: the single-stream decode
+rows, every single-thread encode row and the two- and four-thread encode
+rows hold more than xz, while eight-thread and all-thread encode hold less. Every row on every host, with
+CPU time and the lzma-rust2 and liblzma comparisons, is in
+[docs/benchmarks.md](docs/benchmarks.md); the 0.9.0 encoder audit with its
+retained samples is in [docs/encoder-perf-0.9.0.md](docs/encoder-perf-0.9.0.md).
+To measure your own machine, use
 [`bench/lzma-turbo-bench`](bench/lzma-turbo-bench), which records peak RSS too.
 
 ## Status
@@ -337,6 +316,7 @@ aarch64 and windows-msvc x86-64 unless a stage says otherwise:
 | [`docs/porting.md`](docs/porting.md) | Port rules, C-to-Rust file map, acceptance gate. |
 | [`docs/encoder.md`](docs/encoder.md) | The encoder port: C-to-Rust file map, what was left out, how parity is proved. |
 | [`docs/benchmarking.md`](docs/benchmarking.md) | Fixtures, oracles and how to reproduce a measurement. |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Current fleet results on five CPUs: every row against xz, 7-Zip, lzma-rust2 and liblzma. |
 | [`docs/security.md`](docs/security.md) | Every limit the container layer enforces, and what each one stops. |
 | [`docs/publishing.md`](docs/publishing.md) | Release checklist. |
 | [`xtask`](xtask) | `cargo xtask`: the release checks, the fixture generator, the pre-commit hook and the asm-lab harness, in Rust with one dependency (`sha2`, to check downloads against pinned digests). Not published. |
