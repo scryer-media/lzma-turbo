@@ -8,6 +8,7 @@ use lzma_turbo::{Error, Lzma2Encoder, LzmaEncProps, LzmaEncoder, MatchFinderKind
 
 thread_local! {
     static REFUSE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static REFUSE_SHRINK: Cell<Option<usize>> = const { Cell::new(None) };
     static FAILURES: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -46,6 +47,20 @@ unsafe impl GlobalAlloc for Fallible {
         // SAFETY: every non-null allocation came from System with this layout.
         unsafe { System.dealloc(ptr, layout) }
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if new_size < layout.size()
+            && REFUSE_SHRINK
+                .try_with(|slot| slot.get() == Some(layout.size()))
+                .unwrap_or(false)
+        {
+            let _ = FAILURES.try_with(|count| count.set(count.get() + 1));
+            return core::ptr::null_mut();
+        }
+        // SAFETY: the original System allocation and layout are unchanged;
+        // GlobalAlloc's caller supplies a valid, nonzero new size.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
 }
 
 #[global_allocator]
@@ -54,6 +69,12 @@ static ALLOCATOR: Fallible = Fallible;
 struct Refusal;
 
 impl Refusal {
+    fn shrink(capacity: usize) -> Self {
+        FAILURES.set(0);
+        REFUSE_SHRINK.set(Some(capacity));
+        Self
+    }
+
     fn new(size: usize, align: usize) -> Self {
         FAILURES.set(0);
         REFUSE.set(Some((size, align)));
@@ -64,6 +85,43 @@ impl Refusal {
 impl Drop for Refusal {
     fn drop(&mut self) {
         REFUSE.set(None);
+        REFUSE_SHRINK.set(None);
+    }
+}
+
+#[test]
+fn result_shrink_failure_preserves_solid_and_parallel_output() {
+    const BLOCK: usize = 1 << 16;
+    let props = LzmaEncProps::new().with_dict_size(1 << 15);
+    // Empty block-thread input takes the single-thread Vec writer rather
+    // than the bounded parallel destination, so exercise that shrink with
+    // enough data to dispatch multiple blocks.
+    for (src, parallel) in [
+        (Vec::new(), false),
+        (vec![b'z'; 3 * BLOCK + 123], false),
+        (vec![b'z'; 3 * BLOCK + 123], true),
+    ] {
+        let mut enc = Lzma2Encoder::new(&props).unwrap();
+        if parallel {
+            enc.set_block_size(BLOCK as u64);
+            enc.set_threads(3);
+        }
+        let want = enc.encode_to_vec(&src).unwrap();
+        assert_eq!(want.capacity(), want.len(), "successful shrink");
+        let capacity = if parallel {
+            let blocks = src.len().div_ceil(BLOCK).max(1);
+            let tail = src.len() - (blocks - 1) * BLOCK;
+            (blocks - 1) * (BLOCK + (BLOCK >> 10) + 16) + tail + (tail >> 10) + 16
+        } else {
+            src.len() + (src.len() >> 10) + 16
+        };
+        let refusal = Refusal::shrink(capacity);
+        let result = enc.encode_to_vec(&src);
+        drop(refusal);
+        assert_eq!(FAILURES.get(), 1, "must exercise the final shrink");
+        let got = result.expect("shrinking is optional after successful encoding");
+        assert_eq!(got.capacity(), capacity, "keep the original allocation");
+        assert_eq!(got, want, "parallel={parallel}, input={}", src.len());
     }
 }
 

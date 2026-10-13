@@ -761,7 +761,14 @@ fn waiting_for_a_worker_takes_in_a_finished_run() {
     }
     // Deliberately no `end_of_input` until the buffer is exhausted: that is
     // what makes `drain` return rather than wait.
-    let mut waited = 0usize;
+    // Dispatch once without another drain collecting the result first. Even
+    // if the worker finishes immediately, its result remains outstanding
+    // until this explicit wait consumes it.
+    dec.drain_upto(0, |o, b| sink.put(o, b)).expect("dispatch");
+    assert!(
+        dec.wait_for_worker(),
+        "the dispatched result was not collected"
+    );
     let mut drains = 0usize;
     loop {
         drains += 1;
@@ -775,13 +782,11 @@ fn waiting_for_a_worker_takes_in_a_finished_run() {
             continue;
         }
         if dec.wait_for_worker() {
-            waited += 1;
             continue;
         }
         dec.end_of_input();
     }
     assert_eq!(sink.bytes(), plain);
-    assert!(waited > 0, "no wait was ever needed, so nothing was tested");
     assert!(!dec.wait_for_worker(), "a run outlived the finished stream");
 }
 
