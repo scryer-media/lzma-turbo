@@ -43,6 +43,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod buffer;
 #[cfg(feature = "enc")]
 mod enc;
 mod error;
@@ -58,6 +59,8 @@ mod lzma_alone;
 mod mt;
 #[cfg(feature = "std")]
 mod reader;
+#[cfg(feature = "std")]
+pub mod run;
 
 #[cfg(feature = "xz")]
 pub mod xz;

@@ -90,6 +90,7 @@ impl SeqInStream for Source {
 /// The encoder's view of the output channel.
 struct Sink {
     tx: Sender<Vec<u8>>,
+    spare: Receiver<Vec<u8>>,
     buf: Vec<u8>,
 }
 
@@ -106,6 +107,10 @@ impl Sink {
 
 impl SeqOutStream for Sink {
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.buf.capacity() == 0 {
+            self.buf = self.spare.try_recv().unwrap_or_default();
+            self.buf.clear();
+        }
         self.buf.try_reserve(data.len()).map_err(|_| Error::Alloc)?;
         self.buf.extend_from_slice(data);
         if self.buf.len() >= OUT_BATCH {
@@ -121,6 +126,7 @@ pub(crate) struct Lzma2Pipe {
     input: Option<SyncSender<Vec<u8>>>,
     spent: Receiver<Vec<u8>>,
     output: Receiver<Vec<u8>>,
+    recycled_output: SyncSender<Vec<u8>>,
     worker: Option<JoinHandle<Result<(), Error>>>,
     /// The chunk being filled from the caller's writes.
     fill: Vec<u8>,
@@ -139,6 +145,7 @@ impl Lzma2Pipe {
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH);
         let (spent_tx, spent_rx) = mpsc::channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+        let (recycled_tx, recycled_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH + 1);
         // The encoder goes over only once the thread exists, so that a failed
         // spawn - whose closure is dropped - does not take it down with it.
         let (enc_tx, enc_rx) = mpsc::sync_channel::<Lzma2Encoder>(1);
@@ -155,6 +162,7 @@ impl Lzma2Pipe {
                 };
                 let mut sink = Sink {
                     tx: output_tx,
+                    spare: recycled_rx,
                     buf: Vec::new(),
                 };
                 enc.set_data_size(u64::MAX);
@@ -175,6 +183,7 @@ impl Lzma2Pipe {
             input: Some(input_tx),
             spent: spent_rx,
             output: output_rx,
+            recycled_output: recycled_tx,
             worker: Some(worker),
             fill: Vec::new(),
             produced: 0,
@@ -241,7 +250,7 @@ impl Lzma2Pipe {
         self.send(Vec::new(), out)?;
         drop(self.input.take());
         while let Ok(chunk) = self.output.recv() {
-            self.append(&chunk, out)?;
+            self.append(chunk, out)?;
         }
         match self.worker.take().map(JoinHandle::join) {
             Some(Ok(Ok(()))) => Ok(self.produced),
@@ -273,15 +282,18 @@ impl Lzma2Pipe {
     /// Appends whatever output is ready without waiting for more.
     fn drain(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
         while let Ok(chunk) = self.output.try_recv() {
-            self.append(&chunk, out)?;
+            self.append(chunk, out)?;
         }
         Ok(())
     }
 
-    fn append(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    fn append(&mut self, chunk: Vec<u8>, out: &mut Vec<u8>) -> Result<(), Error> {
         out.try_reserve(chunk.len()).map_err(|_| Error::Alloc)?;
-        out.extend_from_slice(chunk);
+        out.extend_from_slice(&chunk);
         self.produced += chunk.len() as u64;
+        // Recycling never waits for the producer, including during shutdown.
+        // The bounded return queue releases surplus allocations after a burst.
+        let _ = self.recycled_output.try_send(chunk);
         Ok(())
     }
 

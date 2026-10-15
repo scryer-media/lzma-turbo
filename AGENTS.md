@@ -28,23 +28,52 @@ port rules and what was left out are in `docs/encoder.md`.
 
    - Tree/table pointer access and the portable register walk:
      `the_unchecked_walk_is_the_checked_walk_on_any_tables`,
-     `the_walk_refuses_what_it_cannot_vouch_for`, and the five
+     `the_walk_refuses_what_it_cannot_vouch_for`, and the six
      `the_register_walk_*` tests in `src/enc/lz_find_mt.rs`. Native and Miri;
-     Miri exercises the portable walk and its entry-margin wrapper.
-   - x86-64 `sdk_walk` in `src/enc/bt_kernel_x86_64.S`: native-only; the
-     production encoder selects it with `asm` enabled. The five
+     Miri exercises the portable walk and its entry-margin wrapper, including
+     unaligned whole-node copies and repeated nodes at each output boundary.
+     ARM64 production builds with `asm` select this portable walk; it is Rust
+     pointer code, covered by both native differential tests and Miri.
+   - x86-64 assembly kernels: native-only. The fixed `asm` candidate selects
+     `sdk_walk_faithful` in `src/enc/bt_kernel_x86_64_sdk.S`, the complete
+     upstream expansion. The six
      `the_register_walk_*` tests also invoke it directly and compare answers,
      mutated trees and output against the checked walk, including invalid
      margins, short output, SDK modes/error order, and every word/tail.
-     Miri never executes this assembly.
-   - `zeroed_vec`: `a_zeroed_vec_is_zeroes_of_every_zeroable_type` in
-     `src/enc/lz_find.rs`, native and Miri.
+     The earlier `sdk_walk` in `src/enc/bt_kernel_x86_64.S` remains available
+     to native tests and the non-default `kernel-ab` feature.
+     `sdk_walk_faithful_wide` in
+     `src/enc/bt_kernel_x86_64_sdk_wide.S` retains that flow with the bounded
+     match extension, also only for tests and `kernel-ab`. All six tests
+     explicitly run all three variants through the same margin wrapper; no
+     environment mutation is needed to select a test variant. Miri never
+     executes assembly.
+   - Shared decoder/encoder `zeroed_vec` in `src/buffer.rs`:
+     `a_zeroed_vec_is_zeroes_of_every_zeroable_type` in `src/enc/lz_find.rs`
+     exercises the common allocator through the encoder wrapper, native and
+     Miri. `decoder_dictionary_allocation_failure_is_recoverable` checks both
+     decoder constructors under allocation refusal natively. Huge-page advice
+     remains encoder-only; the decoder allocation uses only `core` and `alloc`.
    - Shared finder storage and borrowed direct-input lifetime/ownership in
      `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
      `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,
      cancellation and reuse tests cover the threaded lifecycle as well.
      `a_streamed_window_is_counted_when_reusing_a_block_coder` also checks
      retained-window accounting between streams, natively.
+     Shared window references must be constructed directly from the raw base
+     through the consumer's published prefix, never over the writable append
+     tail. `the_published_window_stays_disjoint_from_hash_append` holds the
+     real window accessor across a synchronized `read_block` short read and
+     EOF. The other `the_published_window_*` tests cover physical clamping,
+     history, stored chunks, reuse and parked fallback state. These new tests
+     are selected by the native and Miri kernel CI filters. Native validation
+     of the bounded-prefix correction passes; Miri remains pending and is
+     reserved for the final capstone. Native passes alone do not prove this
+     reference invariant.
+     The safe owned-input transfer into the single-threaded finder is covered
+     by `owned_blocks_match_copied_windows_and_return_their_allocation` in
+     `src/enc/lzma2_enc.rs`, natively and under Miri, including write errors
+     and reuse through both owned and copied windows.
    - `shrink_result` owns a global-allocator byte vector and only reallocates
      to a nonzero size below its capacity; a null return preserves ownership.
      `shrinking_a_result_preserves_bytes_and_releases_capacity` checks empty,
@@ -55,11 +84,46 @@ port rules and what was left out are in `docs/encoder.md`.
      allocations, reallocations and deallocations to `System`, and injects
      null returns for selected layouts. Its native tests are
      `hash_chain_head_allocation_failure_is_recoverable`,
+     `decoder_dictionary_allocation_failure_is_recoverable`,
      `failed_reconfiguration_keeps_the_allocated_coder_usable`, and the
      result-shrink failure test above; this allocator is not part of the
      library or the Miri kernel job.
    - Low-hash/table access in `mix_matches_kind`:
      `the_mix_matches_kernel_matches_checked_tables`, native and Miri.
+     The `mix_matches_sdk` position-relative address path, selected by the
+     fixed x86-64 `asm` candidate, is also
+     covered by `the_sdk_consumer_preserves_checked_streams_and_normalization`
+     and `the_sdk_consumer_preserves_checked_held_block_tails`, comparing
+     full LZ-owned state and outputs with the checked consumer across all
+     finder families, both tail rules, and normalization. Native stream
+     coverage explicitly proves window slides; Miri bounds the stream size.
+   - `HeldRecords`, `consume_matches` and `consume_skip` in
+     `src/enc/lz_find_mt.rs`: only real producer acquisition certifies the
+     complete record partition. Raw pointers stay in one held block, and
+     only numeric positions survive handoff. Output capacity is checked
+     independently; short outputs and synthetic state retain the indexed
+     fallback. Reset, allocation replacement and teardown revoke provenance.
+     `held_records_preserve_short_output_and_synthetic_failure_state` checks
+     full fallback state and output; the stream/normalization consumer tests,
+     `skip_spans_preserve_checked_streams_and_normalization`, and
+     `a_direct_block_is_read_as_the_copied_window_is` compare independent
+     indexed consumption through interleavings, slides, cancellation and
+     reuse. `the_sdk_fused_consumer_preserves_produced_threaded_tails`
+     compares the fused positional BT4 consumer with the checked indexed
+     consumer on actual producer records, including short tails, full output
+     sentinels and consumer state. It passes natively; Miri remains pending.
+     The register-walk tests also check successful record partitions
+     for every native backend. Portable cursor Miri validation is required
+     at the final capstone and remains pending; native tests do not establish
+     Miri verification, and Miri never verifies the assembly producers.
+   - High-hash table access in `get_heads` / `heads_loop`:
+     `get_heads_matches_the_indexed_loop` compares heads and the entire
+     mutated table against the indexed oracle for all seven families natively.
+     Miri uses bounded 16-bit tables for trusted H2/H3/H4/H5. Big families
+     retain full 24-bit trusted-domain native coverage; Miri exercises their
+     checked fallback through `get_heads_domain_fallback_preserves_checked_mutations`,
+     including arbitrary masks/CRC values, short tables/windows, and mutations
+     before a panic. `get_heads_refuses_a_short_window` checks entry rejection.
    - `EncodeWindow` byte/word reads and parser `match_word!` / `opt!`
      indexing: `encoder_window_reads_match_the_checked_parser` in
      `src/enc/lzma_enc.rs`, native and Miri, across finder families, parser
@@ -72,6 +136,18 @@ port rules and what was left out are in `docs/encoder.md`.
    - `madvise_hugepage`: `the_advice_covers_only_whole_huge_pages_inside_the_buffer`
      checks the range, and `the_kernel_takes_the_advice_and_the_bytes_are_unchanged`
      checks the real FFI call natively on Linux. Miri has no `madvise`.
+   - SDK normalization kernels in `src/enc/lz_find/normalize.rs`:
+     `normalization_matches_scalar_at_every_alignment_and_tail` checks prefix,
+     bulk and tail against scalar saturation, including every word alignment.
+     `normalization_x86_kernels_match_scalar` directly exercises SSE4.1 and
+     AVX2 after runtime feature checks, natively only. Miri selects the scalar
+     path and cannot verify the architecture kernels; ARM needs native tests.
+   - Diagnostic BCJ2 pointer cursors in `src/filters/bcj2/cursor.rs`:
+     `sdk_cursor_matches_checked_at_every_stream_and_output_edge` and
+     `sdk_cursor_matches_checked_for_malformed_streams` compare output, input
+     consumption, error and every decoder-state field, natively and in the
+     Miri kernel job. The port is available only to tests and `kernel-ab`;
+     default production decoding retains the checked slice implementation.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only
    library dependencies the crate may take are `crc-fast`, behind the `crc`

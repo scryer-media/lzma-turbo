@@ -341,9 +341,12 @@ impl<W: Write> XzWriter<W> {
                 self.out = out;
             } else {
                 self.out.append(&mut out);
+                self.enc.recycle_output(out);
             }
         }
-        send(self.inner.as_mut().expect("open"), &mut self.out)
+        send(self.inner.as_mut().expect("open"), &mut self.out)?;
+        self.enc.recycle_output(core::mem::take(&mut self.out));
+        Ok(())
     }
 }
 

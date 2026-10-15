@@ -14,9 +14,14 @@
 //!
 //! - `LZMA_TURBO_MATCH_RUN`: `scalar`, `w8` (default) or `w16`.
 //! - `LZMA_TURBO_BCJ_SCAN`: `scalar` or `wide` (default).
+//! - `LZMA_TURBO_BCJ2`: `sdk` for the complete cursor kernel or `checked`
+//!   (default) for the shipping slice decoder.
 //! - `LZMA_TURBO_DELTA`: `scalar` or `block` (default).
 //! - `LZMA_TURBO_TREE_KERNEL`: `slice` or `reg`, the bt thread's tree walk
-//!   (the default is what the build ships: `reg` on x86-64 with `asm`).
+//!   (the default is what the build ships: `reg` on x86-64 and ARM64 with `asm`).
+//! - `LZMA_TURBO_BT_ASM`: `sdk` for the complete upstream x86-64 walk,
+//!   `sdk-wide` for that flow with the bounded match extension, or
+//!   `current` (default) for the shipping register/word-scan variant.
 //! - `LZMA_TURBO_ENCODER`: `checked` for checked parser window reads and
 //!   low-hash accesses, or `unchecked` (default).
 //! - `LZMA_TURBO_FINDER`: `st` for the C's single-threaded match finder where
@@ -60,6 +65,12 @@ pub(crate) fn bcj_scan_wide() -> bool {
     cached(&CACHED, "LZMA_TURBO_BCJ_SCAN", |v| u8::from(v != "scalar")) == 1
 }
 
+/// Whether the diagnostic BCJ2 decoder uses the complete SDK cursor port.
+pub(crate) fn bcj2_sdk() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_BCJ2", |v| u8::from(v == "sdk")) == 1
+}
+
 /// Whether the delta decoder adds a block at a time at wide distances.
 /// `false` is the C's byte-at-a-time recurrence.
 pub(crate) fn delta_blocked() -> bool {
@@ -74,8 +85,28 @@ pub(crate) fn tree_kernel_reg() -> bool {
     cached(&CACHED, "LZMA_TURBO_TREE_KERNEL", |v| match v {
         "slice" => 0,
         "reg" => 1,
-        _ => u8::from(cfg!(all(feature = "asm", target_arch = "x86_64"))),
+        _ => u8::from(cfg!(all(
+            feature = "asm",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))),
     }) == 1
+}
+
+/// Diagnostic x86-64 walk selection; normal builds retain their fixed kernel.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+pub(crate) fn bt_variant() -> u8 {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_BT_ASM", |v| match v {
+        "sdk" => 1,
+        "sdk-wide" => 2,
+        _ => 0,
+    })
+}
+
+/// Diagnostic SDK consumer call boundary and position-relative addressing.
+pub(crate) fn sdk_mixer() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(UNSET);
+    cached(&CACHED, "LZMA_TURBO_MIXER", |v| u8::from(v == "sdk")) == 1
 }
 
 /// Whether encoder window reads use the checked differential oracle.

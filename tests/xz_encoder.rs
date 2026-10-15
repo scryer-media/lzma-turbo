@@ -318,6 +318,23 @@ fn every_filter_chain_streams() {
     }
 }
 
+#[test]
+fn a_large_filtered_write_preserves_the_streamed_payload() {
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 18);
+    let data = mixed(0x5eed_0009, 700_013.min(max_len()));
+    for (tag, filters) in chains() {
+        let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
+        writer.set_filters(&filters).unwrap();
+        writer.write_all(&data).unwrap();
+        let streamed = writer.finish().unwrap();
+        let whole = encode_xz_with_filters(&data, &props, CheckType::Crc64, 0, &filters).unwrap();
+        if data.len() > 1 << 18 {
+            assert_streamed_form(&streamed, &whole, &tag);
+        }
+        decode_every_way(&streamed, &data, &tag);
+    }
+}
+
 /// Up to the dictionary the block is held and compressed at the end, with its
 /// sizes declared: the bytes are the one-shot encode's exactly. One byte more
 /// and it streams.

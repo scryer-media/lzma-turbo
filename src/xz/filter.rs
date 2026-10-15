@@ -331,53 +331,156 @@ impl Converters {
     }
 
     fn run(&mut self, data: &[u8], out: &mut Vec<u8>, flush: bool, encode: bool) {
-        // `cur` walks down the stages; `scratch` is the other half of a
-        // double buffer so no stage allocates per call.
         let mut cur = core::mem::take(&mut self.scratch);
-        cur.clear();
-        cur.extend_from_slice(data);
+        let room = data.len() + self.max_carry();
+        if cur.len() < room {
+            cur.reserve_exact(room - cur.len());
+            cur.resize(room, 0);
+        }
+        let start = self.carried_bytes();
+        cur[start..start + data.len()].copy_from_slice(data);
+        let done = self.run_buffer(&mut cur, data.len(), flush, encode);
+        out.extend_from_slice(&cur[..done]);
+        self.scratch = cur;
+    }
 
-        let mut next = Vec::new();
+    pub(crate) fn carried_bytes(&self) -> usize {
+        self.stages.iter().map(|stage| stage.carry.len()).sum()
+    }
+
+    // XzUnpacker_Code applies size-preserving filters to the decoded buffer.
+    // The block decoder already owns that buffer; only the short tails need
+    // separate storage between calls. New input starts after carried_bytes()
+    // bytes of prefix room; each stage prepends its tail without moving input.
+    pub(crate) fn decode_buffer(&mut self, data: &mut [u8], len: usize, flush: bool) -> usize {
+        self.run_buffer(data, len, flush, false)
+    }
+
+    fn run_buffer(&mut self, buf: &mut [u8], mut len: usize, flush: bool, encode: bool) -> usize {
+        // Keep initialized storage separate from the valid output length.
+        // Reusing it then needs no zero-fill before the next decoder write.
+        let mut start = self.carried_bytes();
+        debug_assert!(buf.len() >= len + start);
         let stages = self.stages.len();
         for k in 0..stages {
             // `stages` is decode order; an encoder runs it backwards, as
             // `encode_in_place` does.
             let stage = &mut self.stages[if encode { stages - 1 - k } else { k }];
-            let mut buf = core::mem::take(&mut stage.carry);
-            buf.extend_from_slice(&cur);
+            let carry = stage.carry.len();
+            start -= carry;
+            if carry != 0 {
+                buf[start..start + carry].copy_from_slice(&stage.carry);
+                len += carry;
+            }
+            let data = &mut buf[start..start + len];
             let done = match &mut stage.conv {
                 Conv::Delta(d) => {
                     if encode {
-                        d.encode(&mut buf);
+                        d.encode(data);
                     } else {
-                        d.decode(&mut buf);
+                        d.decode(data);
                     }
-                    buf.len()
+                    len
                 }
                 Conv::Bcj(b) => {
                     let n = if encode {
-                        b.encode(&mut buf)
+                        b.encode(data)
                     } else {
-                        b.decode(&mut buf)
+                        b.decode(data)
                     };
-                    if flush { buf.len() } else { n }
+                    if flush { len } else { n }
                 }
             };
-            next.clear();
-            next.extend_from_slice(&buf[..done]);
-            buf.drain(..done);
-            stage.carry = buf;
-            core::mem::swap(&mut cur, &mut next);
+            stage.carry.clear();
+            stage
+                .carry
+                .extend_from_slice(&buf[start + done..start + len]);
+            len = done;
         }
-        out.extend_from_slice(&cur);
-        cur.clear();
-        self.scratch = cur;
+        len
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_filter_chains_match_whole_blocks_at_every_tail() {
+        for id in 0x04..=0x0B {
+            for chained in [false, true] {
+                let mut filters = Vec::new();
+                if chained {
+                    filters.push(flags(FILTER_DELTA, &[3]));
+                    filters.push(flags(0x04, &[]));
+                }
+                filters.push(flags(id, &[]));
+                filters.push(flags(FILTER_LZMA2, &[0]));
+                let chain = FilterChain::validate(&filters).unwrap();
+                for len in [0, 1, 3, 17, 1031, 65_571] {
+                    let mut seed = 0x1234_5678u32;
+                    let original: Vec<u8> = (0..len)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed as u8
+                        })
+                        .collect();
+                    let mut encoded = original.clone();
+                    chain.build().unwrap().encode_in_place(&mut encoded);
+                    let widths: &[usize] = if len > 1031 {
+                        &[65_535, 65_536, 65_537]
+                    } else {
+                        &[1, 2, 3, 4, 7, 15, 16, 17, 63, 257]
+                    };
+                    for &width in widths {
+                        let mut encoder = chain.build().unwrap();
+                        let mut packed = Vec::new();
+                        for part in original.chunks(width) {
+                            encoder.encode_push(part, &mut packed);
+                            encoder.encode_push(&[], &mut packed);
+                        }
+                        encoder.encode_finish(&[], &mut packed);
+                        assert_eq!(packed, encoded, "encode {id} {chained} {len} {width}");
+
+                        for owned in [false, true] {
+                            let mut decoder = chain.build().unwrap();
+                            let mut decoded = Vec::new();
+                            let mut buffer = Vec::new();
+                            for part in encoded.chunks(width) {
+                                if owned {
+                                    let room = part.len() + decoder.carried_bytes();
+                                    if buffer.len() < room {
+                                        buffer.resize(room, 0xa5);
+                                    }
+                                    let start = decoder.carried_bytes();
+                                    buffer[start..start + part.len()].copy_from_slice(part);
+                                    let done =
+                                        decoder.decode_buffer(&mut buffer, part.len(), false);
+                                    decoded.extend_from_slice(&buffer[..done]);
+                                } else {
+                                    decoder.push(part, &mut decoded);
+                                }
+                                assert!(decoder.stages.iter().all(|s| s.carry.len() <= 19));
+                            }
+                            if owned {
+                                if buffer.len() < decoder.carried_bytes() {
+                                    buffer.resize(decoder.carried_bytes(), 0xa5);
+                                }
+                                let done = decoder.decode_buffer(&mut buffer, 0, true);
+                                decoded.extend_from_slice(&buffer[..done]);
+                            } else {
+                                decoder.finish(&[], &mut decoded);
+                            }
+                            assert_eq!(decoded, original, "decode {id} {chained} {len} {width}");
+                            assert!(decoder.stages.iter().all(|s| s.carry.is_empty()));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn flags(id: u64, props: &[u8]) -> FilterFlags {
         let mut p = [0u8; MAX_PROPS];

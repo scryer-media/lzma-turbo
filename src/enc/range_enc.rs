@@ -2,8 +2,8 @@
 //!
 //! C: `CRangeEnc` and the `RC_*` macros in `C/LzmaEnc.c`.
 //!
-//! The literal routines keep `range` in a local across RC_BIT operations,
-//! as the C does, and write it back when the routine ends. ShiftLow only
+//! Symbol routines keep `range` in a local across RC_BIT operations,
+//! as the C does, and write it back at the SDK's group boundaries. ShiftLow only
 //! changes the low/output state, so it cannot force range through memory.
 //! Callers pass the actual probability cell, as the SDK does. RC_BIT writes
 //! it before normalization, avoiding a deferred copy-back across ShiftLow.
@@ -17,7 +17,7 @@ use crate::error::Error;
 /// C: CRangeEnc's output-stream handle. A stable address for the borrowed
 /// stream gives ShiftLow one output-handle pointer across a literal's bits.
 /// This binding lives on the stack and borrows the stream for the call.
-struct RangeOutput<'a>(&'a mut dyn SeqOutStream);
+pub(super) struct RangeOutput<'a>(pub(super) &'a mut dyn SeqOutStream);
 
 /// C: `CRangeEnc`.
 pub(crate) struct RangeEnc {
@@ -118,17 +118,18 @@ impl RangeEnc {
 
     /// C: `RC_NORM`.
     #[inline]
-    fn norm(&mut self, out: &mut dyn SeqOutStream) {
-        if self.range < K_TOP_VALUE {
-            self.range <<= 8;
-            self.shift_low(&mut RangeOutput(out));
+    pub(super) fn norm_with_range(&mut self, mut range: u32, out: &mut RangeOutput<'_>) -> u32 {
+        if range < K_TOP_VALUE {
+            range <<= 8;
+            self.shift_low(out);
         }
+        range
     }
 
     /// C: `RC_BIT`, selecting the bound or remainder directly while retaining
     /// its branchless low/probability updates. Every caller supplies one bit.
     #[inline(always)]
-    fn encode_bit_with_range(
+    pub(super) fn encode_bit_with_range(
         &mut self,
         mut range: u32,
         prob: &mut u16,
@@ -157,59 +158,67 @@ impl RangeEnc {
         range
     }
 
-    /// C: RC_BIT with a range value stored back after this one bit.
-    #[inline]
-    pub(crate) fn encode_bit(&mut self, prob: &mut u16, bit: u32, out: &mut dyn SeqOutStream) {
-        self.range = self.encode_bit_with_range(self.range, prob, bit, &mut RangeOutput(out));
-    }
-
     /// C: `RC_BIT_0_BASE`.
     #[inline]
-    pub(crate) fn encode_bit_0_base(&mut self, prob: &mut u16) {
+    pub(super) fn encode_bit_0_base_with_range(&mut self, range: u32, prob: &mut u16) -> u32 {
         let ttt = u32::from(*prob);
-        let new_bound = (self.range >> K_NUM_BIT_MODEL_TOTAL_BITS) * ttt;
-        self.range = new_bound;
+        let new_bound = (range >> K_NUM_BIT_MODEL_TOTAL_BITS) * ttt;
         *prob = (ttt + ((K_BIT_MODEL_TOTAL - ttt) >> K_NUM_MOVE_BITS)) as u16;
+        new_bound
     }
 
     /// C: `RC_BIT_1_BASE`.
     #[inline]
-    pub(crate) fn encode_bit_1_base(&mut self, prob: &mut u16) {
+    pub(super) fn encode_bit_1_base_with_range(&mut self, range: u32, prob: &mut u16) -> u32 {
         let ttt = u32::from(*prob);
-        let new_bound = (self.range >> K_NUM_BIT_MODEL_TOTAL_BITS) * ttt;
-        self.range -= new_bound;
+        let new_bound = (range >> K_NUM_BIT_MODEL_TOTAL_BITS) * ttt;
         self.low += u64::from(new_bound);
         *prob = (ttt - (ttt >> K_NUM_MOVE_BITS)) as u16;
+        range - new_bound
     }
 
     /// C: `RC_BIT_0`, which is `RC_BIT_0_BASE` then `RC_NORM`.
     #[inline]
-    pub(crate) fn encode_bit_0(&mut self, prob: &mut u16, out: &mut dyn SeqOutStream) {
-        self.encode_bit_0_base(prob);
-        self.norm(out);
+    pub(super) fn encode_bit_0_with_range(
+        &mut self,
+        range: u32,
+        prob: &mut u16,
+        out: &mut RangeOutput<'_>,
+    ) -> u32 {
+        let range = self.encode_bit_0_base_with_range(range, prob);
+        self.norm_with_range(range, out)
     }
 
     /// C: `RC_BIT_1`.
     #[inline]
-    pub(crate) fn encode_bit_1(&mut self, prob: &mut u16, out: &mut dyn SeqOutStream) {
-        self.encode_bit_1_base(prob);
-        self.norm(out);
+    pub(super) fn encode_bit_1_with_range(
+        &mut self,
+        range: u32,
+        prob: &mut u16,
+        out: &mut RangeOutput<'_>,
+    ) -> u32 {
+        let range = self.encode_bit_1_base_with_range(range, prob);
+        self.norm_with_range(range, out)
     }
 
-    /// C: the `RC_NORM` that follows a bare `RC_BIT_*_BASE` in
-    /// `LzmaEnc_CodeOneBlock`.
+    /// C: `RangeEnc_EncodeBit_0`, used for the first literal's match flag.
     #[inline]
-    pub(crate) fn norm_pub(&mut self, out: &mut dyn SeqOutStream) {
-        self.norm(out);
+    pub(crate) fn encode_bit_0(&mut self, prob: &mut u16, out: &mut dyn SeqOutStream) {
+        self.range = self.encode_bit_0_with_range(self.range, prob, &mut RangeOutput(out));
     }
 
     /// C: the inlined `RangeEnc_EncodeDirectBits` in `LzmaEnc_CodeOneBlock`'s
     /// far-distance branch and in `WriteEndMarker`.
     #[inline]
-    pub(crate) fn encode_direct_bit(&mut self, add: u32, out: &mut dyn SeqOutStream) {
-        self.range >>= 1;
-        self.low += u64::from(self.range & add);
-        self.norm(out);
+    pub(super) fn encode_direct_bit_with_range(
+        &mut self,
+        range: u32,
+        add: u32,
+        out: &mut RangeOutput<'_>,
+    ) -> u32 {
+        let range = range >> 1;
+        self.low += u64::from(range & add);
+        self.norm_with_range(range, out)
     }
 
     /// C: `LitEnc_Encode`.
@@ -266,14 +275,160 @@ impl RangeEnc {
         sym: u32,
         out: &mut dyn SeqOutStream,
     ) {
+        let mut bound = RangeOutput(out);
+        let mut range = self.range;
         let mut m = 1usize;
         let mut sym = sym;
         for _ in 0..num_bits {
             let bit = sym & 1;
             sym >>= 1;
             let prob = &mut probs[m];
-            self.encode_bit(prob, bit, out);
+            range = self.encode_bit_with_range(range, prob, bit, &mut bound);
             m = (m << 1) | bit as usize;
+        }
+        self.range = range;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RangeEnc, RangeOutput};
+    use crate::enc::consts::*;
+    use crate::enc::price::LenEnc;
+    use crate::enc::stream::SeqOutStream;
+    use crate::error::Error;
+    use alloc::vec::Vec;
+
+    struct Sink {
+        bytes: Vec<u8>,
+        calls: usize,
+        fail_at: usize,
+    }
+
+    impl SeqOutStream for Sink {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            let call = self.calls;
+            self.calls += 1;
+            if call == self.fail_at {
+                return Err(Error::Write);
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    // C: the checked, branching RC_BIT definition, with a field writeback
+    // after every bit instead of the production symbol-local range.
+    fn reference_bit(rc: &mut RangeEnc, prob: &mut u16, bit: u32, out: &mut Sink) {
+        let value = u32::from(*prob);
+        let bound = (rc.range >> K_NUM_BIT_MODEL_TOTAL_BITS) * value;
+        if bit == 0 {
+            rc.range = bound;
+            *prob = (value + ((K_BIT_MODEL_TOTAL - value) >> K_NUM_MOVE_BITS)) as u16;
+        } else {
+            rc.range -= bound;
+            rc.low += u64::from(bound);
+            *prob = (value - (value >> K_NUM_MOVE_BITS)) as u16;
+        }
+        if rc.range < K_TOP_VALUE {
+            rc.range <<= 8;
+            rc.shift_low(&mut RangeOutput(out));
+        }
+    }
+
+    fn reference_tree(
+        rc: &mut RangeEnc,
+        probs: &mut [u16],
+        bits: u32,
+        sym: u32,
+        reverse: bool,
+        out: &mut Sink,
+    ) {
+        let mut node = 1;
+        for i in 0..bits {
+            let bit = (sym >> if reverse { i } else { bits - i - 1 }) & 1;
+            reference_bit(rc, &mut probs[node], bit, out);
+            node = (node << 1) | bit as usize;
+        }
+    }
+
+    fn reference_length(rc: &mut RangeEnc, len: &mut LenEnc, sym: u32, pos: u32, out: &mut Sink) {
+        let mut base = 0;
+        let mut sym = sym;
+        reference_bit(rc, &mut len.low[0], u32::from(sym >= 8), out);
+        if sym >= 8 {
+            reference_bit(rc, &mut len.low[8], u32::from(sym >= 16), out);
+            if sym >= 16 {
+                reference_tree(rc, &mut len.high, 8, sym - 16, false, out);
+                return;
+            }
+            base = 8;
+            sym -= 8;
+        }
+        base += (pos as usize) << 4;
+        reference_tree(rc, &mut len.low[base..], 3, sym, false, out);
+    }
+
+    #[test]
+    fn range_local_length_and_reverse_trees_match_bitwise_reference() {
+        for fail_at in [usize::MAX, 0, 1] {
+            let mut actual = RangeEnc::new().unwrap();
+            let mut expected = RangeEnc::new().unwrap();
+            let mut lengths = LenEnc::new();
+            let mut expected_lengths = lengths.clone();
+            let mut tree = [K_PROB_INIT_VALUE; 64];
+            let mut expected_tree = tree;
+            let mut out = Sink {
+                bytes: Vec::new(),
+                calls: 0,
+                fail_at,
+            };
+            let mut reference_out = Sink {
+                bytes: Vec::new(),
+                calls: 0,
+                fail_at,
+            };
+            for round in 0..16 {
+                for pos in 0..16 {
+                    for sym in 0..272 {
+                        lengths.encode(&mut actual, sym, pos, &mut out);
+                        reference_length(
+                            &mut expected,
+                            &mut expected_lengths,
+                            sym,
+                            pos,
+                            &mut reference_out,
+                        );
+                        let bits = 1 + (round + pos + sym) % 6;
+                        actual.rc_tree_reverse_encode(&mut tree, bits, sym, &mut out);
+                        reference_tree(
+                            &mut expected,
+                            &mut expected_tree,
+                            bits,
+                            sym,
+                            true,
+                            &mut reference_out,
+                        );
+                        assert_eq!(actual.range, expected.range);
+                        assert_eq!(actual.low, expected.low);
+                        assert_eq!(actual.cache, expected.cache);
+                        assert_eq!(actual.cache_size, expected.cache_size);
+                        assert_eq!(actual.get_processed(), expected.get_processed());
+                        assert_eq!(actual.res.is_err(), expected.res.is_err());
+                    }
+                }
+            }
+            actual.flush_data(&mut out);
+            actual.flush_stream(&mut out);
+            expected.flush_data(&mut reference_out);
+            expected.flush_stream(&mut reference_out);
+            assert_eq!(lengths.low, expected_lengths.low);
+            assert_eq!(lengths.high, expected_lengths.high);
+            assert_eq!(tree, expected_tree);
+            assert_eq!(out.bytes, reference_out.bytes);
+            assert_eq!(out.calls, reference_out.calls);
+            assert_eq!(actual.res.is_err(), fail_at < 2);
+            assert!(actual.get_processed() > RC_BUF_SIZE as u64);
         }
     }
 }

@@ -172,7 +172,16 @@ impl SegQueue {
     /// Only ever a buffer nothing holds any more: a piece the decoder or one
     /// of its workers is still reading is never handed out here.
     pub(crate) fn take_spare(&mut self) -> Option<Vec<u8>> {
-        let buf = self.spare.pop()?;
+        // A cut tail can be returned after a full read. Prefer the full
+        // allocation rather than growing that tail while suitable storage
+        // sits idle. Equal sizes retain the previous last-returned preference.
+        let index = self
+            .spare
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, buf)| buf.capacity())?
+            .0;
+        let buf = self.spare.swap_remove(index);
         let cap = buf.capacity() as u64;
         self.spare_bytes -= cap;
         self.held -= cap;
@@ -387,7 +396,27 @@ impl SegQueue {
         if !first
             && (self.spare.len() >= self.park_slots || self.spare_bytes + cap > self.park_room)
         {
-            return;
+            // Slots occupied by small cut tails must not evict a full read
+            // that the next refill can reuse without growing it. Replacement
+            // must still fit both limits; it never expands the allowance.
+            let Some((index, smallest)) = self
+                .spare
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buf)| buf.capacity())
+            else {
+                return;
+            };
+            let small_cap = smallest.capacity() as u64;
+            if cap <= small_cap
+                || self.spare.len() > self.park_slots
+                || self.spare_bytes - small_cap + cap > self.park_room
+            {
+                return;
+            }
+            drop(self.spare.swap_remove(index));
+            self.spare_bytes -= small_cap;
+            self.held -= small_cap;
         }
         buf.clear();
         self.spare_bytes += cap;
@@ -507,13 +536,36 @@ mod tests {
         q.retain_from(end as u64);
         assert_eq!(q.spare_bytes(), 2 * (READ + TAIL) as u64);
 
-        let mut full = 0;
-        while let Some(buf) = q.take_spare() {
-            if buf.capacity() >= READ {
-                full += 1;
-            }
+        // The next reads must reuse those full allocations immediately,
+        // rather than grow returned cut tails while full buffers sit idle.
+        for _ in 0..2 {
+            let mut buf = q.take_spare().expect("full-read buffer");
+            let allocation = buf.as_ptr();
+            assert!(buf.capacity() >= READ);
+            buf.resize(READ, 0);
+            assert_eq!(buf.as_ptr(), allocation);
         }
-        assert_eq!(full, 2, "both full-read buffers come back to be filled");
+        assert_eq!(q.spare_bytes(), 2 * TAIL as u64);
+    }
+
+    #[test]
+    fn cut_tails_do_not_evict_a_full_read_from_a_bounded_pool() {
+        const READ: usize = 256 << 10;
+        const TAIL: usize = 16 << 10;
+        let mut q = SegQueue::default();
+        q.set_park_budget((READ + TAIL) as u64, 2);
+        q.push_owned(piece(TAIL, 1));
+        q.push_owned(piece(TAIL, 2));
+        let full = piece(READ, 3);
+        let allocation = full.as_ptr();
+        q.push_owned(full);
+        q.retain_from((READ + 2 * TAIL) as u64);
+        let buf = q.take_spare().expect("reusable read allocation");
+        assert_eq!(buf.as_ptr(), allocation);
+        assert_eq!(buf.capacity(), READ);
+        assert_eq!(q.spare_bytes(), TAIL as u64);
+        assert_eq!(q.held_bytes(), TAIL as u64);
+        assert_eq!(q.spare.len(), 1);
     }
 
     #[test]

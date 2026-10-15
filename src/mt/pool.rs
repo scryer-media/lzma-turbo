@@ -146,6 +146,12 @@ impl Pool {
         let live = Arc::clone(&self.live);
         let decoding = Arc::clone(&self.decoding);
         let prop = self.dict_prop;
+        // Allocate probability tables together on the dispatching thread.
+        // Per-worker allocation spreads these small, long-lived tables over
+        // allocator arenas. Failure must not leave a handle with no decoder.
+        let Ok(decoder) = Lzma2Decoder::new_probs_only(prop) else {
+            return;
+        };
         let name = alloc::format!("lzma2-mt-{}", self.handles.len());
         // Counted here rather than as the worker's first act: the count has to
         // rise with the handle it belongs to. A worker increments only once the
@@ -154,7 +160,7 @@ impl Pool {
         // fewer live workers than it holds handles for.
         self.live.fetch_add(1, Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name(name).spawn(move || {
-            worker(prop, &rx, &tx, &cancel, &decoding);
+            worker(prop, decoder, &rx, &tx, &cancel, &decoding);
             live.fetch_sub(1, Ordering::Relaxed);
         });
         // A thread that will not start is not an error: the work is simply
@@ -228,16 +234,12 @@ impl Drop for Pool {
 /// output buffer is its dictionary, so no worker ever allocates one.
 fn worker(
     dict_prop: u8,
+    mut dec: Lzma2Decoder,
     rx: &std::sync::Mutex<Receiver<Job>>,
     tx: &Sender<Done>,
     cancel: &AtomicBool,
     decoding: &AtomicUsize,
 ) {
-    let mut dec = match Lzma2Decoder::new_probs_only(dict_prop) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
     loop {
         // The lock is held only across `recv`, which is where a worker waits.
         // `Receiver` is not `Sync`, so the queue is shared this way rather
@@ -401,6 +403,15 @@ pub(crate) fn locate(index: u64, out_offset: u64, e: Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{Job, Pool};
+
+    #[test]
+    fn failed_decoder_setup_does_not_leave_a_worker_handle() {
+        let mut pool = Pool::new(u8::MAX);
+        pool.grow();
+        assert_eq!(pool.spawned(), 0);
+        assert_eq!(pool.live(), 0);
+        pool.shutdown();
+    }
 
     /// A worker counts as live from the moment the pool holds its handle, not
     /// from the moment the OS gets round to running it.

@@ -5,9 +5,8 @@
 //!
 //! Two paths, and the fast one is the point: a block whose chain is a bare
 //! LZMA2 filter decodes straight into the caller's buffer, with the check
-//! computed over that buffer and nothing copied. Only a chain with converters
-//! in it pays for an intermediate buffer, because a converter has to see its
-//! bytes twice.
+//! computed over that buffer and nothing copied. Filter chains also convert
+//! in caller output; only short destinations need a bounded tail buffer.
 
 use alloc::vec::Vec;
 
@@ -19,7 +18,7 @@ use crate::error::{FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 use crate::mt::checksum::ChecksumPlan;
 
-/// How much LZMA2 output is produced per turn on the buffered path.
+/// The maximum LZMA2 output produced per turn through a filter chain.
 const SCRATCH: usize = 1 << 16;
 
 /// What one block decode is allowed to cost and to produce.
@@ -44,8 +43,8 @@ pub(crate) struct BlockDecoder {
     limits: BlockLimits,
     /// Output produced by the converters and not yet handed to the caller.
     pending: Vec<u8>,
+    pending_len: usize,
     pending_pos: usize,
-    scratch: Vec<u8>,
     unpacked: u64,
     packed: u64,
     /// True once LZMA2 has reached its end marker and the converters have
@@ -107,8 +106,8 @@ impl BlockDecoder {
             check: RunningCheck::new(check, unpacked_offset, plan, verify),
             limits,
             pending: Vec::new(),
+            pending_len: 0,
             pending_pos: 0,
-            scratch: Vec::new(),
             unpacked: 0,
             packed: 0,
             finished: false,
@@ -128,7 +127,7 @@ impl BlockDecoder {
     /// True once the block's end marker has been read and everything the
     /// converters held has been handed over.
     pub(crate) fn finished(&self) -> bool {
-        self.finished && self.pending_pos == self.pending.len()
+        self.finished && self.pending_pos == self.pending_len
     }
 
     /// Decodes into `out`, taking what it needs from `input`.
@@ -147,12 +146,12 @@ impl BlockDecoder {
         out: &mut [u8],
     ) -> Result<(usize, usize), XzErrorKind> {
         // Whatever the converters already produced goes first.
-        if self.pending_pos < self.pending.len() {
-            let n = (self.pending.len() - self.pending_pos).min(out.len());
+        if self.pending_pos < self.pending_len {
+            let n = (self.pending_len - self.pending_pos).min(out.len());
             out[..n].copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
             self.pending_pos += n;
-            if self.pending_pos == self.pending.len() {
-                self.pending.clear();
+            if self.pending_pos == self.pending_len {
+                self.pending_len = 0;
                 self.pending_pos = 0;
             }
             return Ok((0, n));
@@ -203,65 +202,95 @@ impl BlockDecoder {
             return Ok((p.read, p.written));
         }
 
-        // The buffered path: LZMA2 into scratch, scratch through the
-        // converters, converted bytes into `pending`.
-        //
-        // The loop is what keeps this function's contract true. A converter
-        // can swallow everything LZMA2 produced — the last bytes of a block
-        // whose size is not a whole number of instructions go into its carry
-        // and come out only when the block ends — and LZMA2 can produce those
-        // bytes out of what it already holds, reading no new input. That step
-        // would otherwise return `(0, 0)`, which every caller reads as "give
-        // me more input"; a caller with no more input to give then calls the
-        // block truncated. So keep going until something reaches `pending`,
-        // the block ends, or a call genuinely makes no progress at all.
+        // C: liblzma simple_code / delta_decode: decode into caller output,
+        // then convert in place. Only a destination too small for the held
+        // tails needs private storage; twice the chain's maximum carry plus
+        // one byte guarantees room for more input and a filtered prefix.
+        // Keep the existing per-turn bound rather than filling an arbitrarily
+        // large caller buffer. The LZMA2 dictionary remains unfiltered.
         let mut consumed = 0usize;
         loop {
-            let want = self.room(SCRATCH)?;
+            let start = self.converters.carried_bytes();
+            let remaining = self.room(usize::MAX)?;
+            // Carried bytes have already left LZMA2 but are not yet counted
+            // as final output. They consume the same block-size allowance.
+            if start > remaining {
+                return Err(self.at_capacity());
+            }
+            let direct = out.len() > start;
+            let capacity = if direct {
+                out.len()
+            } else {
+                2 * self.converters.max_carry() + 1
+            };
+            let want = (remaining - start).min(SCRATCH).min(capacity - start);
             let finish = if want == 0 {
                 FinishMode::End
             } else {
                 FinishMode::Any
             };
-            if self.scratch.len() < want {
-                self.scratch.resize(want, 0u8);
-            }
-            let mut scratch = core::mem::take(&mut self.scratch);
-            let decoded = self.decode_lzma2(&input[consumed..], &mut scratch[..want], finish);
-            self.scratch = scratch;
-            let p = decoded?;
+            let (p, written) = if direct {
+                let p =
+                    self.decode_lzma2(&input[consumed..], &mut out[start..start + want], finish)?;
+                let written = self.converters.decode_buffer(
+                    out,
+                    p.written,
+                    p.status == Status::FinishedWithMark,
+                );
+                self.check.update(&out[..written]);
+                (p, written)
+            } else {
+                let mut pending = core::mem::take(&mut self.pending);
+                if pending.len() < capacity {
+                    pending.reserve_exact(capacity - pending.len());
+                    pending.resize(capacity, 0);
+                }
+                let decoded = self.decode_lzma2(
+                    &input[consumed..],
+                    &mut pending[start..start + want],
+                    finish,
+                );
+                self.pending = pending;
+                let p = decoded?;
+                let written = self.converters.decode_buffer(
+                    &mut self.pending,
+                    p.written,
+                    p.status == Status::FinishedWithMark,
+                );
+                self.check.update(&self.pending[..written]);
+                (p, written)
+            };
             consumed += p.read;
             self.packed += p.read as u64;
-            let produced = &self.scratch[..p.written];
-            let before = self.pending.len();
-            if p.status == Status::FinishedWithMark {
-                self.converters.finish(produced, &mut self.pending);
-            } else {
-                self.converters.push(produced, &mut self.pending);
-            }
-            self.unpacked += (self.pending.len() - before) as u64;
-            self.check.update(&self.pending[before..]);
+            self.unpacked += written as u64;
             self.note(p.status)?;
-            if want == 0 && !self.finished {
+            // A held tail can exhaust the allowance before the end-marker
+            // byte arrives. Let the reader refill; another data chunk is
+            // still rejected by the zero-output FinishMode::End call.
+            if want == 0 && !self.finished && p.status != Status::NeedsMoreInput {
                 return Err(self.at_capacity());
             }
-            if !self.pending.is_empty() || self.finished {
-                break;
+            if written != 0 || self.finished {
+                if direct {
+                    return Ok((consumed, written));
+                }
+                self.pending_len = written;
+                let n = written.min(out.len());
+                out[..n].copy_from_slice(&self.pending[..n]);
+                self.pending_pos = n;
+                if n == written {
+                    self.pending_len = 0;
+                    self.pending_pos = 0;
+                }
+                return Ok((consumed, n));
             }
             if p.read == 0 && p.written == 0 {
-                // Nothing moved: the block really is waiting for input.
-                break;
+                return Ok((consumed, 0));
             }
+            // A short filter tail may swallow all output without consuming
+            // input. Continue until output, EOF or genuine lack of progress;
+            // returning (0, 0) earlier would falsely request more input.
         }
-
-        let n = self.pending.len().min(out.len());
-        out[..n].copy_from_slice(&self.pending[..n]);
-        self.pending_pos = n;
-        if n == self.pending.len() {
-            self.pending.clear();
-            self.pending_pos = 0;
-        }
-        Ok((consumed, n))
     }
 
     /// One LZMA2 call, with its failure read for what it means here.
@@ -336,5 +365,159 @@ impl BlockDecoder {
     /// [`XzErrorKind::CheckMismatch`] if what was decoded does not match.
     pub(crate) fn finish(self, stored: &[u8]) -> Result<BlockCheck, XzErrorKind> {
         self.check.finish(stored)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::filter::{FILTER_DELTA, FILTER_LZMA2, FilterFlags};
+    use super::*;
+
+    fn chain(id: u64, chained: bool) -> FilterChain {
+        let mut flags = Vec::new();
+        if chained {
+            flags.push(FilterFlags::new(FILTER_DELTA, &[3]).unwrap());
+            flags.push(FilterFlags::new(0x04, &[]).unwrap());
+        }
+        flags.push(FilterFlags::new(id, if id == FILTER_DELTA { &[63] } else { &[] }).unwrap());
+        flags.push(FilterFlags::new(FILTER_LZMA2, &[0]).unwrap());
+        FilterChain::validate(&flags).unwrap()
+    }
+
+    fn packed(chain: &FilterChain, original: &[u8]) -> Vec<u8> {
+        let mut filtered = original.to_vec();
+        chain.build().unwrap().encode_in_place(&mut filtered);
+        let mut packed = Vec::new();
+        // LZMA2 uncompressed chunks still exercise the real dictionary and
+        // block state machine, without requiring an encoder feature.
+        for (i, chunk) in filtered.chunks(65_536).enumerate() {
+            packed.push(if i == 0 { 1 } else { 2 });
+            packed.extend_from_slice(&((chunk.len() - 1) as u16).to_be_bytes());
+            packed.extend_from_slice(chunk);
+        }
+        packed.push(0);
+        packed
+    }
+
+    fn decoder(chain: &FilterChain, size: Option<u64>, cap: u64, packed: usize) -> BlockDecoder {
+        BlockDecoder::new(
+            chain,
+            CheckType::Crc32,
+            0,
+            &ChecksumPlan::none(),
+            true,
+            BlockLimits {
+                memory_limit: 1 << 20,
+                uncompressed_size: size,
+                compressed_size: Some(packed as u64),
+                max_block_size: cap,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn caller_output_filters_preserve_chains_tails_and_checks() {
+        for id in FILTER_DELTA..=0x0b {
+            for chained in [false, true] {
+                let chain = chain(id, chained);
+                for len in [0, 1, 3, 17, 257] {
+                    let original: Vec<u8> = (0..len).map(|i| ((i * 37) ^ (i / 7)) as u8).collect();
+                    let packed = packed(&chain, &original);
+                    for width in [1, 2, 7, 19, 64, 65_536] {
+                        for input_width in [1, 17] {
+                            let mut dec =
+                                decoder(&chain, Some(len as u64), len as u64, packed.len());
+                            let mut pos = 0;
+                            let mut got = Vec::new();
+                            let mut out = alloc::vec![0xa5; width];
+                            let mut turns = 0;
+                            while !dec.finished() {
+                                let end = packed.len().min(pos + input_width);
+                                let (read, wrote) =
+                                    dec.decode(&packed[pos..end], &mut out).unwrap();
+                                pos += read;
+                                got.extend_from_slice(&out[..wrote]);
+                                assert!(read != 0 || wrote != 0 || dec.finished());
+                                assert!(dec.pending.len() <= 2 * dec.converters.max_carry() + 1);
+                                turns += 1;
+                                assert!(turns <= 4 * (packed.len() + 1));
+                            }
+                            assert_eq!(pos, packed.len());
+                            assert_eq!(
+                                got, original,
+                                "filter={id} chain={chained} len={len} out={width} in={input_width}"
+                            );
+                            let mut crc = crate::crc::Crc32::new();
+                            crc.update(&original);
+                            dec.finish(&crc.finalize().to_le_bytes()).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caller_output_filters_need_no_large_private_buffer() {
+        for id in FILTER_DELTA..=0x0b {
+            let chain = chain(id, true);
+            let original: Vec<u8> = (0..65_557).map(|i| ((i * 37) ^ (i / 7)) as u8).collect();
+            let packed = packed(&chain, &original);
+            let mut dec = decoder(&chain, None, original.len() as u64, packed.len());
+            let mut pos = 0;
+            let mut got = Vec::new();
+            let mut out = alloc::vec![0xa5; 1 << 20];
+            while !dec.finished() {
+                let (read, wrote) = dec.decode(&packed[pos..], &mut out).unwrap();
+                pos += read;
+                got.extend_from_slice(&out[..wrote]);
+                assert!(read != 0 || wrote != 0 || dec.finished());
+                assert_eq!(dec.pending.capacity(), 0);
+                assert!(wrote <= SCRATCH + dec.converters.max_carry());
+            }
+            assert_eq!(got, original);
+            assert_eq!(pos, packed.len());
+            // A wrong block check is still rejected on the direct path.
+            let mut crc = crate::crc::Crc32::new();
+            crc.update(&original);
+            assert!(matches!(
+                dec.finish(&(crc.finalize() ^ 1).to_le_bytes()),
+                Err(XzErrorKind::CheckMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn carried_filter_bytes_count_toward_the_block_limit() {
+        let chain = chain(0x04, true);
+        let original: Vec<u8> = (0..31).map(|i| i as u8).collect();
+        let packed = packed(&chain, &original);
+        for declared in [false, true] {
+            for width in [1, 64] {
+                let cap = original.len() as u64 - 1;
+                let mut dec = decoder(&chain, declared.then_some(cap), cap, packed.len());
+                let mut pos = 0;
+                let mut delivered = 0;
+                let mut out = alloc::vec![0xa5; width];
+                let error = loop {
+                    match dec.decode(&packed[pos..], &mut out) {
+                        Ok((read, wrote)) => {
+                            assert!(!dec.finished());
+                            assert!(read != 0 || wrote != 0);
+                            pos += read;
+                            delivered += wrote;
+                        }
+                        Err(error) => break error,
+                    }
+                };
+                assert!(delivered <= cap as usize);
+                if declared {
+                    assert!(matches!(error, XzErrorKind::SizeMismatch));
+                } else {
+                    assert!(matches!(error, XzErrorKind::TooMuchOutput { limit } if limit == cap));
+                }
+            }
+        }
     }
 }

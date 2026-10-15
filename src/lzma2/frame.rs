@@ -26,7 +26,6 @@ pub(crate) const fn dic_size_from_prop(prop: u8) -> u32 {
 
 /// C: `LZMA2_DIC_SIZE_FROM_PROP_FULL(p)` in `CPP/7zip/Compress/Lzma2Decoder.cpp`,
 /// which is the same formula with the `prop == 40` special case folded in.
-#[cfg(feature = "std")]
 pub(crate) const fn dic_size_from_prop_full(prop: u8) -> u32 {
     if prop == 40 {
         0xFFFF_FFFF

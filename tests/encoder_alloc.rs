@@ -4,7 +4,24 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use lzma_turbo::{Error, Lzma2Encoder, LzmaEncProps, LzmaEncoder, MatchFinderKind, SliceStream};
+use lzma_turbo::{
+    Error, Lzma2Decoder, Lzma2Encoder, LzmaDecoder, LzmaEncProps, LzmaEncoder, LzmaProps,
+    MatchFinderKind, SliceStream,
+};
+
+#[test]
+fn decoder_dictionary_allocation_failure_is_recoverable() {
+    let props = LzmaProps::new(3, 0, 2, 1 << 16).unwrap();
+    let refusal = Refusal::new(1 << 16, 1);
+    let lzma = LzmaDecoder::new(props);
+    let lzma2 = Lzma2Decoder::new(8);
+    drop(refusal);
+    assert!(matches!(lzma, Err(Error::Alloc)));
+    assert!(matches!(lzma2, Err(Error::Alloc)));
+    assert_eq!(FAILURES.get(), 2);
+    assert!(LzmaDecoder::new(props).is_ok());
+    assert!(Lzma2Decoder::new(8).is_ok());
+}
 
 thread_local! {
     static REFUSE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };

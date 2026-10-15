@@ -38,6 +38,50 @@ use crc_fast::CrcAlgorithm;
 #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
 use crc_fast::Digest;
 
+#[cfg(any(target_arch = "aarch64", test))]
+fn needs_generic_crc32(algorithm: CrcAlgorithm, has_crc: bool) -> bool {
+    matches!(algorithm, CrcAlgorithm::Crc32IsoHdlc) && !has_crc
+}
+
+/// The public parameter-based API bypasses the dependency's CRC-instruction
+/// fusion dispatch. Its generic calculator uses detected PMULL or software.
+/// C: `CrcGenerateTable` likewise selects CRC instructions only when supported.
+#[cfg(any(target_arch = "aarch64", test))]
+fn generic_crc32_params() -> crc_fast::CrcParams {
+    static PARAMS: std::sync::OnceLock<crc_fast::CrcParams> = std::sync::OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        crc_fast::CrcParams::new(
+            "CRC-32/ISO-HDLC",
+            32,
+            0x04c1_1db7,
+            0xffff_ffff,
+            true,
+            0xffff_ffff,
+            0xcbf4_3926,
+        )
+    })
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+#[inline]
+fn native_digest(algorithm: CrcAlgorithm) -> Digest {
+    #[cfg(target_arch = "aarch64")]
+    if needs_generic_crc32(algorithm, std::arch::is_aarch64_feature_detected!("crc")) {
+        return Digest::new_with_params(generic_crc32_params());
+    }
+    Digest::new(algorithm)
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+#[inline]
+fn native_checksum(algorithm: CrcAlgorithm, data: &[u8]) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    if needs_generic_crc32(algorithm, std::arch::is_aarch64_feature_detected!("crc")) {
+        return crc_fast::checksum_with_params(generic_crc32_params(), data);
+    }
+    crc_fast::checksum(algorithm, data)
+}
+
 /// Fold `data` into a running CRC-32 through the embedder-installed hook.
 ///
 /// Dead on a native target outside `#[cfg(test)]`: only a wasm build has a
@@ -105,7 +149,7 @@ macro_rules! digest {
             /// A digest over no bytes yet.
             #[must_use]
             pub fn new() -> Self {
-                Self(Digest::new($algo))
+                Self(native_digest($algo))
             }
 
             /// Feeds the next bytes of the stream.
@@ -140,7 +184,7 @@ macro_rules! digest {
         #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
         #[must_use]
         pub fn $one(data: &[u8]) -> $out {
-            crc_fast::checksum($algo, data) as $out
+            native_checksum($algo, data) as $out
         }
     };
 }
@@ -322,6 +366,103 @@ impl<W: Foldable> CrcFolder<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc_capability_selection_is_specific_to_iso_hdlc() {
+        for has_crc in [false, true] {
+            assert_eq!(
+                needs_generic_crc32(CrcAlgorithm::Crc32IsoHdlc, has_crc),
+                !has_crc
+            );
+            assert!(!needs_generic_crc32(CrcAlgorithm::Crc64Xz, has_crc));
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+    fn crc32_byte_oracle(data: &[u8]) -> u32 {
+        let mut state = u32::MAX;
+        for &byte in data {
+            state ^= u32::from(byte);
+            for _ in 0..8 {
+                state = (state >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(state & 1));
+            }
+        }
+        !state
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+    fn forced_generic_crc32() -> Crc32 {
+        Crc32(Digest::new_with_params(generic_crc32_params()))
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+    fn generic_crc32_matches_the_polynomial_at_dispatch_boundaries() {
+        let params = generic_crc32_params();
+        assert_eq!((params.width, params.poly), (32, 0x04c1_1db7));
+        assert_eq!(
+            (params.init, params.init_algorithm, params.xorout),
+            (0xffff_ffff, 0xffff_ffff, 0xffff_ffff)
+        );
+        assert!(params.refin && params.refout);
+        assert_eq!(params.check, 0xcbf4_3926);
+        let data: alloc::vec::Vec<u8> = (0u32..4112).map(|i| (i * 37 + i / 7) as u8).collect();
+        for offset in 0..16 {
+            for len in (0..=257).chain([1023, 1024, 1025, 4096]) {
+                let bytes = &data[offset..offset + len];
+                let expected = crc32_byte_oracle(bytes);
+                assert_eq!(
+                    crc_fast::checksum_with_params(params, bytes) as u32,
+                    expected,
+                    "offset {offset}, len {len}"
+                );
+                let mut digest = forced_generic_crc32();
+                digest.update(bytes);
+                assert_eq!(digest.finalize(), expected);
+                assert_eq!(crc32(bytes), expected);
+            }
+        }
+        // The encoder constructs every hash-table entry with this one-byte CRC.
+        for byte in 0..=255u8 {
+            let data = [byte];
+            assert_eq!(
+                crc_fast::checksum_with_params(params, &data) as u32,
+                crc32_byte_oracle(&data)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
+    fn generic_crc32_streaming_reset_and_combine_keep_iso_values() {
+        let data: alloc::vec::Vec<u8> = (0u32..8192).map(|i| (i * 31 + 7) as u8).collect();
+        let expected = crc32_byte_oracle(&data);
+        for chunk in [1, 3, 127, 128, 129, 1024, 1025, 8192] {
+            let mut digest = forced_generic_crc32();
+            for bytes in data.chunks(chunk) {
+                digest.update(&[]);
+                digest.update(bytes);
+            }
+            // Callers reset this consuming wrapper with mem::take, not a reset API.
+            assert_eq!(std::mem::take(&mut digest).finalize(), expected);
+            assert_eq!(digest.finalize(), 0);
+        }
+        for cut in [0, 1, 127, 128, 1024, 8191, 8192] {
+            let mut left = forced_generic_crc32();
+            let mut right = forced_generic_crc32();
+            left.update(&data[..cut]);
+            right.update(&data[cut..]);
+            assert_eq!(
+                crc32_combine(left.finalize(), right.finalize(), (data.len() - cut) as u64),
+                expected
+            );
+        }
+        let mut public = Crc32::default();
+        public.update(&data);
+        assert_eq!(std::mem::take(&mut public).finalize(), expected);
+        public.update(&data);
+        assert_eq!(public.finalize(), expected);
+    }
 
     /// The check values both algorithms publish for the nine ASCII digits,
     /// plus the empty string, which is where an off-by-one in the initial or

@@ -253,6 +253,13 @@ impl Segmenter {
         }
     }
 
+    /// Reserves an already-bounded run's segment records before decoding.
+    pub(crate) fn reserve_segments(&mut self, count: usize) -> Result<(), crate::Error> {
+        self.segments
+            .try_reserve_exact(count)
+            .map_err(|_| crate::Error::Alloc)
+    }
+
     /// Feeds the next bytes of the run. One pass: every byte is looked at
     /// once, whatever the split points do.
     pub(crate) fn update(&mut self, mut data: &[u8]) {

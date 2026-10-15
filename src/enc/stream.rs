@@ -10,8 +10,10 @@
 //! `MatchFinder_SET_DIRECT_INPUT_BUF` lets the C point `p->buffer` straight at
 //! the caller's bytes and never allocate a window. This port does that for
 //! block-threaded LZMA2 and solid buffered LZMA2 through the threaded or
-//! inline finder (`crate::enc::lz_find_mt::run_block`). Other paths retain
-//! a window filled from a stream; their slice source is [`SliceStream`].
+//! inline finder (`crate::enc::lz_find_mt::run_block`). A streamed MT input
+//! block can also transfer its owned Vec to the single-threaded finder for
+//! the duration of encoding. Borrowed single-threaded inputs and custom
+//! blocks larger than one GiB retain a window filled from [`SliceStream`].
 //!
 //! The two find the same matches. The two modes differ only in how much input is
 //! visible at once, and that reaches nothing a match depends on:
@@ -191,12 +193,11 @@ pub trait SeqOutStream {
 
     /// Writes all of `data` and leaves it empty.
     ///
-    /// The block-threaded encoder hands each finished block over through
-    /// this, a whole block in one buffer of its own. A sink that queues what
-    /// it is given can take the allocation ([`core::mem::take`]) instead of
-    /// copying the block; the encoder then allocates the next block's buffer
-    /// afresh. The default copies through [`SeqOutStream::write`] and leaves
-    /// `data` its capacity, which the encoder uses again.
+    /// A sink that queues what it is given can take the allocation
+    /// ([`core::mem::take`]) instead of copying it. The default copies through
+    /// [`SeqOutStream::write`] and leaves `data` its capacity. Block-threaded
+    /// encoding uses [`Self::write_buffer`] to retain initialized tail storage;
+    /// a sink implementing ownership transfer should override that method too.
     ///
     /// C: `ISeqOutStream` has nothing like it; `Lzma2Enc_MtCallback_Write`
     /// passes the block's buffer to `ISeqOutStream_Write` and keeps it.
@@ -209,6 +210,26 @@ pub trait SeqOutStream {
         self.write(data)?;
         data.clear();
         Ok(())
+    }
+
+    /// Writes the produced prefix of an initialized block buffer.
+    ///
+    /// C: `Lzma2Enc_MtCallback_Write` keeps the whole allocation while passing
+    /// only `packSize` to the sink. Keeping the initialized tail lets the
+    /// next block encode directly into it without zeroing it again. A sink
+    /// may transfer ownership and return any initialized replacement buffer;
+    /// only `data[..written]` is output. The default retains the buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`], or [`Error::Param`] if the prefix is out of bounds.
+    /// The buffer is in an unspecified state after an error.
+    fn write_buffer(
+        &mut self,
+        data: &mut alloc::vec::Vec<u8>,
+        written: usize,
+    ) -> Result<(), Error> {
+        self.write(data.get(..written).ok_or(Error::Param)?)
     }
 }
 

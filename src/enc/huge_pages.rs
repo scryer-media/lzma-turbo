@@ -48,6 +48,16 @@ pub(crate) fn advise_vec<T>(v: &alloc::vec::Vec<T>) {
     let _ = advise_vec_result(v);
 }
 
+/// Advise only the logical region of an owner with alignment padding. A
+/// trailing huge page must not make unused padding resident with the table.
+pub(crate) fn advise_slice<T>(slice: &[T]) {
+    let _ = advise_with(
+        slice.as_ptr().addr(),
+        core::mem::size_of_val(slice),
+        madvise_hugepage,
+    );
+}
+
 #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
 fn madvise_hugepage(start: usize, length: usize) -> i32 {
     // asm-generic/mman-common.h.

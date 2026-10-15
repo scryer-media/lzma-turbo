@@ -35,6 +35,8 @@ use crate::error::Error;
 use crate::enc::mt_coder::{BLOCKS_MAX, MtCoder, MtCoderCallback, MtInput, THREADS_MAX};
 #[cfg(feature = "std")]
 use std::sync::Mutex;
+#[cfg(feature = "std")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// C: `LZMA2_CONTROL_LZMA`.
 const CONTROL_LZMA: u8 = 1 << 7;
@@ -295,6 +297,43 @@ impl Lzma2EncInt {
         }
     }
 
+    // C: Lzma2Enc_EncodeMt1's direct-input block, owned by MtCoder. The fast
+    // finder temporarily owns this buffer, so it needs no second input window.
+    #[cfg(feature = "std")]
+    fn encode_mt1_owned(
+        &mut self,
+        src: &mut super::lz_find::MatchWindow,
+        out: &mut MemoryOutput<'_>,
+        finished: bool,
+    ) -> Result<(), Error> {
+        if src.len() > 1 << 30 {
+            return self.encode_mt1_mem_into(src, out, finished);
+        }
+        let len = src.len();
+        self.init_block();
+        self.enc.set_data_limit(len as u64);
+        self.enc.mem_prepare_owned(len, UNPACK_SIZE_MAX)?;
+        match self.enc.mt_block_handle()? {
+            Some(sh) => {
+                lz_find_mt::run_block(&sh, src, || self.subblock_loop_into(&mut NoStream, out))?;
+            }
+            None => {
+                self.enc.exchange_owned_input(src);
+                let result = self.subblock_loop_into(&mut NoStream, out);
+                // Return the same allocation on errors as well as success.
+                self.enc.exchange_owned_input(src);
+                result?;
+            }
+        }
+        if self.src_pos != len as u64 {
+            return Err(Error::InternalFailure);
+        }
+        if finished {
+            out.write(&[CONTROL_EOF])?;
+        }
+        Ok(())
+    }
+
     /// C: `Lzma2Enc_EncodeMt1`'s `inData` path, which is what the `MtCoder`
     /// callback drives: `src` is already at most one block, so the C's loop
     /// over blocks runs once.
@@ -345,13 +384,11 @@ impl Lzma2EncInt {
         self.enc
             .mem_prepare_direct(src.len() as u64, UNPACK_SIZE_MAX)?;
         let handle = self.enc.mt_block_handle()?;
-        let mut drive = |input: &mut dyn SeqInStream| {
-            while self.encode_subblock_into(input, out)? != 0 {}
-            Ok(())
-        };
         match handle {
-            Some(sh) => lz_find_mt::run_block(&sh, src, || drive(&mut NoStream))?,
-            None => drive(&mut SliceStream::new(src))?,
+            Some(sh) => {
+                lz_find_mt::run_block(&sh, src, || self.subblock_loop_into(&mut NoStream, out))?;
+            }
+            None => self.subblock_loop_into(&mut SliceStream::new(src), out)?,
         }
         if self.src_pos != src.len() as u64 {
             return Err(Error::InternalFailure);
@@ -359,6 +396,16 @@ impl Lzma2EncInt {
         if finished {
             out.write(&[CONTROL_EOF])?;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    fn subblock_loop_into(
+        &mut self,
+        input: &mut dyn SeqInStream,
+        out: &mut MemoryOutput<'_>,
+    ) -> Result<(), Error> {
+        while self.encode_subblock_into(input, out)? != 0 {}
         Ok(())
     }
 
@@ -910,8 +957,15 @@ impl Lzma2Encoder {
         };
         // C: `destBlockSize` in `Lzma2Enc_Encode2`, plus the block's own copy
         // of the input that `MtCoder` holds when it reads a stream.
-        let copy = if copies_input { block } else { 0 };
-        let bufs = block + (block >> 10) + 16 + copy;
+        let copy = if copies_input {
+            usize::try_from(block)
+                .ok()
+                .and_then(|len| super::lz_find::MatchWindow::padded_words(len).ok())
+                .map_or(u64::MAX, |len| len as u64)
+        } else {
+            0
+        };
+        let bufs = (block + (block >> 10) + 16).saturating_add(copy);
         let _ = self.sync_coder();
         // A block coder prepares with `mem_prepare_direct`, which only the
         // threaded and inline finders (and so only `std`) take up.
@@ -1311,7 +1365,7 @@ impl Lzma2Encoder {
             .try_reserve_exact(BLOCKS_MAX)
             .map_err(|_| Error::Alloc)?;
         for _ in 0..BLOCKS_MAX {
-            out_bufs.push(Mutex::new(Vec::new()));
+            out_bufs.push(Mutex::new(BlockOutput::default()));
         }
 
         Ok(Lzma2MtCallback {
@@ -1319,6 +1373,7 @@ impl Lzma2Encoder {
             rest: &self.block_coders,
             props,
             out_bufs,
+            output_retention: OutputRetention::new(threads),
             out: Mutex::new(out),
         })
     }
@@ -1344,6 +1399,19 @@ impl SeqOutStream for VecOutput {
             data.clear();
         }
         Ok(())
+    }
+
+    fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), Error> {
+        if written > data.len() {
+            return Err(Error::Param);
+        }
+        if self.0.is_empty() {
+            core::mem::swap(&mut self.0, data);
+            self.0.truncate(written);
+            Ok(())
+        } else {
+            self.0.write(&data[..written])
+        }
     }
 }
 
@@ -1401,6 +1469,91 @@ impl MtCoderCallback for MemoryMtCallback<'_, '_> {
     }
 }
 
+/// C: one `outBuf` and its `packSize`. The initialized allocation is kept
+/// independently of its output length, including across synchronous delivery.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct BlockOutput {
+    data: Vec<u8>,
+    written: usize,
+}
+
+/// Keep ordinary coder buffer reuse, but not a completed backlog's high-water
+/// allocation count. Unlike the SDK's permanent per-slot outBuf, a delivered
+/// surplus can be released without restricting blocks in flight or writers.
+#[cfg(feature = "std")]
+struct OutputRetention {
+    allocated: AtomicUsize,
+    coders: usize,
+}
+
+#[cfg(feature = "std")]
+impl OutputRetention {
+    fn new(coders: usize) -> Self {
+        Self {
+            allocated: AtomicUsize::new(0),
+            coders,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl BlockOutput {
+    fn encode(
+        &mut self,
+        input_len: usize,
+        retention: &OutputRetention,
+        code: impl FnOnce(&mut MemoryOutput<'_>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        // C: `destBlockSize`; enough for every stored-chunk header and EOF.
+        // calloc-backed initialization avoids faulting the unused tail.
+        let room = input_len
+            .checked_add((input_len >> 10) + 16)
+            .ok_or(Error::Alloc)?;
+        if self.data.len() < room {
+            let was_empty = self.data.capacity() == 0;
+            self.data = super::lz_find::zeroed_vec(room)?;
+            if was_empty {
+                retention.allocated.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut out = MemoryOutput {
+            data: &mut self.data,
+            written: 0,
+        };
+        let result = code(&mut out);
+        self.written = out.written;
+        result
+    }
+
+    fn write(
+        &mut self,
+        retention: &OutputRetention,
+        out: &mut (dyn SeqOutStream + Send),
+    ) -> Result<(), Error> {
+        let had_allocation = self.data.capacity() != 0;
+        let result = out.write_buffer(&mut self.data, self.written);
+        if had_allocation && self.data.capacity() == 0 {
+            // An ownership-taking sink already released this slot's storage.
+            retention.allocated.fetch_sub(1, Ordering::Relaxed);
+        } else if !had_allocation && self.data.capacity() != 0 {
+            retention.allocated.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.data.capacity() != 0
+            && retention.allocated.load(Ordering::Relaxed) > retention.coders
+        {
+            // MtCoder serializes ordered delivery; this slot is exclusively
+            // held until Write returns. Other slots may still encode or wait
+            // for order and are never reclaimed here. The relaxed count is a
+            // reuse policy, not an admission or memory-safety bound.
+            self.data = Vec::new();
+            retention.allocated.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.written = 0;
+        result
+    }
+}
+
 /// C: `Lzma2Enc_MtCallback_Code` and `Lzma2Enc_MtCallback_Write`.
 #[cfg(feature = "std")]
 struct Lzma2MtCallback<'o> {
@@ -1410,7 +1563,8 @@ struct Lzma2MtCallback<'o> {
     rest: &'o [Mutex<Option<Lzma2EncInt>>],
     /// What a coder built during this stream is built with.
     props: LzmaEncProps,
-    out_bufs: Vec<Mutex<Vec<u8>>>,
+    out_bufs: Vec<Mutex<BlockOutput>>,
+    output_retention: OutputRetention,
     out: Mutex<&'o mut (dyn SeqOutStream + Send)>,
 }
 
@@ -1427,18 +1581,28 @@ impl MtCoderCallback for Lzma2MtCallback<'_> {
         let mut dest = self.out_bufs[out_buf_index]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        dest.clear();
-        // C: `destBlockSize`, the `blockSize + (blockSize >> 10) + 16` every
-        // `outBuf` is allocated at, here of this block's own length: more
-        // than a block of all stored chunks comes to, taken once and not
-        // reached by doubling. The buffer can still grow, so nothing rests
-        // on the bound.
-        let room = src.len().saturating_add((src.len() >> 10) + 16);
-        if dest.capacity() < room {
-            dest.try_reserve_exact(room).map_err(|_| Error::Alloc)?;
-        }
+        dest.encode(src.len(), &self.output_retention, |out| {
+            self.with_coder(coder_index, |coder| {
+                coder.encode_mt1_mem_into(src, out, finished)
+            })
+        })
+    }
 
-        self.code_to(coder_index, src, &mut *dest, finished)
+    fn code_owned(
+        &self,
+        coder_index: usize,
+        out_buf_index: usize,
+        src: &mut super::lz_find::MatchWindow,
+        finished: bool,
+    ) -> Result<(), Error> {
+        let mut dest = self.out_bufs[out_buf_index]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dest.encode(src.len(), &self.output_retention, |out| {
+            self.with_coder(coder_index, |coder| {
+                coder.encode_mt1_owned(src, out, finished)
+            })
+        })
     }
 
     /// C: `Lzma2Enc_MtCallback_Write`.
@@ -1448,29 +1612,15 @@ impl MtCoderCallback for Lzma2MtCallback<'_> {
             .unwrap_or_else(|e| e.into_inner());
         // The whole block, in a buffer nothing else needs until the next
         // block that draws this index: the sink may keep it.
-        self.out
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_vec(&mut data)
+        data.write(
+            &self.output_retention,
+            &mut **self.out.lock().unwrap_or_else(|e| e.into_inner()),
+        )
     }
 }
 
 #[cfg(feature = "std")]
 impl Lzma2MtCallback<'_> {
-    /// C: the coder selection and `Lzma2Enc_EncodeMt1` call shared by both
-    /// forms of `Lzma2Enc_MtCallback_Code`'s memory destination.
-    fn code_to(
-        &self,
-        coder_index: usize,
-        src: &[u8],
-        out: &mut dyn SeqOutStream,
-        finished: bool,
-    ) -> Result<(), Error> {
-        self.with_coder(coder_index, |coder| {
-            coder.encode_mt1_mem(src, out, finished)
-        })
-    }
-
     /// C: the lazy coder selection shared by both output forms of
     /// `Lzma2Enc_MtCallback_Code`.
     fn with_coder(
@@ -1561,6 +1711,148 @@ pub fn encode_lzma2_mt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn completed_surplus_output_is_released_without_touching_queued_blocks() {
+        let retention = OutputRetention::new(2);
+        let mut blocks: [BlockOutput; 3] = core::array::from_fn(|_| BlockOutput::default());
+        for (i, block) in blocks.iter_mut().enumerate() {
+            block
+                .encode(4096, &retention, |out| out.write(&[i as u8; 4096]))
+                .unwrap();
+        }
+        let queued = [blocks[1].data.as_ptr(), blocks[2].data.as_ptr()];
+        let mut sink = Vec::new();
+        blocks[0].write(&retention, &mut sink).unwrap();
+        assert_eq!(sink, [0; 4096]);
+        assert_eq!(blocks[0].data.capacity(), 0);
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 2);
+        for (index, address) in [1, 2].into_iter().zip(queued) {
+            assert_eq!(blocks[index].data.as_ptr(), address);
+            assert_eq!(&blocks[index].data[..4096], &[index as u8; 4096]);
+        }
+        blocks[1].write(&retention, &mut sink).unwrap();
+        assert_eq!(blocks[1].data.as_ptr(), queued[0]);
+        // Ownership transfer must remove the allocation from the retained
+        // count; subsequent reuse must add it exactly once.
+        let mut taking = VecOutput(Vec::new());
+        blocks[2].write(&retention, &mut taking).unwrap();
+        assert_eq!(taking.0, [2; 4096]);
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 1);
+        blocks[2]
+            .encode(17, &retention, |out| out.write(&[9; 17]))
+            .unwrap();
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            blocks[0].encode(usize::MAX, &retention, |_| unreachable!()),
+            Err(Error::Alloc)
+        );
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 2);
+        struct Refuse;
+        impl SeqOutStream for Refuse {
+            fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+                Err(Error::Write)
+            }
+        }
+        assert_eq!(blocks[2].write(&retention, &mut Refuse), Err(Error::Write));
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 2);
+        assert_eq!(&blocks[2].data[..17], &[9; 17]);
+        struct TakeThenFail(Vec<u8>);
+        impl SeqOutStream for TakeThenFail {
+            fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), Error> {
+                self.0 = core::mem::take(data);
+                self.0.truncate(written);
+                Err(Error::Write)
+            }
+        }
+        blocks[2]
+            .encode(17, &retention, |out| out.write(&[7; 17]))
+            .unwrap();
+        let mut failed = TakeThenFail(Vec::new());
+        assert_eq!(blocks[2].write(&retention, &mut failed), Err(Error::Write));
+        assert_eq!(failed.0, [7; 17]);
+        assert_eq!(retention.allocated.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn owned_blocks_match_copied_windows_and_return_their_allocation() {
+        for level in [1, 3, 5] {
+            let props = LzmaEncProps {
+                level,
+                dict_size: 1 << 15,
+                num_threads: 1,
+                ..LzmaEncProps::default()
+            };
+            let mut copied = Lzma2EncInt::new(&props).unwrap();
+            let lengths: &[usize] = if cfg!(miri) {
+                &[0, 1, 17, 513]
+            } else {
+                &[0, 1, 17, 65_537, 262_159]
+            };
+            for &len in lengths {
+                let mut owned = Lzma2EncInt::new(&props).unwrap();
+                let mut input = super::super::lz_find::MatchWindow::new(len).unwrap();
+                for (i, byte) in input.iter_mut().enumerate() {
+                    *byte = ((i * 29) ^ (i >> 7)) as u8;
+                }
+                let original = input.to_vec();
+                let address = input.as_ptr();
+                let mut expected = Vec::new();
+                copied.encode_mt1_mem(&input, &mut expected, true).unwrap();
+                let mut actual = BlockOutput::default();
+                let retention = OutputRetention::new(1);
+                actual
+                    .encode(len, &retention, |out| {
+                        owned.encode_mt1_owned(&mut input, out, true)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    &actual.data[..actual.written],
+                    expected,
+                    "level {level}, length {len}"
+                );
+                let output_address = actual.data.as_ptr();
+                assert!(
+                    owned.temp.is_empty(),
+                    "direct output must not allocate chunk staging"
+                );
+                assert_eq!(&input[..], original);
+                assert_eq!(input.as_ptr(), address);
+                assert_eq!(
+                    owned.encode_mt1_owned(
+                        &mut input,
+                        &mut MemoryOutput {
+                            data: &mut [],
+                            written: 0
+                        },
+                        true
+                    ),
+                    Err(Error::Write)
+                );
+                assert_eq!(&input[..], original);
+                assert_eq!(input.as_ptr(), address);
+                actual
+                    .encode(len, &retention, |out| {
+                        owned.encode_mt1_owned(&mut input, out, true)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    &actual.data[..actual.written],
+                    expected,
+                    "reused after refused output"
+                );
+                assert_eq!(actual.data.as_ptr(), output_address);
+                let mut streamed = Vec::new();
+                owned.encode_mt1_mem(&input, &mut streamed, true).unwrap();
+                assert_eq!(streamed, expected, "reused through the copied window");
+            }
+        }
+    }
 
     #[cfg(feature = "std")]
     #[test]
@@ -1778,7 +2070,13 @@ mod tests {
                 let direct = cfg!(feature = "std");
                 let estimate = enc.coder.enc.mem_usage_for(direct);
                 let out = block + (block >> 10) + 16;
-                assert_eq!(enc.mem_usage_per_thread(), estimate + out + block, "{what}");
+                let input =
+                    super::super::lz_find::MatchWindow::padded_words(block as usize).unwrap();
+                assert_eq!(
+                    enc.mem_usage_per_thread(),
+                    estimate + out + input as u64,
+                    "{what}"
+                );
                 assert_eq!(enc.block_thread_mem(false), estimate + out, "{what}");
 
                 #[cfg(feature = "std")]
@@ -1872,12 +2170,14 @@ mod tests {
         enc.set_threads(8);
         let inline = enc.coder.enc.mem_usage_for(true);
         assert!(inline < enc.coder.enc.mem_usage());
-        assert_eq!(enc.mem_usage_per_thread(), inline + out + block);
+        let input =
+            super::super::lz_find::MatchWindow::padded_words(block as usize).unwrap() as u64;
+        assert_eq!(enc.mem_usage_per_thread(), inline + out + input);
 
         // The single-threaded finder reads through a window, and the
         // estimate is the one it always had.
         enc.coder.set_inline_finder(false);
-        let old = enc.coder.enc.mem_usage() + out + block;
+        let old = enc.coder.enc.mem_usage() + out + input;
         assert_eq!(enc.mem_usage_per_thread(), old);
         assert_eq!(enc.coder.enc.mem_usage_for(true), enc.coder.enc.mem_usage());
     }
@@ -2911,7 +3211,8 @@ mod tests {
         cb.code(0, 0, &src, true).unwrap();
         let (len, cap) = {
             let buf = cb.out_bufs[0].lock().unwrap();
-            (buf.len(), buf.capacity())
+            assert_eq!(buf.data.len(), room);
+            (buf.written, buf.data.capacity())
         };
         assert!(len > src.len() && len <= room);
         // What was reserved, not the next power of two above the length.
@@ -2920,7 +3221,7 @@ mod tests {
         // The same buffer takes a second, shorter block as it is.
         cb.write(0).unwrap();
         cb.code(0, 0, &src[..1000], true).unwrap();
-        assert_eq!(cb.out_bufs[0].lock().unwrap().capacity(), cap);
+        assert_eq!(cb.out_bufs[0].lock().unwrap().data.capacity(), cap);
     }
 
     /// A sink that keeps what it is handed is handed every block whole, once,
@@ -2941,6 +3242,12 @@ mod tests {
             }
             fn write_vec(&mut self, data: &mut Vec<u8>) -> Result<(), Error> {
                 self.blocks.push(core::mem::take(data));
+                Ok(())
+            }
+            fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), Error> {
+                let mut block = core::mem::take(data);
+                block.truncate(written);
+                self.blocks.push(block);
                 Ok(())
             }
         }

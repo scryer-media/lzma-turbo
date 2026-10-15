@@ -74,7 +74,10 @@ impl Lzma2Decoder {
         Ok(p)
     }
 
-    /// Allocates a decoder whose dictionary is clamped to `cap` bytes.
+    /// Allocates a decoder whose dictionary is clamped to `cap` bytes,
+    /// with the format's minimum allocation of 4096 bytes and the SDK's
+    /// dictionary allocation rounding. The usable match distance is capped;
+    /// the backing allocation may be rounded up.
     ///
     /// C: nothing - 7-Zip always allocates the declared dictionary. The xz
     /// container can do better: it resets the dictionary at every block, so no
@@ -83,16 +86,16 @@ impl Lzma2Decoder {
     /// never has to be larger than it. That turns an `xz -9` stream of small
     /// blocks from 64 MiB per worker into a few kilobytes.
     ///
-    /// The caller is responsible for `cap` being at least as large as the
-    /// block's output; a smaller `cap` decodes a block whose matches reach
+    /// This also applies to independently reset LZMA2 runs. The caller is
+    /// responsible for `cap` being at least as large as the block or run's
+    /// output; a smaller `cap` decodes a block whose matches reach
     /// past it into [`Error::CorruptData`], not into wrong bytes, because the
     /// distance check is against the dictionary size.
     ///
     /// # Errors
     ///
     /// As [`Lzma2Decoder::new`].
-    #[cfg(feature = "xz")]
-    pub(crate) fn new_capped(dict_prop: u8, cap: u32) -> Result<Self, Error> {
+    pub fn new_capped(dict_prop: u8, cap: u32) -> Result<Self, Error> {
         if dict_prop > 40 {
             return Err(Error::UnsupportedProps);
         }
@@ -432,6 +435,22 @@ impl Lzma2Decoder {
         self.frame.state == crate::lzma2::frame::Lzma2State::Control
             && self.frame.unpack_size == 0
             && self.frame.pack_size == 0
+    }
+
+    /// A stored payload beginning in this input, after any complete header.
+    /// The normal decoder still validates the header and updates history;
+    /// run delivery can then write the source slice without reading the ring
+    /// back. Incomplete headers use the ordinary dictionary delivery path.
+    pub(crate) fn stored_payload(&self, input: &[u8]) -> Option<(usize, usize)> {
+        if matches!(self.frame.state, Lzma2State::Data | Lzma2State::DataCont)
+            && is_uncompressed_state(self.frame.control)
+        {
+            Some((0, self.frame.unpack_size as usize))
+        } else if self.at_chunk_boundary() && input.len() >= 3 && matches!(input[0], 1 | 2) {
+            Some((3, usize::from(u16::from_be_bytes([input[1], input[2]])) + 1))
+        } else {
+            None
+        }
     }
 
     /// The decoded bytes between two dictionary positions.

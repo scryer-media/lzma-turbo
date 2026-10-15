@@ -566,9 +566,10 @@ jobs:
   # agrees. Miri runs a thousand of the tables; the ordinary `test` job runs
   # all sixty thousand natively. The release run is the entry assertions in
   # the build that ships: they must panic there too, not only under debug
-  # assertions. Second, `zeroed_vec` in `src/enc/lz_find.rs`, which hands
-  # the match finder's window and tables over from `alloc_zeroed` through
-  # `Vec::from_raw_parts`; its test allocates every `Zeroable` type at odd
+  # assertions. Second, shared `zeroed_vec` in `src/buffer.rs`, which hands
+  # decoder dictionaries and the match finder's window and tables over from
+  # `alloc_zeroed` through `Vec::from_raw_parts`; its encoder-wrapper test
+  # allocates every `Zeroable` type at odd
   # lengths, reads, writes, grows and frees each, and Miri checks the layout,
   # the initialisation and the free. Third, the direct-input hand-off in
   # `run_block` (`src/enc/lz_find_mt.rs`), which gives the kept producer
@@ -595,22 +596,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Portable encoder unsafe invariants under Miri
+      - name: Portable kernel unsafe invariants under Miri
         run: |
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
-            --no-default-features --features std,enc \
+            --no-default-features --features std,enc,filters \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
+            enc::lz_find_mt::tests::get_heads_ \
+            enc::lz_find_mt::tests::held_records_preserve_short_output_and_synthetic_failure_state \
+            enc::lz_find_mt::tests::skip_spans_preserve_checked_ \
             enc::lz_find_mt::tests::a_direct_block_ \
             enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
-            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
+            enc::lzma2_enc::tests::owned_blocks_match_copied_windows_and_return_their_allocation \
+            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser \
+            enc::lz_find::normalize::tests::normalization_ \
+            filters::bcj2::cursor::tests::sdk_cursor_
       - name: The same tests in the release build
         run: |
           cargo test --locked --release --lib \
-            --no-default-features --features std,enc \
+            --no-default-features --features std,enc,filters \
             -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
+            enc::lz_find_mt::tests::get_heads_ \
+            enc::lz_find_mt::tests::held_records_preserve_short_output_and_synthetic_failure_state \
+            enc::lz_find_mt::tests::skip_spans_preserve_checked_ \
             enc::lz_find_mt::tests::a_direct_block_ \
             enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
-            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
+            enc::lzma2_enc::tests::owned_blocks_match_copied_windows_and_return_their_allocation \
+            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser \
+            enc::lz_find::normalize::tests::normalization_ \
+            filters::bcj2::cursor::tests::sdk_cursor_
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.

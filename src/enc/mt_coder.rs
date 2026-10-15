@@ -66,6 +66,18 @@ pub(crate) trait MtCoderCallback: Sync {
         finished: bool,
     ) -> Result<(), Error>;
 
+    // An input block read by MtCoder can transfer ownership to a finder for
+    // the duration of Code. Other callbacks retain the borrowed interface.
+    fn code_owned(
+        &self,
+        coder_index: usize,
+        out_buf_index: usize,
+        src: &mut super::lz_find::MatchWindow,
+        finished: bool,
+    ) -> Result<(), Error> {
+        self.code(coder_index, out_buf_index, src, finished)
+    }
+
     /// C: `IMtCoderCallback2::Write`. Emits a finished block; called in block
     /// order.
     fn write(&self, out_buf_index: usize) -> Result<(), Error>;
@@ -296,7 +308,7 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
         'c: 's,
     {
         // C: `t->inBuf`, allocated on first use and only for the stream input.
-        let mut in_buf: Vec<u8> = Vec::new();
+        let mut in_buf = super::lz_find::MatchWindow::default();
 
         loop {
             self.read_event.wait();
@@ -320,13 +332,10 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                 match &self.coder.input {
                     MtInput::Stream(stream) => {
                         if in_buf.len() != self.coder.block_size {
-                            in_buf.clear();
-                            if in_buf.try_reserve_exact(self.coder.block_size).is_err() {
-                                res = Err(Error::Alloc);
-                            } else {
-                                crate::enc::huge_pages::advise_vec(&in_buf);
-                                in_buf.resize(self.coder.block_size, 0);
-                            }
+                            // C: MtCoderThread's first-use BigAlloc input.
+                            // Preserve lazy zeroes, alignment and the owner
+                            // exchanged with the single-threaded finder.
+                            res = in_buf.resize_zeroed(self.coder.block_size);
                         }
                         if res.is_ok() {
                             let mut s = stream.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,11 +409,15 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                     head
                 };
                 buf_index = Some(bufi);
-                let src: &[u8] = match in_data {
-                    Some(d) => d,
-                    None => &in_buf[..size],
+                res = match in_data {
+                    Some(src) => self.coder.callback.code(index, bufi, src, finished),
+                    None => {
+                        in_buf.truncate(size);
+                        self.coder
+                            .callback
+                            .code_owned(index, bufi, &mut in_buf, finished)
+                    }
                 };
-                res = self.coder.callback.code(index, bufi, src, finished);
                 if let Err(e) = res {
                     self.set_error(e);
                 }

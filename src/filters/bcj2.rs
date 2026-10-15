@@ -38,6 +38,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(any(test, feature = "kernel-ab"))]
+mod cursor;
+
 /// The number of streams a BCJ2 conversion has. C: `BCJ2_NUM_STREAMS`.
 pub const NUM_STREAMS: usize = 4;
 
@@ -142,6 +145,83 @@ fn is_branch_byte(b: u32) -> bool {
 #[inline]
 fn is_long_jump(v: u32) -> bool {
     v.wrapping_sub((0x0F << 24) + 0x80) & 0xFFFF_FFF0 == 0
+}
+
+// C: Bcj2Dec_Decode's four ONE_ITER steps, followed by its short tail.
+// Copy each tested byte directly: branch-dense input does not first scan
+// a word, fall back to bytes, and then copy the same short span again.
+#[inline]
+fn copy_main(src: &[u8], dest: &mut [u8], mut v: u32) -> (usize, u32, bool) {
+    let n = src.len().min(dest.len());
+    let src = &src[..n];
+    let dest = &mut dest[..n];
+    let mut copied = 0;
+    while n - copied >= 4 {
+        let input = &src[copied..copied + 4];
+        let output = &mut dest[copied..copied + 4];
+        macro_rules! one_iter {
+            ($index:expr) => {{
+                let b = input[$index];
+                output[$index] = b;
+                v = (v << 24) | u32::from(b);
+                if is_branch_byte(u32::from(b)) || is_long_jump(v) {
+                    return (copied + $index + 1, v, true);
+                }
+            }};
+        }
+        one_iter!(0);
+        one_iter!(1);
+        one_iter!(2);
+        one_iter!(3);
+        copied += 4;
+    }
+    while copied < n {
+        let b = src[copied];
+        dest[copied] = b;
+        copied += 1;
+        v = (v << 24) | u32::from(b);
+        if is_branch_byte(u32::from(b)) || is_long_jump(v) {
+            return (copied, v, true);
+        }
+    }
+    (copied, v, false)
+}
+
+// Preserve the previous grouped scan as an independent differential arm.
+// Its frozen archive-path binaries remain in the performance evidence.
+#[cfg(test)]
+fn copy_main_grouped(src: &[u8], dest: &mut [u8], mut v: u32) -> (usize, u32, bool) {
+    let n = src.len().min(dest.len());
+    let mut copied = 0;
+    while copied < n {
+        let mut end = n;
+        if n - copied >= 8 {
+            let word =
+                u64::from_le_bytes(src[copied..copied + 8].try_into().expect("eight-byte word"));
+            let branch = (word ^ 0xe8e8_e8e8_e8e8_e8e8) & 0xfefe_fefe_fefe_fefe;
+            let escape = word ^ 0x0f0f_0f0f_0f0f_0f0f;
+            let possible = ((branch.wrapping_sub(0x0101_0101_0101_0101) & !branch)
+                | (escape.wrapping_sub(0x0101_0101_0101_0101) & !escape))
+                & 0x8080_8080_8080_8080;
+            if possible == 0 && !is_long_jump((v << 24) | u32::from(word as u8)) {
+                v = (u32::from((word >> 48) as u8) << 24) | u32::from((word >> 56) as u8);
+                copied += 8;
+                continue;
+            }
+            end = copied + 8;
+        }
+        while copied < end {
+            let b = u32::from(src[copied]);
+            copied += 1;
+            v = (v << 24) | b;
+            if is_branch_byte(b) || is_long_jump(v) {
+                dest[..copied].copy_from_slice(&src[..copied]);
+                return (copied, v, true);
+            }
+        }
+    }
+    dest[..copied].copy_from_slice(&src[..copied]);
+    (copied, v, false)
 }
 
 /// C: the probability index, `((0 - c) & (Byte)(v >> 24)) + c + ((v >> 5) & 1)`
@@ -262,6 +342,15 @@ impl Bcj2Dec {
         self.ip
     }
 
+    /// The input stream needed after the last successful decode call, or
+    /// `None` when the decoder stopped for output space. C: `CBcj2Dec::state`
+    /// below `BCJ2_NUM_STREAMS`. Refilling only this stream avoids waiting
+    /// for unrelated inputs in a threaded coder graph.
+    #[must_use]
+    pub fn required_input(&self) -> Option<usize> {
+        (self.state < NUM_STREAMS).then_some(self.state)
+    }
+
     /// Whether the decoder is waiting for more of the main stream rather than
     /// holding bytes it could not write. C:
     /// `Bcj2Dec_IsMaybeFinished_state_MAIN`.
@@ -300,8 +389,16 @@ impl Bcj2Dec {
     /// are not a valid range-coder priming (C: `SZ_ERROR_DATA`), and
     /// [`Bcj2Error::UnalignedStream`] if the call or jump slice is not a
     /// multiple of four bytes long.
-    #[allow(clippy::too_many_lines)]
     pub fn decode(&mut self, s: &mut Bcj2DecStreams<'_>) -> Result<(), Bcj2Error> {
+        #[cfg(feature = "kernel-ab")]
+        if crate::kernel_ab::bcj2_sdk() {
+            return cursor::decode(self, s);
+        }
+        self.decode_checked(s)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn decode_checked(&mut self, s: &mut Bcj2DecStreams<'_>) -> Result<(), Bcj2Error> {
         if !s.bufs[STREAM_CALL].len().is_multiple_of(4)
             || !s.bufs[STREAM_JUMP].len().is_multiple_of(4)
         {
@@ -387,35 +484,10 @@ impl Bcj2Dec {
             }
 
             {
-                // C: the `ONE_ITER` loop, which copies the main stream to the
-                // output until it meets a branch opcode. The C unrolls it four
-                // at a time behind a length rounded down to a multiple of four
-                // and then finishes byte at a time; both arms copy one byte,
-                // test it, and stop on the same byte, and the amount consumed
-                // from the main stream is taken from how far `dest` moved, so
-                // one byte-at-a-time loop is the same function.
-                //
-                // The loop here only looks: it finds the byte that stops the
-                // run, within what both the main stream and `dest` have, and
-                // the run up to and including it is then copied as one slice.
-                // Storing through `s` a byte at a time costs a store of
-                // `dest_pos` per byte, which is most of the conversion.
                 let main = s.bufs[STREAM_MAIN];
                 let start = s.dest_pos;
-                let n = main.len().min(s.dest.len() - start);
-                let src = &main[..n];
-                let mut copied = 0usize;
-                let mut found = false;
-                while copied != n {
-                    let b = u32::from(src[copied]);
-                    copied += 1;
-                    v = (v << 24) | b;
-                    if is_branch_byte(b) || is_long_jump(v) {
-                        found = true;
-                        break;
-                    }
-                }
-                s.dest[start..start + copied].copy_from_slice(&src[..copied]);
+                let (copied, context, found) = copy_main(main, &mut s.dest[start..], v);
+                v = context;
                 s.dest_pos = start + copied;
                 s.bufs[STREAM_MAIN] = &main[copied..];
                 self.ip = self.ip.wrapping_add(copied as u32);
@@ -1083,6 +1155,46 @@ fn truncated(mut v: Vec<u8>, n: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_copy_kernels_match_bytewise_scan_at_every_edge() {
+        for seed in [1, 0x1234_5678, 0x8765_4321] {
+            let mut rng = Rng(seed);
+            let mut input: Vec<u8> = (0..257).map(|_| rng.next() as u8).collect();
+            for offset in 0..8 {
+                input[offset * 29..offset * 29 + 4].copy_from_slice(&[0x0f, 0x84, 0xe8, 0xe9]);
+            }
+            for begin in 0..input.len() {
+                for size in 0..=17 {
+                    for context in [0, 0x0f, 0x90, 0x1234_5678] {
+                        let source = &input[begin..];
+                        let mut expected = vec![0xcc; size];
+                        let mut v = context;
+                        let mut count = 0;
+                        let mut found = false;
+                        for (&b, out) in source.iter().zip(&mut expected) {
+                            *out = b;
+                            count += 1;
+                            v = (v << 24) | u32::from(b);
+                            if is_branch_byte(u32::from(b)) || is_long_jump(v) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        let mut actual = vec![0xcc; size];
+                        assert_eq!(copy_main(source, &mut actual, context), (count, v, found));
+                        assert_eq!(actual, expected);
+                        actual.fill(0xcc);
+                        assert_eq!(
+                            copy_main_grouped(source, &mut actual, context),
+                            (count, v, found)
+                        );
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
 
     /// A xorshift, so the inputs are generated rather than committed.
     struct Rng(u32);
