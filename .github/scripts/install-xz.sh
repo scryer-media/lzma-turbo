@@ -75,7 +75,9 @@ else
   name="xz-${VERSION}-windows.zip"
   curl --fail --silent --show-error --location --retry 3 --output "$name" "${BASE}/${name}"
   check_sha256 "$name" "$WINDOWS_SHA256"
-  dest="${RUNNER_TEMP:-$PWD}/xz-${VERSION}"
+  # Git Bash PATH uses colons as separators; a native drive-letter path
+  # would split into unrelated entries and leave the image's xz selected.
+  dest="$(cygpath -u "${RUNNER_TEMP:-$PWD}")/xz-${VERSION}"
   rm -rf "$dest"
   mkdir -p "$dest"
   # Not every Git for Windows image has `unzip`; PowerShell is always there.
@@ -92,7 +94,7 @@ else
   }
   # Ahead of anything the image has, for every later step of the job.
   if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "$bin" >> "$GITHUB_PATH"
+    cygpath -w "$bin" >> "$GITHUB_PATH"
   fi
   export PATH="$bin:$PATH"
 fi
