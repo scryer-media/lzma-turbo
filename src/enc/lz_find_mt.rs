@@ -4265,93 +4265,104 @@ mod tests {
 
     /// Compare the whole LZ-owned transition, not just emitted matches:
     /// every tail, low-hash family, BT entry width and failure-parking step.
-    #[test]
-    fn skip_spans_preserve_checked_state_at_tails_and_parked_failures() {
+    fn check_skip_span_tails(kind: MatchFinderKind, parked: bool) {
         let lengths: &[usize] = if cfg!(miri) {
             &[1, 2, 3, 4, 5, 9]
         } else {
             &[1, 2, 3, 4, 5, 31, 257]
         };
         let prefixes: &[usize] = if cfg!(miri) { &[1] } else { &[0, 1, 7] };
-        for kind in [
-            MatchFinderKind::Bt2,
-            MatchFinderKind::Bt3,
-            MatchFinderKind::Bt4,
-            MatchFinderKind::Bt5,
-        ] {
-            for &len in lengths {
-                for &prefix in prefixes {
-                    for parked in [false, true] {
-                        for varied in [false, true] {
-                            let run = |checked: bool| {
-                                let mut mt = MatchFinderMt::new();
-                                prepare(&mut mt, kind, prefix + len, false, true);
-                                {
-                                    let sh = mt.shared();
-                                    let c = sh.common();
-                                    // SAFETY: inline fixture, before any call;
-                                    // no producer can access these buffers.
-                                    unsafe {
-                                        // SAFETY: create published this initialized extent;
-                                        // no window references or producers are active.
-                                        // Reborrow its pointer, not the owner: DerefMut
-                                        // on the owner would invalidate the published tag.
-                                        let win = core::slice::from_raw_parts_mut(c.win, c.win_len);
-                                        for (i, byte) in win.iter_mut().enumerate() {
-                                            *byte = (i.wrapping_mul(37) + i / 7) as u8;
-                                        }
-                                        c.low_hash().fill(0x1234_5678);
-                                        let l = &mut *sh.lz_state.get();
-                                        l.pointer_to_cur_pos = prefix;
-                                        l.bt_num_avail_bytes = len as u32;
-                                        l.lz_pos = 97;
-                                        if parked {
-                                            c.bt_park().fill(0);
-                                            l.bt_buf_pos = BT_BUFFER_SIZE;
-                                            l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
-                                            l.failure_lz_bt = true;
-                                        } else {
-                                            let bt = c.bt_block(0);
-                                            bt.fill(0xfeed_1234);
-                                            let mut at = 2;
-                                            for i in 0..len {
-                                                let words = if varied { 2 * (i % 3) } else { 0 };
-                                                bt[at] = words as u32;
-                                                at += words + 1;
-                                            }
-                                            bt[0] = at as u32;
-                                            bt[1] = len as u32;
-                                            l.bt_buf_pos = 2;
-                                            l.bt_buf_pos_limit = at;
-                                        }
-                                    }
+        for &len in lengths {
+            for &prefix in prefixes {
+                for varied in [false, true] {
+                    let run = |checked: bool| {
+                        let mut mt = MatchFinderMt::new();
+                        prepare(&mut mt, kind, prefix + len, false, true);
+                        {
+                            let sh = mt.shared();
+                            let c = sh.common();
+                            // SAFETY: inline fixture, before any call;
+                            // no producer can access these buffers.
+                            unsafe {
+                                // SAFETY: create published this initialized extent;
+                                // no window references or producers are active.
+                                // Reborrow its pointer, not the owner: DerefMut
+                                // on the owner would invalidate the published tag.
+                                let win = core::slice::from_raw_parts_mut(c.win, c.win_len);
+                                for (i, byte) in win.iter_mut().enumerate() {
+                                    *byte = (i.wrapping_mul(37) + i / 7) as u8;
                                 }
-                                let mut states = Vec::new();
-                                let mut left = len as u32;
-                                // Force both returns within a held block and
-                                // its exact end, including the short tail.
-                                for requested in [1, 2, 5, left] {
-                                    if left == 0 {
-                                        break;
+                                c.low_hash().fill(0x1234_5678);
+                                let l = &mut *sh.lz_state.get();
+                                l.pointer_to_cur_pos = prefix;
+                                l.bt_num_avail_bytes = len as u32;
+                                l.lz_pos = 97;
+                                if parked {
+                                    c.bt_park().fill(0);
+                                    l.bt_buf_pos = BT_BUFFER_SIZE;
+                                    l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
+                                    l.failure_lz_bt = true;
+                                } else {
+                                    let bt = c.bt_block(0);
+                                    bt.fill(0xfeed_1234);
+                                    let mut at = 2;
+                                    for i in 0..len {
+                                        let words = if varied { 2 * (i % 3) } else { 0 };
+                                        bt[at] = words as u32;
+                                        at += words + 1;
                                     }
-                                    let n = requested.min(left);
-                                    if checked {
-                                        skip_reference(&mut mt, &mut NoStream, n);
-                                    } else {
-                                        mt.skip(&mut NoStream, n);
-                                    }
-                                    states.push(skip_state(&mt));
-                                    left -= n;
+                                    bt[0] = at as u32;
+                                    bt[1] = len as u32;
+                                    l.bt_buf_pos = 2;
+                                    l.bt_buf_pos_limit = at;
                                 }
-                                states
-                            };
-                            assert_eq!(run(false), run(true), "len={len}, prefix={prefix}");
+                            }
                         }
-                    }
+                        let mut states = Vec::new();
+                        let mut left = len as u32;
+                        // Force both returns within a held block and
+                        // its exact end, including the short tail.
+                        for requested in [1, 2, 5, left] {
+                            if left == 0 {
+                                break;
+                            }
+                            let n = requested.min(left);
+                            if checked {
+                                skip_reference(&mut mt, &mut NoStream, n);
+                            } else {
+                                mt.skip(&mut NoStream, n);
+                            }
+                            states.push(skip_state(&mt));
+                            left -= n;
+                        }
+                        states
+                    };
+                    assert_eq!(run(false), run(true), "len={len}, prefix={prefix}");
                 }
             }
         }
     }
+
+    // Each family/state pair is a separate CI Miri shard. Keep the full
+    // Cartesian product above: the combined test exceeds a runner's hour
+    // limit because Miri interprets each allocation and table comparison.
+    macro_rules! skip_span_tail_test {
+        ($name:ident, $kind:ident, $parked:literal) => {
+            #[test]
+            fn $name() {
+                check_skip_span_tails(MatchFinderKind::$kind, $parked);
+            }
+        };
+    }
+
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt2, Bt2, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt3, Bt3, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt4, Bt4, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt5, Bt5, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt2, Bt2, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt3, Bt3, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt4, Bt4, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt5, Bt5, true);
 
     /// Short destinations must enter the old path before any mutation. A
     /// synthetic rewrite explicitly revokes acquisition provenance; a plausible
