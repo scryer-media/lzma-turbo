@@ -89,6 +89,55 @@ fn lzma2_vectors() -> impl Iterator<Item = (String, u8, Vec<u8>)> {
 }
 
 #[test]
+fn positional_ring_runs_match_the_sdk_vectors() {
+    let Some(_) = decoders() else { return };
+    use lzma_turbo::{Lzma2RunScanner, run::Lzma2RunDecoder};
+    use std::sync::atomic::AtomicBool;
+
+    for (name, prop, packed) in lzma2_vectors() {
+        let source = data(&format!("src_{}.bin", name.split('.').next().unwrap()));
+        let mut scanner = Lzma2RunScanner::new();
+        scanner.feed(&packed).unwrap();
+        assert!(scanner.finished(), "{name}");
+        let mut actual = Vec::new();
+        while let Some(run) = scanner.next_run() {
+            let mut decoder = Lzma2RunDecoder::new(0, prop, run, u64::MAX).unwrap();
+            let image = &packed[run.in_offset as usize..(run.in_offset + run.packed_len) as usize];
+            let cancel = AtomicBool::new(false);
+            let mut position = 0;
+            loop {
+                let end = (position + 4093).min(image.len());
+                let progress = decoder
+                    .decode(
+                        &image[position..end],
+                        37019,
+                        &cancel,
+                        &mut |offset, bytes: &[u8]| {
+                            assert_eq!(offset, actual.len() as u64);
+                            let size = bytes.len().min(8191);
+                            actual.extend_from_slice(&bytes[..size]);
+                            Ok(size)
+                        },
+                    )
+                    .unwrap();
+                position += progress.read;
+                if progress.read == 0 && progress.written == 0 {
+                    assert_eq!(position, image.len());
+                    break;
+                }
+            }
+            decoder.finish(&cancel).unwrap();
+        }
+        assert_eq!(actual, source, "{name}");
+        for &variant in VARIANTS {
+            let trace = trace_lzma2(Which::Sdk(variant), prop, &packed, Shape::new(4093, 37019));
+            assert!(trace.calls.iter().all(Result::is_ok), "{variant:?} {name}");
+            assert_eq!(actual, trace.output, "{variant:?} {name}");
+        }
+    }
+}
+
+#[test]
 fn the_sdk_oracle_decodes_the_vectors_to_their_sources() {
     // The oracle is checked against the plaintext, not only against the
     // crate: a broken oracle build must not pass for a working one.

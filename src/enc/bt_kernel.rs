@@ -1,14 +1,15 @@
 //! The bt thread's SDK tree walk with a checked margin wrapper.
 //!
 //! C: GetMatchesSpecN_2 in SDK 26.03's Asm/x86/LzFindOpt.asm and
-//! C/LzFindOpt.c. The x86-64 path expands the upstream assembly's System V
-//! macros directly: lengths are negative offsets from the match limit, tree
-//! pointers stay in registers, and the node's first child load precedes the
-//! byte comparison. See bt_kernel_x86_64.S for provenance and the two error
-//! checks that preserve this port's behavior on invalid tables. The length
-//! extension uses bounded 16/8-byte comparisons after two equal bytes, with
-//! a byte tail at the match limit. `scan` below uses the same margin with
-//! eight-byte words on the portable path.
+//! C/LzFindOpt.c. All x86-64 variants use negative offsets from the match
+//! limit and load the node's first child before comparing bytes. The earlier
+//! bt_kernel_x86_64.S changes register allocation and child addressing, and
+//! extends matches with bounded 16/8-byte comparisons and a byte tail.
+//! bt_kernel_x86_64_sdk.S retains the complete upstream System V instruction
+//! sequence for the fixed x86-64 candidate and differential tests. The sdk_wide
+//! diagnostic combines that flow with the earlier bounded extension. All preserve
+//! this port's two additional invalid-table checks. `scan` below uses the
+//! same margin with eight-byte words on the portable path.
 //!
 //! The wrapper establishes the slice kernel's five bounds invariants and
 //! reserves output for a complete position (F). Short output buffers use the
@@ -59,9 +60,148 @@ unsafe fn scan(cur: *const u8, diff: usize, mut len: usize, lim: usize) -> usize
 /// [`super::lz_find_mt`], which documents them; see the module comment for how
 /// it differs.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn get_matches_spec_n_2_reg(
+    win: &[u8],
+    len_limit_0: usize,
+    pos: u32,
+    cur: usize,
+    son: &mut [u32],
+    cut_value: u32,
+    d: &mut [u32],
+    di: usize,
+    max_len_0: usize,
+    heads: &[u32],
+    hi: usize,
+    limit: usize,
+    hsize: usize,
+    cyclic_buffer_pos: u32,
+    cyclic_buffer_size: u32,
+) -> Option<(usize, u32)> {
+    #[cfg(all(
+        feature = "kernel-ab",
+        not(miri),
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "macos")
+        )
+    ))]
+    match crate::kernel_ab::bt_variant() {
+        1 => {
+            return get_matches_spec_n_2_reg_variant::<1>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
+        2 => {
+            return get_matches_spec_n_2_reg_variant::<2>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        3 => {
+            return get_matches_spec_n_2_reg_variant::<3>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        4 => {
+            return get_matches_spec_n_2_reg_variant::<4>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
+        _ => {}
+    }
+    get_matches_spec_n_2_reg_variant::<
+        {
+            if cfg!(feature = "kernel-ab") {
+                0
+            } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+                4
+            } else {
+                1
+            }
+        },
+    >(
+        win,
+        len_limit_0,
+        pos,
+        cur,
+        son,
+        cut_value,
+        d,
+        di,
+        max_len_0,
+        heads,
+        hi,
+        limit,
+        hsize,
+        cyclic_buffer_pos,
+        cyclic_buffer_size,
+    )
+}
+
+/// Shared margin proof for all assembly variants. Tests select each variant
+/// explicitly, without process-global environment changes or races.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 #[inline(never)]
-pub(crate) fn get_matches_spec_n_2_reg(
+pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
     win: &[u8],
     len_limit_0: usize,
     mut pos: u32,
@@ -147,6 +287,50 @@ pub(crate) fn get_matches_spec_n_2_reg(
             cyclic_buffer_size,
         );
     }
+    #[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+    if (VARIANT == 2 || VARIANT == 3 || VARIANT == 4)
+        && lim <= u32::MAX as usize
+        && (!cfg!(debug_assertions) || cut_value != 0)
+        && (pos as usize)
+            .checked_add(n)
+            .is_some_and(|end| end <= u32::MAX as usize)
+        && (pos >= cyclic_buffer_size || pos == cyclic_buffer_pos)
+    {
+        let stop = d.as_ptr().addr().saturating_add(limit.saturating_mul(4));
+        let mut pos_res = pos;
+        // SAFETY: A/B bound tree nodes; C/D bound lookahead; E and the
+        // descending-child checks bound backward reads; F reserves output.
+        // The guards preserve 32-bit positions and debug cut-count overflow.
+        // The assembly borrows these slices only for this call, preserves all
+        // callee-saved registers, and writes only the exclusive son/d/pos_res.
+        let walk = match VARIANT {
+            4 => sdk_walk_arm64_negative,
+            3 => sdk_walk_arm64_wide,
+            _ => sdk_walk_arm64,
+        };
+        let end = unsafe {
+            walk(
+                win.as_ptr().add(len_limit_0),
+                pos as usize,
+                win.as_ptr().add(cur),
+                son.as_mut_ptr(),
+                cut_value,
+                d.as_mut_ptr().add(di),
+                max_len_0,
+                heads.as_ptr().add(hi),
+                stop,
+                heads.as_ptr().add(hsize),
+                cyclic_buffer_pos as usize,
+                cyclic_buffer_size,
+                &raw mut pos_res,
+            )
+        };
+        if end.is_null() {
+            return None;
+        }
+        // SAFETY: F confines the returned cursor to d or its one-past end.
+        return Some((unsafe { end.offset_from(d.as_ptr()) } as usize, pos_res));
+    }
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if lim <= u32::MAX as usize
         // Preserve the checked kernel's debug overflow on a zero cut count.
@@ -159,6 +343,18 @@ pub(crate) fn get_matches_spec_n_2_reg(
     {
         let stop = d.as_ptr().addr().saturating_add(limit.saturating_mul(4));
         let mut pos_res = pos;
+        #[cfg(any(test, feature = "kernel-ab"))]
+        let walk = match VARIANT {
+            1 => sdk_walk_faithful,
+            2 => sdk_walk_faithful_wide,
+            _ => sdk_walk,
+        };
+        #[cfg(not(any(test, feature = "kernel-ab")))]
+        let walk = if VARIANT == 1 {
+            sdk_walk_faithful
+        } else {
+            sdk_walk
+        };
         // SAFETY: A/B bound every tree node; C/D bound the current and
         // lookahead bytes; E and the assembly's descending-child checks bound
         // backward reads. F reserves all output writes. The guards above
@@ -167,7 +363,7 @@ pub(crate) fn get_matches_spec_n_2_reg(
         // All pointers borrow these slices for this call only; son/d are
         // exclusive and pos_res is initialized, exclusively owned storage.
         let end = unsafe {
-            sdk_walk(
+            walk(
                 win.as_ptr().add(len_limit_0),
                 pos as usize,
                 win.as_ptr().add(cur),
@@ -323,6 +519,29 @@ pub(crate) fn get_matches_spec_n_2_reg(
                             {
                                 break;
                             }
+                            // Each repeated match emits exactly three words.
+                            // Fold the output threshold into the head bound so
+                            // the inner loop has only one remaining-count test.
+                            let output_positions = (stop - dist.addr() - 1) / 12 + 1;
+                            // SAFETY: both head cursors belong to heads; the
+                            // new bound never exceeds its established end.
+                            let repeat_end = unsafe {
+                                head.add(output_positions.min(head_end.offset_from(head) as usize))
+                            };
+                            // At distance one, every destination copies the
+                            // node just written. Keep that value across the
+                            // run instead of a load dependent on each store.
+                            let repeated_node = if delta == 1 {
+                                // SAFETY: A and B cover the current node's two
+                                // initialized words; u64 alignment is not needed.
+                                unsafe {
+                                    tree.add((cyclic_buffer_pos as usize) << 1)
+                                        .cast::<u64>()
+                                        .read_unaligned()
+                                }
+                            } else {
+                                0
+                            };
                             loop {
                                 // SAFETY: F covers this position's triple.
                                 unsafe {
@@ -340,12 +559,16 @@ pub(crate) fn get_matches_spec_n_2_reg(
                                     << 1;
                                 // SAFETY: A covers the next position and B
                                 // its two tree words; the wrapped source is
-                                // below cyclic by the same tree invariant.
+                                // below cyclic by the same tree invariant. The
+                                // u64 copy needs only u32 alignment and preserves
+                                // both words regardless of native byte order.
                                 unsafe {
-                                    let p0 = tree.add(src).read();
-                                    let p1 = tree.add(src + 1).read();
-                                    tree.add(dest).write(p0);
-                                    tree.add(dest + 1).write(p1);
+                                    let node = if delta == 1 {
+                                        repeated_node
+                                    } else {
+                                        tree.add(src).cast::<u64>().read_unaligned()
+                                    };
+                                    tree.add(dest).cast::<u64>().write_unaligned(node);
                                 }
                                 pos = pos.wrapping_add(1);
                                 // SAFETY: the preceding condition established
@@ -353,13 +576,12 @@ pub(crate) fn get_matches_spec_n_2_reg(
                                 head = unsafe { head.add(1) };
                                 // SAFETY: another head implies another window
                                 // byte by D, and E bounds the backward read.
-                                if head == head_end
+                                if head == repeat_end
                                     || unsafe { head.read() } != delta
                                     || unsafe {
                                         base.add(cur + lim - diff).read()
                                             != base.add(cur + lim).read()
                                     }
-                                    || dist.addr() >= stop
                                 {
                                     break;
                                 }
@@ -427,6 +649,84 @@ pub(crate) fn get_matches_spec_n_2_reg(
     Some((unsafe { dist.offset_from(output) } as usize, pos))
 }
 
+/// C: GetMatchesSpecN_2 in SDK 26.03's C/LzFindOpt.c, ARM64 register map.
+///
+/// # Safety
+/// Requires the A-F margins and integer guards established by the wrapper.
+/// Native differential tests cover mutations and refusals; Miri uses Rust.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_sdk.S"), options(raw))
+}
+
+/// SDK ARM64 flow retaining the portable walk's bounded word scan and early
+/// child fetch. Diagnostic only; the unmodified SDK variant remains available.
+///
+/// # Safety
+/// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64_wide(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_sdk_wide.S"), options(raw))
+}
+
+/// SDK GetMatchesSpecN_2 negative-offset control flow ported to ARM64.
+///
+/// # Safety
+/// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
+/// The native register-walk differential suite checks this diagnostic port.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64_negative(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_negative.S"), options(raw))
+}
+
 /// C: GetMatchesSpecN_2 in SDK 26.03's LzFindOpt.asm, System V register map.
 ///
 /// # Safety
@@ -454,4 +754,60 @@ unsafe extern "sysv64" fn sdk_walk(
     pos_res: *mut u32,
 ) -> *mut u32 {
     core::arch::naked_asm!(include_str!("bt_kernel_x86_64.S"), options(raw))
+}
+
+/// Complete SDK GetMatchesSpecN_2 expansion, sharing the same checked entry
+/// contract as the retained earlier kernel.
+///
+/// # Safety
+///
+/// Identical A-F, integer and direct-mode preconditions to `sdk_walk` above.
+/// The same wrapper establishes them before either variant is entered.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "sysv64" fn sdk_walk_faithful(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_x86_64_sdk.S"), options(raw))
+}
+
+/// SDK GetMatchesSpecN_2 flow with bounded match extension for tests and
+/// the non-default kernel-ab measurement feature.
+///
+/// # Safety
+///
+/// Identical A-F, integer and direct-mode preconditions to `sdk_walk` above.
+/// The same wrapper establishes them before either variant is entered.
+#[cfg(all(target_arch = "x86_64", not(miri), any(test, feature = "kernel-ab")))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "sysv64" fn sdk_walk_faithful_wide(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_x86_64_sdk_wide.S"), options(raw))
 }

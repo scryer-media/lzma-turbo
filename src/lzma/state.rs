@@ -170,10 +170,7 @@ impl LzmaDec {
             .map_err(|_| Error::Alloc)?;
         probs.resize(num_probs, 0);
 
-        let mut dic = Vec::new();
-        dic.try_reserve_exact(dic_buf_size)
-            .map_err(|_| Error::Alloc)?;
-        dic.resize(dic_buf_size, 0);
+        let dic = crate::buffer::zeroed_vec(dic_buf_size)?;
 
         let mut p = LzmaDec {
             prop,

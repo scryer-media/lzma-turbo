@@ -566,9 +566,10 @@ jobs:
   # agrees. Miri runs a thousand of the tables; the ordinary `test` job runs
   # all sixty thousand natively. The release run is the entry assertions in
   # the build that ships: they must panic there too, not only under debug
-  # assertions. Second, `zeroed_vec` in `src/enc/lz_find.rs`, which hands
-  # the match finder's window and tables over from `alloc_zeroed` through
-  # `Vec::from_raw_parts`; its test allocates every `Zeroable` type at odd
+  # assertions. Second, shared `zeroed_vec` in `src/buffer.rs`, which hands
+  # decoder dictionaries and the match finder's window and tables over from
+  # `alloc_zeroed` through `Vec::from_raw_parts`; its encoder-wrapper test
+  # allocates every `Zeroable` type at odd
   # lengths, reads, writes, grows and frees each, and Miri checks the layout,
   # the initialisation and the free. Third, the direct-input hand-off in
   # `run_block` (`src/enc/lz_find_mt.rs`), which gives the kept producer
@@ -578,12 +579,29 @@ jobs:
   # the first hand-off, partway, at the end and in a panic, and drops each
   # block as soon as `run_block` returns, so that under Miri a read after
   # `Stop` is a use after free and a racing hand-off is a data race.
-  unchecked-kernel-miri:
-    name: unchecked-kernel-miri
+  # Discover the existing selection under cfg(miri), so new tests matching
+  # these prefixes automatically get their own shard. The native release
+  # sweep keeps the full selection, including native-only tests.
+  unchecked-kernel-miri-plan:
+    name: unchecked-kernel-miri-plan
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
     env:
       MIRI_TOOLCHAIN: nightly-2026-09-01
+      MIRI_FILTERS: >-
+        enc::lz_find_mt::tests::the_
+        enc::lz_find::tests::a_zeroed_vec_
+        enc::lz_find_mt::tests::get_heads_
+        enc::lz_find_mt::tests::held_records_preserve_short_output_and_synthetic_failure_state
+        enc::lz_find_mt::tests::skip_spans_preserve_checked_
+        enc::lz_find_mt::tests::a_direct_block_
+        enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity
+        enc::lzma2_enc::tests::owned_blocks_match_copied_windows_and_return_their_allocation
+        enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
+        enc::lz_find::normalize::tests::normalization_
+        filters::bcj2::cursor::tests::sdk_cursor_
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -595,22 +613,77 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Portable encoder unsafe invariants under Miri
+      - name: Discover every selected Miri test
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a filters <<< "$MIRI_FILTERS"
+          cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
+            --no-default-features --features std,enc,filters \
+            -- "${filters[@]}" --list --format terse > "$RUNNER_TEMP/miri-tests.txt"
+          python3 - "$RUNNER_TEMP/miri-tests.txt" "$GITHUB_OUTPUT" <<'PYTHON'
+          import json
+          import pathlib
+          import sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          tests = [line.removesuffix(": test") for line in lines if line.endswith(": test")]
+          if not tests or len(tests) != len(set(tests)):
+              raise SystemExit("Miri discovery returned no tests or duplicate tests")
+          matrix = {"test": sorted(tests)}
+          with open(sys.argv[2], "a") as output:
+              output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+          print(f"Scheduled {len(tests)} individual Miri tests")
+          PYTHON
+      - name: The full selection in the release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a filters <<< "$MIRI_FILTERS"
+          cargo "+$RUST_TOOLCHAIN" test --locked --release --lib \
+            --no-default-features --features std,enc,filters \
+            -- "${filters[@]}"
+
+  unchecked-kernel-miri-tests:
+    name: miri-${{ matrix.test }}
+    needs: unchecked-kernel-miri-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.unchecked-kernel-miri-plan.outputs.matrix) }}
+    env:
+      MIRI_TOOLCHAIN: nightly-2026-09-01
+      MIRI_TEST: ${{ matrix.test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - name: Portable kernel unsafe invariants under Miri
         run: |
           cargo "+$MIRI_TOOLCHAIN" miri test --locked --lib \
-            --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
-            enc::lz_find_mt::tests::a_direct_block_ \
-            enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
-            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
-      - name: The same tests in the release build
-        run: |
-          cargo test --locked --release --lib \
-            --no-default-features --features std,enc \
-            -- enc::lz_find_mt::tests::the_ enc::lz_find::tests::a_zeroed_vec_ \
-            enc::lz_find_mt::tests::a_direct_block_ \
-            enc::lzma2_enc::tests::shrinking_a_result_preserves_bytes_and_releases_capacity \
-            enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
+            --no-default-features --features std,enc,filters \
+            -- --exact "$MIRI_TEST" --nocapture
+
+  # Keep the existing required-check name and fail closed when discovery or
+  # any shard fails, is cancelled, or is skipped.
+  unchecked-kernel-miri:
+    name: unchecked-kernel-miri
+    if: always()
+    needs: [unchecked-kernel-miri-plan, unchecked-kernel-miri-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Miri shard and the native release sweep
+        env:
+          PLAN_RESULT: ${{ needs.unchecked-kernel-miri-plan.result }}
+          TEST_RESULT: ${{ needs.unchecked-kernel-miri-tests.result }}
+        run: test "$PLAN_RESULT" = success && test "$TEST_RESULT" = success
 
   # Two minutes of the differential fuzz target per assembly architecture;
   # the nightly schedule in fuzz.yml runs it for half an hour.

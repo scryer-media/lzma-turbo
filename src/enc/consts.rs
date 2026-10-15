@@ -32,9 +32,14 @@ pub(crate) const REP_LEN_COUNT: i32 = 64;
 /// constant and the slot it returns must not depend on the host, so the
 /// 64-bit value is used everywhere. That costs 2 KiB of table on a 32-bit
 /// target and makes the output identical on both.
+#[cfg(any(
+    all(test, feature = "std"),
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
 pub(crate) const K_NUM_LOG_BITS: usize = 11 + 3;
 
 /// C: `kDicLogSizeMaxCompress`.
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 pub(crate) const K_DIC_LOG_SIZE_MAX_COMPRESS: u32 = (K_NUM_LOG_BITS as u32 - 1) * 2 + 7;
 
 /// C: `LZMA_NUM_REPS`.

@@ -52,6 +52,38 @@ impl Delta {
         }
         let delta = self.distance;
 
+        if delta == 1 {
+            // Delta_Decode's recurrence needs only the preceding decoded
+            // byte. Keep it in a local instead of reloading it from output.
+            let mut previous = self.state[0];
+            for byte in data {
+                previous = previous.wrapping_add(*byte);
+                *byte = previous;
+            }
+            self.state[0] = previous;
+            return;
+        }
+
+        if delta == 4 {
+            // Delta_Decode has four independent recurrences at this distance.
+            // Keep their preceding bytes together across complete groups.
+            let mut previous: [u8; 4] = self.state[..4].try_into().expect("four-byte history");
+            let mut groups = data.chunks_exact_mut(4);
+            for group in groups.by_ref() {
+                for (byte, prior) in group.iter_mut().zip(&mut previous) {
+                    *prior = prior.wrapping_add(*byte);
+                    *byte = *prior;
+                }
+            }
+            for byte in groups.into_remainder() {
+                *byte = byte.wrapping_add(previous[0]);
+                previous.rotate_left(1);
+                previous[3] = *byte;
+            }
+            self.state[..4].copy_from_slice(&previous);
+            return;
+        }
+
         if size <= delta {
             for (i, b) in data.iter_mut().enumerate() {
                 *b = b.wrapping_add(self.state[i]);

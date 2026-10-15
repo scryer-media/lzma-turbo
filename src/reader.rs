@@ -331,6 +331,85 @@ impl<R: Read> Lzma2Reader<R> {
     }
 }
 
+impl<R: Read> Lzma2Reader<R> {
+    /// Performs one `Read`-equivalent operation without copying its output.
+    ///
+    /// `None` means the requested read could cross the dictionary boundary;
+    /// neither input nor decoder state has changed, so the caller can use
+    /// [`Read::read`] instead. The callback sees the same complete successful
+    /// read, including its chunk boundary, before the dictionary can be reused.
+    /// It may validate that span before passing it to an output sink.
+    ///
+    /// # Errors
+    /// Returns the same source and decoding errors as `read`, without calling
+    /// the callback for a failed read. Callback errors pass through after the
+    /// successful read has been consumed. Recovery after a decoding error or
+    /// a callback panic is not guaranteed.
+    pub fn read_borrowed<F>(&mut self, max: usize, sink: &mut F) -> Option<io::Result<usize>>
+    where
+        F: FnMut(&[u8]) -> io::Result<()> + ?Sized,
+    {
+        if self.done || max == 0 {
+            return Some(Ok(0));
+        }
+        let pos = self.dec.dic_pos();
+        let size = self.dec.dic_buf_size();
+        let available = if pos == size { size } else { size - pos };
+        if max > available {
+            return None;
+        }
+        Some(self.read_contiguous(max, sink))
+    }
+
+    fn read_contiguous<F>(&mut self, max: usize, sink: &mut F) -> io::Result<usize>
+    where
+        F: FnMut(&[u8]) -> io::Result<()> + ?Sized,
+    {
+        loop {
+            self.src.fill()?;
+            self.dec.wrap_dic_pos();
+            let start = self.dec.dic_pos();
+            let mut used = 0;
+            // C: Lzma2Dec_DecodeToBuf, with its copy omitted. Preserve the
+            // extra decode step after partial output and commit input only
+            // after the complete read succeeds, exactly as Read does.
+            let status = loop {
+                let before = self.dec.dic_pos();
+                let (read, status) = self
+                    .dec
+                    .decode_block(
+                        start + max,
+                        &self.src.buf[self.src.pos + used..self.src.len],
+                        FinishMode::Any,
+                    )
+                    .map_err(to_io)?;
+                used += read;
+                if self.dec.dic_pos() == before || self.dec.dic_pos() - start == max {
+                    break status;
+                }
+            };
+            self.src.pos += used;
+            let end = self.dec.dic_pos();
+            if status == Status::FinishedWithMark {
+                self.done = true;
+            }
+            if end != start {
+                sink(self.dec.dic_slice(start, end))?;
+                return Ok(end - start);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            if used == 0 && self.src.eof {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated LZMA2 stream",
+                ));
+            }
+        }
+    }
+}
+
 impl<R: Read> Read for Lzma2Reader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.done || out.is_empty() {
@@ -363,6 +442,199 @@ impl<R: Read> Read for Lzma2Reader<R> {
             }
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod borrowed_read_tests {
+    use super::*;
+
+    fn stored(bytes: &[u8]) -> Vec<u8> {
+        let mut packed = Vec::new();
+        for (index, chunk) in bytes.chunks(65536).enumerate() {
+            packed.push(if index == 0 { 1 } else { 2 });
+            packed.extend_from_slice(&((chunk.len() - 1) as u16).to_be_bytes());
+            packed.extend_from_slice(chunk);
+        }
+        packed.push(0);
+        packed
+    }
+
+    struct Fragmented<'a> {
+        bytes: &'a [u8],
+        cap: usize,
+        interrupt: bool,
+    }
+
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.interrupt {
+                self.interrupt = false;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let n = out.len().min(self.cap).min(self.bytes.len());
+            out[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state() {
+        let data: Vec<u8> = (0..140_000).map(|i| (i * 29) as u8).collect();
+        let packed = stored(&data);
+        for cap in [3, 997, 65536] {
+            for prop in [0, 16] {
+                for truncate in [0, 1, 41] {
+                    let input = &packed[..packed.len() - truncate];
+                    let source = || Fragmented {
+                        bytes: input,
+                        cap,
+                        interrupt: true,
+                    };
+                    let mut oracle = Lzma2Reader::new(source(), prop).unwrap();
+                    let mut candidate = Lzma2Reader::new(source(), prop).unwrap();
+                    let mut calls = 0;
+                    loop {
+                        let max = [0, 1, 4093, 65536, 7][calls % 5];
+                        calls += 1;
+                        let mut expected = vec![0; max];
+                        let result = oracle.read(&mut expected);
+                        let before = (
+                            candidate.src.pos,
+                            candidate.src.len,
+                            candidate.src.inner.bytes.len(),
+                            candidate.dec.dic_pos(),
+                        );
+                        let mut got = Vec::new();
+                        let borrowed = candidate.read_borrowed(max, &mut |bytes| {
+                            got.extend_from_slice(bytes);
+                            Ok(())
+                        });
+                        let actual = match borrowed {
+                            Some(result) => result,
+                            None => {
+                                assert_eq!(
+                                    before,
+                                    (
+                                        candidate.src.pos,
+                                        candidate.src.len,
+                                        candidate.src.inner.bytes.len(),
+                                        candidate.dec.dic_pos()
+                                    )
+                                );
+                                let mut buf = vec![0; max];
+                                candidate
+                                    .read(&mut buf)
+                                    .inspect(|&n| got.extend_from_slice(&buf[..n]))
+                            }
+                        };
+                        match (result, actual) {
+                            (Ok(n), Ok(m)) => {
+                                assert_eq!(n, m);
+                                assert_eq!(&expected[..n], got);
+                                if n == 0 && max != 0 {
+                                    break;
+                                }
+                            }
+                            (Err(a), Err(b)) => {
+                                assert_eq!(a.kind(), b.kind());
+                                assert_eq!(a.to_string(), b.to_string());
+                                assert!(got.is_empty());
+                                if a.kind() != io::ErrorKind::Interrupted {
+                                    break;
+                                }
+                            }
+                            pair => panic!("different outcomes: {pair:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_callback_errors_commit_only_the_completed_read() {
+        let packed = stored(b"abcdefghij");
+        let mut reader = Lzma2Reader::new(packed.as_slice(), 0).unwrap();
+        let error = reader
+            .read_borrowed(4, &mut |_| Err(io::Error::other("sink marker")))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sink marker");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"efghij");
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn borrowed_compressed_reads_engage_and_preserve_reset_and_error_chunks() {
+        use crate::enc::{LzmaEncProps, encode_lzma2};
+        let data: Vec<u8> = (0..17003)
+            .map(|i| ((i / 97 + i % 19) % 251) as u8)
+            .collect();
+        let props = LzmaEncProps {
+            dict_size: 1 << 16,
+            num_threads: 1,
+            ..LzmaEncProps::default()
+        };
+        let (prop, first) = encode_lzma2(&data, &props).unwrap();
+        assert!(
+            first[0] >= 0xe0,
+            "fixture must contain compressed data with dictionary reset"
+        );
+        let mut joined = first[..first.len() - 1].to_vec();
+        joined.extend_from_slice(&first);
+        let mut damaged = joined.clone();
+        damaged[first.len() - 1] = 3;
+        let truncated = joined[..joined.len() - 8].to_vec();
+        for (case, input) in [joined, damaged, truncated].into_iter().enumerate() {
+            for cap in [3, 65536] {
+                let source = || Fragmented {
+                    bytes: &input,
+                    cap,
+                    interrupt: false,
+                };
+                let mut oracle = Lzma2Reader::new(source(), prop).unwrap();
+                let mut candidate = Lzma2Reader::new(source(), prop).unwrap();
+                let mut engaged = 0;
+                let mut all = Vec::new();
+                loop {
+                    let mut expected = vec![0; 17003];
+                    let result = oracle.read(&mut expected);
+                    let mut got = Vec::new();
+                    let actual = candidate
+                        .read_borrowed(expected.len(), &mut |bytes| {
+                            engaged += 1;
+                            got.extend_from_slice(bytes);
+                            Ok(())
+                        })
+                        .expect("both reset streams fit the dictionary");
+                    match (result, actual) {
+                        (Ok(n), Ok(m)) => {
+                            assert_eq!(n, m);
+                            assert_eq!(&expected[..n], got);
+                            all.extend_from_slice(&got);
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                        (Err(a), Err(b)) => {
+                            assert_eq!(a.kind(), b.kind());
+                            assert_eq!(a.to_string(), b.to_string());
+                            assert!(got.is_empty());
+                            break;
+                        }
+                        pair => panic!("compressed outcomes differ: {pair:?}"),
+                    }
+                }
+                if case == 0 {
+                    assert!(engaged > 0);
+                    assert_eq!(all, data.repeat(2));
+                }
+            }
+        }
     }
 }
 

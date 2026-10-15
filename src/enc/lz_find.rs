@@ -4,7 +4,7 @@
 //! (`hc4`, `hc5`) and binary-tree (`bt2`, `bt3`, `bt4`, `bt5`) variants that
 //! `LzmaEnc` configures. `C/LzHash.h` supplies the hash constants.
 //!
-//! The window is `buf_base`, a `Vec<u8>`, and `buffer` is an offset into it
+//! The window is `buf_base`, an owned byte buffer, and `buffer` is an offset into it
 //! rather than the C's pointer; `hash` holds the hash table and the `son`
 //! table in one allocation exactly as `MatchFinder_Create` does, with `son`
 //! starting at `son_base`.
@@ -13,9 +13,7 @@
 //! `super::lz_find_mt`.
 //!
 //! Not ported: `Bt3Zip_*`/`Hc3Zip_*` (the Deflate-shaped finders, which
-//! `LzmaEnc` never selects), and the SSE4.1/AVX2/NEON variants of
-//! `LzFind_SaturSub`, which are codegen for one loop the portable
-//! `LzFind_SaturSub_32` already defines.
+//! `LzmaEnc` never selects). The normalization kernel family is in `normalize`.
 
 use alloc::vec::Vec;
 
@@ -81,16 +79,7 @@ impl MatchFinderKind {
     }
 }
 
-/// A type whose every value may be the all-zero bit pattern.
-///
-/// # Safety
-///
-/// Implement only for types for which all-zero bytes are a valid value.
-pub(crate) unsafe trait Zeroable: Copy {}
-// SAFETY: integers are valid for every bit pattern, zero included.
-unsafe impl Zeroable for u8 {}
-// SAFETY: as above.
-unsafe impl Zeroable for u32 {}
+pub(crate) use crate::buffer::Zeroable;
 
 /// `len` zeroes, allocated zeroed rather than allocated and then filled.
 ///
@@ -103,25 +92,123 @@ unsafe impl Zeroable for u32 {}
 /// the rest of the tables resident, and a finder built per small stream
 /// skips a fill the size of its tables. `resize(len, 0)` wrote every byte.
 pub(crate) fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
-    if len == 0 || core::mem::size_of::<T>() == 0 {
-        return Ok(Vec::new());
-    }
-    let layout = core::alloc::Layout::array::<T>(len).map_err(|_| Error::Alloc)?;
-    // SAFETY: `layout` has a non-zero size (len > 0, T is not zero-sized).
-    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut T;
-    if ptr.is_null() {
-        return Err(Error::Alloc);
-    }
-    // SAFETY: `ptr` came from the global allocator with `T`'s alignment and
-    // room for exactly `len` values, all of which are initialised: zero is a
-    // valid `T` (`Zeroable`). The `Vec` takes ownership and frees it with the
-    // same layout. CI checks this under Miri: the `unchecked-kernel-miri` job
-    // runs `a_zeroed_vec_is_zeroes_of_every_zeroable_type`.
-    let v = unsafe { Vec::from_raw_parts(ptr, len, len) };
+    let v = crate::buffer::zeroed_vec(len)?;
     // Before any page of it is touched, so the faults that fill it come in
     // huge pages.
     crate::enc::huge_pages::advise_vec(&v);
     Ok(v)
+}
+
+/// C: `BigAlloc` aligns large tables, windows and handoff buffers before
+/// huge-page advice. Keep Vec's original owner and
+/// zero allocation: an aligned interior avoids eager initialization by an
+/// over-aligned allocator, and never changes the deallocation layout.
+#[derive(Default, Debug)]
+pub(crate) struct MatchBuffer<T> {
+    storage: Vec<T>,
+    start: usize,
+    len: usize,
+}
+
+pub(crate) type MatchTables = MatchBuffer<u32>;
+pub(crate) type MatchWindow = MatchBuffer<u8>;
+
+impl<T: Zeroable> MatchBuffer<T> {
+    const PAGE_WORDS: usize = (2 << 20) / core::mem::size_of::<T>();
+
+    pub(crate) fn padded_words(len: usize) -> Result<usize, Error> {
+        if cfg!(all(target_os = "linux", feature = "std")) && len > Self::PAGE_WORDS / 2 {
+            len.checked_add(Self::PAGE_WORDS - 1).ok_or(Error::Alloc)
+        } else {
+            Ok(len)
+        }
+    }
+
+    pub(crate) fn new(len: usize) -> Result<Self, Error> {
+        Self::new_with(len, crate::buffer::zeroed_vec::<T>)
+    }
+
+    fn new_with(
+        len: usize,
+        mut allocate: impl FnMut(usize) -> Result<Vec<T>, Error>,
+    ) -> Result<Self, Error> {
+        let mut words = Self::padded_words(len)?;
+        let storage = match allocate(words) {
+            Ok(storage) => storage,
+            // C: BigAlloc falls back to ordinary alignment on refusal. The
+            // optional padding must not turn a usable allocation into OOM.
+            Err(_) if words != len => {
+                words = len;
+                allocate(words)?
+            }
+            Err(error) => return Err(error),
+        };
+        let start = if words != len {
+            let address_words = storage.as_ptr().addr() / core::mem::size_of::<T>();
+            address_words.wrapping_neg() & (Self::PAGE_WORDS - 1)
+        } else {
+            0
+        };
+        // The padding covers every alignment offset. Advise only the logical
+        // table before writes: padding must not add resident huge pages.
+        assert!(start <= words - len);
+        let tables = Self {
+            storage,
+            start,
+            len,
+        };
+        crate::enc::huge_pages::advise_slice(&tables);
+        Ok(tables)
+    }
+
+    pub(crate) fn allocated_words(&self) -> usize {
+        self.storage.len()
+    }
+}
+
+impl MatchWindow {
+    #[cfg(feature = "std")]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
+    /// Restore a worker's input extent after a short read, without replacing
+    /// the owner or exposing its alignment padding as input.
+    #[cfg(feature = "std")]
+    pub(crate) fn resize_zeroed(&mut self, len: usize) -> Result<(), Error> {
+        if len > self.storage.len() - self.start {
+            *self = Self::new(len)?;
+        } else {
+            if len > self.len {
+                self.storage[self.start + self.len..self.start + len].fill(0);
+            }
+            self.len = len;
+        }
+        Ok(())
+    }
+}
+
+impl<T> core::ops::Deref for MatchBuffer<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        &self.storage[self.start..self.start + self.len]
+    }
+}
+
+impl<T> core::ops::DerefMut for MatchBuffer<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.storage[self.start..self.start + self.len]
+    }
+}
+
+#[cfg(test)]
+impl<T: PartialEq> PartialEq for MatchBuffer<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
 }
 
 /// How many chain heads the hash-chain finder takes ahead: 16 KiB, which
@@ -148,12 +235,12 @@ pub(crate) struct MatchFinder {
 
     pub(crate) match_max_len: u32,
     /// C: `p->hash` and `p->son`, one allocation; `son` starts at `son_base`.
-    pub(crate) hash: Vec<u32>,
+    pub(crate) hash: MatchTables,
     pub(crate) son_base: usize,
     pub(crate) hash_mask: u32,
     pub(crate) cut_value: u32,
 
-    pub(crate) buf_base: Vec<u8>,
+    pub(crate) buf_base: MatchWindow,
     /// C: `p->directInput`: the input is a slice the threaded finder reads in
     /// place, so [`MatchFinder::create`] allocates no window. Only
     /// [`crate::enc::lz_find_mt::MatchFinderMt`] sets it; this finder always
@@ -192,7 +279,7 @@ pub(crate) struct MatchFinder {
     /// finder `LzmaEnc_Alloc` picks (`C/LzmaEnc.c:435`) and is allocated
     /// once (`C/LzFindMt.c:863`).
     #[cfg(feature = "std")]
-    pub(crate) mt_bufs: Vec<u32>,
+    pub(crate) mt_bufs: MatchTables,
 
     /// How many buffers this finder has allocated since it was made: the
     /// window, the tables, and for the threaded finder its two hand-off
@@ -269,12 +356,12 @@ impl MatchFinder {
             kind: MatchFinderKind::Bt4,
             big_hash: false,
             match_max_len: 0,
-            hash: Vec::new(),
+            hash: MatchTables::default(),
             son_base: 0,
             hash_mask: 0,
             // C: MatchFinder_SetDefaultSettings.
             cut_value: 32,
-            buf_base: Vec::new(),
+            buf_base: MatchWindow::default(),
             direct_input: false,
             block_size: 0,
             keep_size_before: 0,
@@ -293,7 +380,7 @@ impl MatchFinder {
             heads_end: 0,
             hc_heads: true,
             #[cfg(feature = "std")]
-            mt_bufs: Vec::new(),
+            mt_bufs: MatchTables::default(),
             #[cfg(test)]
             allocs: 0,
         }
@@ -597,7 +684,7 @@ impl MatchFinder {
             u64::MAX,
         )?;
         let window = if window {
-            u64::from(plan.block_size)
+            MatchWindow::padded_words(plan.block_size as usize)? as u64
         } else {
             0
         };
@@ -606,17 +693,18 @@ impl MatchFinder {
         } else {
             HC_HEADS as u64 * 4
         };
-        Ok(window + (plan.num_refs as u64) * 4 + heads)
+        Ok(window + (MatchTables::padded_words(plan.num_refs)? as u64) * 4 + heads)
     }
 
     /// What this finder has allocated, in bytes: the window and the tables.
     #[cfg(test)]
     pub(crate) fn allocated(&self) -> u64 {
         #[cfg(feature = "std")]
-        let mt_bufs = self.mt_bufs.len();
+        let mt_bufs = self.mt_bufs.allocated_words();
         #[cfg(not(feature = "std"))]
         let mt_bufs = 0;
-        self.buf_base.len() as u64 + (self.hash.len() + self.heads.len() + mt_bufs) as u64 * 4
+        self.buf_base.allocated_words() as u64
+            + (self.hash.allocated_words() + self.heads.len() + mt_bufs) as u64 * 4
     }
 
     /// C: `MatchFinder_Create`.
@@ -650,8 +738,8 @@ impl MatchFinder {
         // an earlier stream stays for the next stream that needs it.
         self.block_size = plan.block_size;
         if !self.direct_input && self.buf_base.len() < plan.block_size as usize {
-            self.buf_base = Vec::new();
-            self.buf_base = zeroed_vec(plan.block_size as usize)?;
+            self.buf_base = MatchWindow::default();
+            self.buf_base = MatchWindow::new(plan.block_size as usize)?;
             #[cfg(test)]
             {
                 self.allocs += 1;
@@ -676,9 +764,9 @@ impl MatchFinder {
             return Ok(());
         }
 
-        self.hash = Vec::new();
+        self.hash = MatchTables::default();
         self.num_refs = plan.num_refs;
-        self.hash = zeroed_vec(plan.num_refs)?;
+        self.hash = MatchTables::new(plan.num_refs)?;
         self.son_base = plan.hash_size_sum;
         #[cfg(test)]
         {
@@ -723,7 +811,8 @@ impl MatchFinder {
             n = k;
         }
 
-        self.pos_limit = self.pos + n;
+        // C uses UInt32 wrap to reach the normalization position (zero).
+        self.pos_limit = self.pos.wrapping_add(n);
     }
 
     /// C: `MatchFinder_Init_LowHash`.
@@ -757,7 +846,16 @@ impl MatchFinder {
         self.init_high_hash();
         self.init_low_hash();
         self.init_4();
-        self.read_block(stream);
+        if self.direct_input {
+            // C: MatchFinder_SET_DIRECT_INPUT_BUF. The MtCoder-owned input
+            // is installed before Init and is bounded to one GiB, so it is
+            // all visible without moving a window or normalizing positions.
+            assert!(self.buf_base.len() <= 1 << 30);
+            self.stream_pos += self.buf_base.len() as u32;
+            self.stream_end_was_reached = true;
+        } else {
+            self.read_block(stream);
+        }
         // C: `CYC_TO_POS_OFFSET` is 0, so this is `cyclicBufferPos = pos`.
         self.cyclic_buffer_pos = self.pos;
         self.set_limits();
@@ -778,10 +876,10 @@ impl MatchFinder {
             && self.get_num_available_bytes() >= self.num_hash_bytes
         {
             // C: "after normalization we need (p->pos >= p->historySize + 1)"
-            let sub_value = self.pos - self.history_size - 1;
+            let sub_value = self.pos.wrapping_sub(self.history_size).wrapping_sub(1);
             // C: `MatchFinder_REDUCE_OFFSETS`.
-            self.pos -= sub_value;
-            self.stream_pos -= sub_value;
+            self.pos = self.pos.wrapping_sub(sub_value);
+            self.stream_pos = self.stream_pos.wrapping_sub(sub_value);
             let hash_items = self.hash_mask as usize + 1 + self.fixed_hash_size as usize;
             normalize3(sub_value, &mut self.hash[..hash_items]);
             let mut num_son_refs = self.cyclic_buffer_size as usize;
@@ -804,7 +902,7 @@ impl MatchFinder {
     fn move_pos_macro(&mut self, stream: &mut dyn SeqInStream) {
         self.cyclic_buffer_pos += 1;
         self.buffer += 1;
-        let pos1 = self.pos + 1;
+        let pos1 = self.pos.wrapping_add(1);
         self.pos = pos1;
         if pos1 == self.pos_limit {
             self.check_limits(stream);
@@ -1106,7 +1204,6 @@ impl MatchFinder {
         let pos = self.pos;
         let mut d2 = pos - self.hash[h2 as usize];
         let d3 = pos - self.hash[K_FIX3_HASH_SIZE + h3 as usize];
-        let cur_match = self.take_head(pos, cur, K_FIX4_HASH_SIZE, hv);
         self.hash[h2 as usize] = pos;
         self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
         let mmm = self.set_mmm();
@@ -1142,6 +1239,7 @@ impl MatchFinder {
             max_len = self.update_max_len(cur, d2, max_len, len_limit);
             distances[d - 2] = max_len;
             if max_len == len_limit {
+                let cur_match = self.take_head(pos, cur, K_FIX4_HASH_SIZE, hv, false);
                 let at = self.son_base + self.cyclic_buffer_pos as usize;
                 self.hash[at] = cur_match;
                 self.move_pos_macro(stream);
@@ -1150,6 +1248,7 @@ impl MatchFinder {
             break;
         }
 
+        let cur_match = self.take_head(pos, cur, K_FIX4_HASH_SIZE, hv, true);
         let n =
             d + self.hc_get_matches_spec(len_limit, cur_match, cur, &mut distances[d..], max_len);
         self.move_pos_macro(stream);
@@ -1168,7 +1267,6 @@ impl MatchFinder {
         let pos = self.pos;
         let mut d2 = pos - self.hash[h2 as usize];
         let d3 = pos - self.hash[K_FIX3_HASH_SIZE + h3 as usize];
-        let cur_match = self.take_head(pos, cur, K_FIX5_HASH_SIZE, hv);
         self.hash[h2 as usize] = pos;
         self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
         let mmm = self.set_mmm();
@@ -1208,6 +1306,7 @@ impl MatchFinder {
             max_len = self.update_max_len(cur, d2, max_len, len_limit);
             distances[d - 2] = max_len;
             if max_len == len_limit {
+                let cur_match = self.take_head(pos, cur, K_FIX5_HASH_SIZE, hv, false);
                 let at = self.son_base + self.cyclic_buffer_pos as usize;
                 self.hash[at] = cur_match;
                 self.move_pos_macro(stream);
@@ -1216,6 +1315,7 @@ impl MatchFinder {
             break;
         }
 
+        let cur_match = self.take_head(pos, cur, K_FIX5_HASH_SIZE, hv, true);
         let n =
             d + self.hc_get_matches_spec(len_limit, cur_match, cur, &mut distances[d..], max_len);
         self.move_pos_macro(stream);
@@ -1318,18 +1418,18 @@ impl MatchFinder {
     /// C: `Hc4_MatchFinder_Skip`, whose `HC_SKIP_HEADER`/`HC_SKIP_FOOTER`
     /// batch a run of positions between two `posLimit` checks.
     fn hc4_skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
-        self.hc_skip(stream, num, 4);
+        self.hc_skip::<4>(stream, num);
     }
 
     /// C: `Hc5_MatchFinder_Skip`.
     fn hc5_skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
-        self.hc_skip(stream, num, 5);
+        self.hc_skip::<5>(stream, num);
     }
 
     /// C: `HC_SKIP_HEADER` / `HC_SKIP_FOOTER` with the 4- or 5-byte hash.
-    fn hc_skip(&mut self, stream: &mut dyn SeqInStream, mut num: u32, min_len: u32) {
+    fn hc_skip<const HASH_BYTES: usize>(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
         while num != 0 {
-            if self.len_limit < min_len {
+            if self.len_limit < HASH_BYTES as u32 {
                 self.move_pos(stream);
                 num -= 1;
                 continue;
@@ -1337,42 +1437,61 @@ impl MatchFinder {
             let mut pos = self.pos;
             let mut num2 = num;
             // C: "(p->pos == p->posLimit) is not allowed here !!!"
-            let rem = self.pos_limit - pos;
+            let rem = self.pos_limit.wrapping_sub(pos);
             if num2 >= rem {
                 num2 = rem;
             }
             num -= num2;
             let cyc_pos = self.cyclic_buffer_pos;
-            let mut son = self.son_base + cyc_pos as usize;
             self.cyclic_buffer_pos = cyc_pos + num2;
-            let mut cur = self.buffer;
+            let cur = self.buffer;
+            let count = num2 as usize;
+            // C: HC_SKIP_HEADER keeps hash, son and cur in locals until
+            // posLimit. Split their disjoint ranges once for that whole run.
+            let fix = if HASH_BYTES == 4 {
+                K_FIX4_HASH_SIZE
+            } else {
+                K_FIX5_HASH_SIZE
+            };
+            let (low, rest) = self.hash.split_at_mut(fix);
+            let (high, son) = rest.split_at_mut(self.son_base - fix);
+            let (h2, h3) = low.split_at_mut(K_FIX3_HASH_SIZE);
+            let son = &mut son[cyc_pos as usize..cyc_pos as usize + count];
+            let win = &self.buf_base[cur..cur + count + HASH_BYTES - 1];
 
-            loop {
-                let (h2, h3, hv) = if min_len == 4 {
-                    self.hash4_calc(cur)
-                } else {
-                    self.hash5_calc(cur)
-                };
-                let fix = if min_len == 4 {
-                    K_FIX4_HASH_SIZE
-                } else {
-                    K_FIX5_HASH_SIZE
-                };
-                let cur_match = self.take_head(pos, cur, fix, hv);
-                self.hash[h2 as usize] = pos;
-                self.hash[K_FIX3_HASH_SIZE + h3 as usize] = pos;
+            // A preceding search may have already updated high hash heads.
+            // Consume those exact heads first; recomputing them would see
+            // future positions. Only the low hashes and chain remain to write.
+            let queued = count.min(self.heads_end - self.heads_at);
+            for b in win[..queued + 2].windows(3) {
+                let temp = self.crc[usize::from(b[0])] ^ u32::from(b[1]);
+                h2[(temp & (K_HASH2_SIZE - 1)) as usize] = pos;
+                h3[((temp ^ (u32::from(b[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize] = pos;
+                pos = pos.wrapping_add(1);
+            }
+            son[..queued].copy_from_slice(&self.heads[self.heads_at..self.heads_at + queued]);
+            self.heads_at += queued;
 
-                cur += 1;
-                pos += 1;
-                self.hash[son] = cur_match;
-                son += 1;
-                num2 -= 1;
-                if num2 == 0 {
-                    break;
+            // C: Hc4_MatchFinder_Skip / Hc5_MatchFinder_Skip. Already-skipped
+            // positions need no speculative head queue or second hash pass.
+            for (b, link) in win[queued..].windows(HASH_BYTES).zip(&mut son[queued..]) {
+                let mut temp = self.crc[usize::from(b[0])] ^ u32::from(b[1]);
+                let hash2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                temp ^= u32::from(b[2]) << 8;
+                let hash3 = (temp & (K_HASH3_SIZE - 1)) as usize;
+                temp ^= self.crc[usize::from(b[3])] << K_LZ_HASH_CRC_SHIFT_1;
+                if HASH_BYTES == 5 {
+                    temp ^= self.crc[usize::from(b[4])] << K_LZ_HASH_CRC_SHIFT_2;
                 }
+                let hv = (temp & self.hash_mask) as usize;
+                *link = high[hv];
+                h2[hash2] = pos;
+                h3[hash3] = pos;
+                high[hv] = pos;
+                pos = pos.wrapping_add(1);
             }
 
-            self.buffer = cur;
+            self.buffer = cur + count;
             self.pos = pos;
             if pos == self.pos_limit {
                 self.check_limits(stream);
@@ -1543,9 +1662,11 @@ impl MatchFinder {
     /// reads are in the window, and the run is used up before
     /// `check_limits` moves the window or normalizes the tables. Taken in
     /// order, the heads and the table are the ones the C's lookups leave.
+    /// A full-length match does not walk the chain: consume an existing head
+    /// or perform just the SDK's single lookup instead of starting that queue.
     #[inline]
-    fn take_head(&mut self, pos: u32, cur: usize, fix: usize, hv: u32) -> u32 {
-        if !self.hc_heads {
+    fn take_head(&mut self, pos: u32, cur: usize, fix: usize, hv: u32, prefetch: bool) -> u32 {
+        if !self.hc_heads || (!prefetch && self.heads_at == self.heads_end) {
             let at = fix + hv as usize;
             let head = self.hash[at];
             self.hash[at] = pos;
@@ -1564,7 +1685,7 @@ impl MatchFinder {
     #[cold]
     #[inline(never)]
     fn fill_heads(&mut self, mut pos: u32, cur: usize, fix: usize) {
-        let n = ((self.pos_limit - pos) as usize).min(self.heads.len());
+        let n = (self.pos_limit.wrapping_sub(pos) as usize).min(self.heads.len());
         // `K_FIX5_HASH_SIZE` is `K_FIX4_HASH_SIZE`, so the kind says which.
         let five = self.kind == MatchFinderKind::Hc5;
         let (crc, mask) = (&self.crc, self.hash_mask);
@@ -1582,7 +1703,7 @@ impl MatchFinder {
             let at = (temp & mask) as usize;
             *head = table[at];
             table[at] = pos;
-            pos += 1;
+            pos = pos.wrapping_add(1);
         }
         self.heads_at = 0;
         self.heads_end = n;
@@ -1646,21 +1767,113 @@ impl MatchFinder {
     }
 }
 
-/// C: `MatchFinder_Normalize3` with `LzFind_SaturSub_32`, the portable
-/// default. The 128- and 256-bit variants are the same loop vectorized and
-/// are not ported.
-pub(crate) fn normalize3(sub_value: u32, items: &mut [u32]) {
-    for v in items {
-        // C: `SASUB_32`. "kEmptyHashValue must be zero".
-        if *v < sub_value {
-            *v = sub_value;
-        }
-        *v -= sub_value;
-    }
-}
+mod normalize;
+pub(crate) use normalize::normalize3;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "std")]
+    #[test]
+    fn aligned_input_restores_its_extent_and_preserves_owner_on_failure() {
+        use super::MatchWindow;
+        let mut input = MatchWindow::new((2 << 20) + 17).unwrap();
+        let len = input.len();
+        let pointer = input.as_ptr();
+        let allocation = input.allocated_words();
+        input.fill(53);
+        input.truncate(7);
+        input.resize_zeroed(len).unwrap();
+        assert_eq!(input.as_ptr(), pointer);
+        assert_eq!(input.allocated_words(), allocation);
+        assert_eq!(&input[..7], &[53; 7]);
+        assert!(input[7..].iter().all(|&byte| byte == 0));
+        assert_eq!(input.resize_zeroed(usize::MAX), Err(crate::Error::Alloc));
+        assert_eq!(input.as_ptr(), pointer);
+        assert_eq!(input.len(), len);
+        assert_eq!(&input[..7], &[53; 7]);
+        if cfg!(target_os = "linux") {
+            assert_eq!(pointer.addr() % (2 << 20), 0);
+            assert_eq!(allocation, len + (2 << 20) - 1);
+        }
+        assert!(input.storage[..input.start].iter().all(|&byte| byte == 0));
+        assert!(
+            input.storage[input.start + len..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+    }
+
+    #[test]
+    fn aligned_match_tables_preserve_zeroes_ownership_and_accounting() {
+        use super::MatchTables;
+        for len in [
+            0,
+            1,
+            4097,
+            MatchTables::PAGE_WORDS / 2,
+            MatchTables::PAGE_WORDS + 17,
+        ] {
+            let mut tables = MatchTables::new(len).unwrap();
+            assert_eq!(tables.len(), len);
+            assert_eq!(
+                tables.allocated_words(),
+                MatchTables::padded_words(len).unwrap()
+            );
+            assert!(tables.iter().all(|&value| value == 0));
+            if tables.allocated_words() != len {
+                assert_eq!(tables.as_ptr().addr() % (2 << 20), 0);
+                assert!(tables.start < MatchTables::PAGE_WORDS);
+            }
+            if len != 0 {
+                tables[0] = 17;
+                tables[len - 1] = 29;
+                let pointer = tables.as_ptr();
+                let moved = core::mem::take(&mut tables);
+                assert!(tables.is_empty());
+                assert_eq!(moved.as_ptr(), pointer);
+                assert_eq!(moved[len - 1], 29);
+                assert!(moved.storage[..moved.start].iter().all(|&v| v == 0));
+                assert!(moved.storage[moved.start + len..].iter().all(|&v| v == 0));
+            }
+        }
+        assert!(matches!(
+            MatchTables::new(usize::MAX),
+            Err(crate::Error::Alloc)
+        ));
+    }
+
+    #[test]
+    fn aligned_match_tables_fall_back_without_hiding_allocation_failure() {
+        use super::MatchTables;
+        let len = MatchTables::PAGE_WORDS + 17;
+        let mut requests = alloc::vec::Vec::new();
+        let tables = MatchTables::new_with(len, |words| {
+            requests.push(words);
+            if words != len {
+                Err(crate::Error::Alloc)
+            } else {
+                super::zeroed_vec(words)
+            }
+        })
+        .unwrap();
+        assert_eq!(tables.len(), len);
+        assert_eq!(tables.allocated_words(), len);
+        assert!(tables.iter().all(|&value| value == 0));
+        assert_eq!(requests.last(), Some(&len));
+        assert_eq!(
+            requests.len(),
+            if MatchTables::padded_words(len).unwrap() == len {
+                1
+            } else {
+                2
+            }
+        );
+        assert!(matches!(
+            MatchTables::new_with(len, |_| Err(crate::Error::Alloc)),
+            Err(crate::Error::Alloc)
+        ));
+    }
+
     /// A zeroed allocation of every [`super::Zeroable`] type is the length
     /// asked for, all zero and writable to its last element, at odd lengths
     /// and across a page; an empty one is empty, and one the allocator
@@ -1795,6 +2008,102 @@ mod tests {
             check_self_consistent(kind, b"a");
             check_self_consistent(kind, b"abcabcabcabc");
             check_self_consistent(kind, &[0u8; 1000]);
+        }
+    }
+
+    /// Skipping must leave the same future matches, low hashes and links as
+    /// the SDK-style finder visited one byte at a time. Exercise both sides
+    /// of the queued-head boundary, cyclic wrap, real window slides, and a
+    /// UInt32 normalization without allocating a four-GiB fixture.
+    #[test]
+    fn skips_preserve_the_bytewise_finder_across_all_boundaries() {
+        fn check(kind: MatchFinderKind, data: &[u8], wrap: bool) {
+            let mut actual = MatchFinder::new();
+            let mut expected = MatchFinder::new();
+            let mut input = SliceStream::new(data);
+            let mut oracle_input = SliceStream::new(data);
+            for (finder, stream) in [
+                (&mut actual, &mut input),
+                (&mut expected, &mut oracle_input),
+            ] {
+                finder.kind = kind;
+                finder.num_hash_bytes = kind.num_hash_bytes();
+                finder.create(1 << 12, 0, 32, 0, u64::MAX).unwrap();
+                finder.init(stream);
+                if wrap {
+                    let available = finder.get_num_available_bytes();
+                    finder.pos = u32::MAX - 127;
+                    finder.stream_pos = finder.pos.wrapping_add(available);
+                    finder.set_limits();
+                }
+            }
+            actual.hc_heads = true;
+            expected.hc_heads = false;
+            let mut got = [0; 64];
+            let mut want = [0; 64];
+            let mut step = 0;
+            while actual.get_num_available_bytes() != 0 {
+                let n = actual.get_matches(&mut input, &mut got);
+                let m = expected.get_matches(&mut oracle_input, &mut want);
+                assert_eq!(&got[..n], &want[..m], "{kind:?} step {step}");
+                // Small skips interleave with searches; larger ones cross
+                // a prepared-head run, cyclic wrap and input refill.
+                let skip = [0, 1, 3, 31, 127, 4095, 4097, 16385][step % 8]
+                    .min(actual.get_num_available_bytes());
+                // SDK Skip requires a positive count; the parser guards
+                // zero-length moves before calling the finder.
+                if skip != 0 {
+                    actual.skip(&mut input, skip);
+                }
+                for _ in 0..skip {
+                    expected.get_matches(&mut oracle_input, &mut want);
+                }
+                assert_eq!(
+                    (
+                        actual.pos,
+                        actual.buffer,
+                        actual.cyclic_buffer_pos,
+                        actual.pos_limit
+                    ),
+                    (
+                        expected.pos,
+                        expected.buffer,
+                        expected.cyclic_buffer_pos,
+                        expected.pos_limit
+                    )
+                );
+                assert_eq!(
+                    actual.get_num_available_bytes(),
+                    expected.get_num_available_bytes()
+                );
+                let fix = actual.fixed_hash_size as usize;
+                assert_eq!(actual.hash[..fix], expected.hash[..fix]);
+                assert_eq!(
+                    actual.hash[actual.son_base..],
+                    expected.hash[expected.son_base..]
+                );
+                if actual.heads_at == actual.heads_end {
+                    assert_eq!(actual.hash, expected.hash);
+                }
+                step += 1;
+            }
+            assert!(actual.result.is_ok() && expected.result.is_ok());
+            assert_eq!(actual.hash, expected.hash);
+        }
+        let mut seed = 1u32;
+        let mixed: Vec<_> = (0..300_019)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 8192 < 4096 { 0 } else { seed as u8 }
+            })
+            .collect();
+        for kind in KINDS {
+            for data in [b"".as_slice(), b"a", b"abc", b"abcde", &[0; 9001], &mixed] {
+                check(kind, data, false);
+            }
+            check(kind, &mixed, true);
         }
     }
 

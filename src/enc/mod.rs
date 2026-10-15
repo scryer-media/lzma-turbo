@@ -5,14 +5,14 @@
 //! the optimal parser) and `C/Lzma2Enc.c` (LZMA2 chunking). See
 //! `docs/encoder.md` for what was left out and how parity is tested.
 
-// The register-shaped tree walk: what the bt thread runs on x86-64 with
+// The register-shaped tree walk: what the bt thread runs on x86-64 and ARM64 with
 // `asm`, the other arm of `kernel-ab`, and under test everywhere.
 #[cfg(all(
     feature = "std",
     any(
         test,
         feature = "kernel-ab",
-        all(feature = "asm", target_arch = "x86_64")
+        all(feature = "asm", any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
 mod bt_kernel;
@@ -24,6 +24,8 @@ mod lz_find;
 mod lz_find_mt;
 mod lzma2_enc;
 mod lzma_enc;
+#[cfg(all(feature = "std", target_os = "macos", not(miri)))]
+mod mapped_output;
 mod match_run;
 #[cfg(feature = "std")]
 mod mt_coder;

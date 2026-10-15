@@ -10,8 +10,10 @@
 //! `MatchFinder_SET_DIRECT_INPUT_BUF` lets the C point `p->buffer` straight at
 //! the caller's bytes and never allocate a window. This port does that for
 //! block-threaded LZMA2 and solid buffered LZMA2 through the threaded or
-//! inline finder (`crate::enc::lz_find_mt::run_block`). Other paths retain
-//! a window filled from a stream; their slice source is [`SliceStream`].
+//! inline finder (`crate::enc::lz_find_mt::run_block`). A streamed MT input
+//! block can also transfer its owned Vec to the single-threaded finder for
+//! the duration of encoding. Borrowed single-threaded inputs and custom
+//! blocks larger than one GiB retain a window filled from [`SliceStream`].
 //!
 //! The two find the same matches. The two modes differ only in how much input is
 //! visible at once, and that reaches nothing a match depends on:
@@ -189,14 +191,23 @@ pub trait SeqOutStream {
     /// Whatever the sink reports; the encoder turns it into [`Error::Write`].
     fn write(&mut self, data: &[u8]) -> Result<(), Error>;
 
+    /// Allows an ordered block to arrive through multiple [`Self::write`]
+    /// calls while it is encoded, instead of one [`Self::write_buffer`].
+    ///
+    /// Byte-stream sinks may opt in to avoid a complete staging allocation.
+    /// The default preserves whole-block delivery and existing ownership
+    /// overrides. Opting in preserves byte order but permits partial output
+    /// before a later encoder error, as in single-block streaming encoding.
+    fn supports_streamed_blocks(&self) -> bool {
+        false
+    }
+
     /// Writes all of `data` and leaves it empty.
     ///
-    /// The block-threaded encoder hands each finished block over through
-    /// this, a whole block in one buffer of its own. A sink that queues what
-    /// it is given can take the allocation ([`core::mem::take`]) instead of
-    /// copying the block; the encoder then allocates the next block's buffer
-    /// afresh. The default copies through [`SeqOutStream::write`] and leaves
-    /// `data` its capacity, which the encoder uses again.
+    /// A sink that queues what it is given can take the allocation
+    /// ([`core::mem::take`]) instead of copying it. The default copies through
+    /// [`SeqOutStream::write`] and leaves `data` its capacity. Block-threaded
+    /// encoding uses [`Self::write_buffer`], whose default delegates here.
     ///
     /// C: `ISeqOutStream` has nothing like it; `Lzma2Enc_MtCallback_Write`
     /// passes the block's buffer to `ISeqOutStream_Write` and keeps it.
@@ -210,12 +221,51 @@ pub trait SeqOutStream {
         data.clear();
         Ok(())
     }
+
+    /// Writes the produced prefix of an initialized block buffer.
+    ///
+    /// C: `Lzma2Enc_MtCallback_Write` keeps the whole allocation while passing
+    /// only `packSize` to the sink. Keeping the initialized tail lets the
+    /// next block encode directly into it without zeroing it again. A sink
+    /// may transfer ownership and return any initialized replacement buffer;
+    /// only `data[..written]` is output. The default truncates to that prefix
+    /// and delegates to [`Self::write_vec`], preserving existing ownership
+    /// overrides. Copying sinks can override this method to retain the
+    /// initialized tail as well as the allocation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`], or [`Error::Param`] if the prefix is out of bounds.
+    /// The buffer is in an unspecified state after an error.
+    fn write_buffer(
+        &mut self,
+        data: &mut alloc::vec::Vec<u8>,
+        written: usize,
+    ) -> Result<(), Error> {
+        if written > data.len() {
+            return Err(Error::Param);
+        }
+        data.truncate(written);
+        self.write_vec(data)
+    }
 }
 
 impl SeqOutStream for alloc::vec::Vec<u8> {
+    fn supports_streamed_blocks(&self) -> bool {
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         self.try_reserve(data.len()).map_err(|_| Error::Alloc)?;
         self.extend_from_slice(data);
         Ok(())
+    }
+
+    fn write_buffer(
+        &mut self,
+        data: &mut alloc::vec::Vec<u8>,
+        written: usize,
+    ) -> Result<(), Error> {
+        self.write(data.get(..written).ok_or(Error::Param)?)
     }
 }

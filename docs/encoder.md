@@ -73,13 +73,11 @@ chunk by chunk.
 
 ## What was left out
 
-**`directInput` mode.** `CMatchFinder` can be pointed at a caller's whole
-buffer instead of copying into its own window; only the windowed path is here,
-fed by the `SeqInStream` trait. The two modes differ in how much input is
-visible at once, and not in the output: `lenLimit` is clamped to `matchMaxLen`
-whenever more than `keepSizeAfter` bytes remain, `posLimit` only decides *when*
-`MatchFinder_CheckLimits` runs, and normalization only happens on a `pos` wrap
-past 2^32. `src/enc/stream.rs` sets this out at length.
+**Borrowed single-threaded direct input.** Threaded and inline finders already
+read borrowed blocks directly. Streamed block workers transfer their owned
+input to the single-threaded finder too. Borrowed single-threaded input and
+custom blocks larger than one GiB still use the copied window. The margin
+and expected-size rules are documented in `src/enc/stream.rs`.
 
 **Two host-dependent constants, pinned to their 64-bit values.** Both derive
 from `sizeof(size_t)` in the C, which would make one input at one setting
@@ -174,21 +172,17 @@ another thread can see.
 | `IMatchFinder2`, the vtable `LzmaEnc` calls through | the `Finder` enum in `src/enc/finder.rs` |
 | `numTotalThreads`, the `t1`/`t2`/`t3` split in `Lzma2EncProps_Normalize` | `Lzma2Encoder::set_total_threads`, `::split_threads` |
 
-Two things differ from the C, both forced by ownership rather than by choice:
+Ownership determines the input and thread lifetimes:
 
-- **The threads live for one encode call**, in a `std::thread::scope` opened by
-  the entry point that owns the input, the same shape `MtCoder` uses here. That
-  is what lets the hash thread hold the caller's stream directly instead of the
-  C's stored `mf->stream` pointer, so there is no set/release pair to get
-  wrong. `MtRun`'s `Drop` is `MatchFinderMt_ReleaseStream` plus
-  `MtSync_Destruct`: stop the bt thread, stop the hash thread, join both.
+- **Direct-block finder threads persist across blocks.** `run_block` borrows
+  a block until both producers stop using it. Borrowed streaming input uses
+  scoped threads, which stop and join before the input borrow ends.
 - **Streaming input must be `Send`.** The hash thread reads it, so
   `LzmaEncoder::encode_send` / `encode_sized_send` and
   `Lzma2Encoder::encode_send` are the streaming entry points that can thread.
-  Every memory entry point already routes through them. The existing
-  `encode` / `encode_sized` take a plain `&mut dyn SeqInStream` and so always
-  run the single-threaded finder; that is the one case where `numThreads` is
-  silently ignored.
+  Memory input can use retained producers. `encode` / `encode_sized` accept
+  a plain `&mut dyn SeqInStream`; they run the finder on the coding thread,
+  using the inline SDK tree kernel where applicable.
 
 **Unlike the block thread count, this setting changes the bytes** — and that is
 the C's behaviour, not this port's. `Bt5_MatchFinder_GetMatches` extends its
@@ -258,8 +252,14 @@ through `MatchFinderMt` against that binary, including two dictionaries past
 `0xFFFFFF`, which is what sets `MFB.bigHash` and swaps `GetHeads4`/`GetHeads5`
 for `GetHeads4b`/`GetHeads5b`. `tests/mt_match_finder.rs` carries what the
 corpus is too small for: three-megabyte inputs at dictionaries that force
-`MatchFinder_MoveBlock` and `MatchFinder_Normalize3` to run while the threads
-are live.
+`MatchFinder_MoveBlock` and cyclic-buffer wrap while the threads are live.
+Those inputs do not reach UInt32 position normalization. The focused
+`hash_normalization_preserves_wrapped_read_ahead_and_queued_distances` test
+seeds that boundary, and
+`encoder_position_wrap_preserves_output_and_processed_count` checks parser
+positions and accounting across it. Actual generated streams beyond 4 GiB,
+with SDK byte parity and independent decoding, are recorded in
+`docs/mac-fleet-audit.md`.
 
 **Threaded parity, `tests/lzma2_mt_parity.rs`.** `cargo xtask lzma-util` also
 builds `lzma2-oracle-mt`: the same props-driven LZMA2 harness compiled

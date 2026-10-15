@@ -7,7 +7,7 @@
 //! optimal parser can add the cost of a symbol without encoding it.
 
 use crate::enc::consts::*;
-use crate::enc::range_enc::RangeEnc;
+use crate::enc::range_enc::{RangeEnc, RangeOutput};
 use crate::enc::stream::SeqOutStream;
 
 /// C: `CProbPrice ProbPrices[kBitModelTotal >> kNumMoveReducingBits]`.
@@ -131,16 +131,19 @@ impl LenEnc {
         out: &mut dyn SeqOutStream,
     ) {
         // C: `probs` walks `p->low`; here it is the index of its first entry.
+        let mut bound = RangeOutput(out);
+        let mut range = rc.range;
         let mut base = 0usize;
         if sym >= K_LEN_NUM_LOW_SYMBOLS {
             let prob = &mut self.low[base];
-            rc.encode_bit_1(prob, out);
+            range = rc.encode_bit_1_with_range(range, prob, &mut bound);
             base += K_LEN_NUM_LOW_SYMBOLS as usize;
             if sym >= K_LEN_NUM_LOW_SYMBOLS * 2 {
                 let prob = &mut self.low[base];
-                rc.encode_bit_1(prob, out);
+                range = rc.encode_bit_1_with_range(range, prob, &mut bound);
+                rc.range = range;
                 // C: `LitEnc_Encode(rc, p->high, sym - kLenNumLowSymbols * 2)`.
-                rc.lit_encode(&mut self.high, sym - K_LEN_NUM_LOW_SYMBOLS * 2, out);
+                rc.lit_encode(&mut self.high, sym - K_LEN_NUM_LOW_SYMBOLS * 2, bound.0);
                 return;
             }
             sym -= K_LEN_NUM_LOW_SYMBOLS;
@@ -149,22 +152,23 @@ impl LenEnc {
         // C: `RcTree_Encode(rc, probs + (posState << kLenNumLowBits), kLenNumLowBits, sym)`,
         // unrolled as the C unrolls it.
         let prob = &mut self.low[base];
-        rc.encode_bit_0(prob, out);
+        range = rc.encode_bit_0_with_range(range, prob, &mut bound);
         base += (pos_state as usize) << (1 + K_LEN_NUM_LOW_BITS);
 
         let bit = sym >> 2;
         let prob = &mut self.low[base + 1];
-        rc.encode_bit(prob, bit, out);
+        range = rc.encode_bit_with_range(range, prob, bit, &mut bound);
         let mut m = (1usize << 1) + bit as usize;
 
         let bit = (sym >> 1) & 1;
         let prob = &mut self.low[base + m];
-        rc.encode_bit(prob, bit, out);
+        range = rc.encode_bit_with_range(range, prob, bit, &mut bound);
         m = (m << 1) + bit as usize;
 
         let bit = sym & 1;
         let prob = &mut self.low[base + m];
-        rc.encode_bit(prob, bit, out);
+        range = rc.encode_bit_with_range(range, prob, bit, &mut bound);
+        rc.range = range;
     }
 }
 

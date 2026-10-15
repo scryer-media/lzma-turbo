@@ -4,11 +4,11 @@
 //! forever on input that has stopped arriving.
 #![no_main]
 
-use std::io::Read;
+use std::io::{Cursor, Read};
 
 use libfuzzer_sys::fuzz_target;
-use lzma_turbo::xz::{XzAdaptiveDecoder, XzOptions, XzReader};
 use lzma_turbo::DrainStatus;
+use lzma_turbo::xz::{XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader};
 
 /// Small enough that a fuzz case cannot ask for a real allocation, large
 /// enough that a `-0` stream still decodes.
@@ -54,6 +54,28 @@ fuzz_target!(|data: &[u8]| {
             Err(_) => {
                 seq = None;
                 break;
+            }
+        }
+    }
+
+    // XZ Utils tests/ossfuzz/fuzz_decode_stream_mt.c exercises multithreaded
+    // container decoding. Here the seekable parallel reader has separate
+    // index/worker setup, in addition to the adaptive driver below.
+    // Keep our normal checksum enforcement: never weaken production parsing
+    // merely to reach farther into a fuzz input.
+    if let Ok(mut parallel) =
+        XzParallelReader::with_options(Cursor::new(data), opts.clone().with_threads(threads))
+    {
+        let mut out = Vec::new();
+        if parallel
+            .by_ref()
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut out)
+            .is_ok()
+        {
+            assert!(out.len() as u64 <= OUTPUT_LIMIT);
+            if let Some(seq) = &seq {
+                assert_eq!(&out, seq);
             }
         }
     }

@@ -2,6 +2,97 @@
 
 ## 0.9.1 - 2026-10-11
 
+- Accelerate macOS ARM64 binary-tree matching with the SDK's negative-offset
+  traversal and bounded word comparisons. Stream ordered parallel blocks to
+  opt-in byte sinks to reduce peak memory, preserving whole-block delivery
+  for existing custom output sinks.
+- Preserve existing `SeqOutStream::write_vec` ownership overrides during
+  parallel block delivery, while built-in copying sinks retain reusable storage.
+- Release surplus completed parallel encoder buffers after ordered delivery,
+  retaining reusable buffers for active coders without reducing concurrency.
+- On macOS, reuse small output slots and use owned anonymous mappings for
+  large blocks delivered to opted-in byte sinks, avoiding resident freed-buffer
+  caches while preserving custom sinks' existing Vec ownership behavior.
+- Decode XZ filters into caller output with bounded carry storage, avoiding
+  the private 64 KiB intermediate buffer while preserving filter tails and
+  checksums. Offer contiguous LZMA2 dictionary output through borrowed reads,
+  retaining ordinary reads at wrap boundaries and on unsupported inputs.
+- Encode streamed parallel blocks directly into their final output buffers,
+  retaining initialized storage across delivery instead of staging each chunk.
+- Use the SDK's batched hash-chain updates for skipped positions and avoid
+  speculative head preparation on full matches, retaining prepared heads for
+  actual searches. Preserve unsigned position wrap at normalization boundaries.
+- Keep continuous encodes beyond 4 GiB working with overflow checks enabled,
+  preserving SDK position wrap in parser look-ahead, progress accounting and
+  threaded input read-ahead without changing compressed bytes.
+- Use the SDK's SSE4.1, AVX2 and ARM64 normalization kernels when a long-lived
+  encoder's match positions approach their 32-bit wrap, with portable fallback.
+- Use the SDK's leading-zero position-slot calculation on ARM and ARM64,
+  removing the encoder's unused 16 KiB lookup table on those architectures.
+- Check ARM64 CRC capability separately from AES before selecting CRC32
+  instructions, using the existing generic checksum backend when unavailable.
+- Keep range-coder state in registers across the SDK's complete symbol groups,
+  preserving encoded bytes, carry propagation and deferred write errors.
+- Preserve the SDK's cache-line separation between threaded finder owners
+  and their synchronization state, avoiding false sharing from field layout.
+- Align large Linux match tables, input blocks, finder windows and handoff
+  buffers before huge-page advice, while retaining lazy zero allocation and
+  accounting for padding in memory limits.
+- Reuse XZ encoder input and output allocations, bound filtered-write scratch
+  space, and avoid geometric excess when collecting parallel block output.
+- Deliver streamed XZ output directly through startup and finish, with bounded
+  encoder output queues and wakeups for input room or output availability.
+  Preserve short-write retries and the destination's original I/O errors.
+  Deliver finite and parallel XZ blocks without an aggregate output copy,
+  and reuse fixed packed buffers between batches as the SDK does.
+- Keep completed XZ decoder blocks within worker admission limits until
+  ordered delivery, and include waiting and partially delivered adaptive
+  output in input backpressure so slow earlier blocks cannot grow the queue
+  with archive length.
+- Bound packed-input storage to 256 KiB when the indexed XZ reader uses one
+  worker, while still verifying each complete block before exposing its bytes.
+  Reserve known packed-block sizes exactly in both indexed and adaptive
+  dispatch, avoiding doubled buffers when later blocks are slightly larger.
+- Let streamed LZMA2 block workers encode their owned input directly when
+  using a single-threaded match finder, avoiding a second input window while
+  preserving bit-exact output and returning the allocation after write errors.
+- Allocate fresh streamed encoder blocks as initialized zeroes without
+  eagerly touching unused pages when a worker reaches a short block or EOF.
+- Reduce repeated-node work in the portable encoder tree walk and fetch
+  independent low-hash heads before updating them, in SDK order.
+- Use the register-shaped encoder tree walk on ARM64 with the default `asm`
+  feature, through the normal single-threaded and threaded encoder paths.
+- Decode XZ filter chains in their existing output buffer, retaining only
+  unconverted tails without shifting or zero-filling each decoded chunk.
+  Reduce BCJ word-load overhead and use the SDK's four-step BCJ2 copy loop
+  and delta-distance-four decoding without changing encoded bytes.
+- Apply the adaptive decoder's output-buffer slot limit to small runs too,
+  so spare output cannot occupy the input room needed to keep workers busy.
+- Release only enough spare output buffers to admit a waiting run, keeping
+  the remaining buffers available without changing memory limits.
+- Keep decoder output slots occupied until their bytes are delivered, so
+  later runs reuse those buffers. Retain one input piece across the reader's
+  handoff without exceeding its explicit memory ceiling, and collect
+  completed runs without a temporary allocation.
+- Prefer full-sized recycled input buffers over cut tails, and keep useful
+  full buffers when smaller tails fill the spare pool's existing slot limit.
+- Allocate worker probability tables on the caller before spawning a decoder
+  thread; failed setup leaves no unusable worker handle behind.
+- Allocate initialized decoder dictionaries without eagerly writing pages
+  that the allocator already knows are zero. Allocation failure still returns
+  `Error::Alloc`.
+- Retain input spares for one decoder during serial LZMA2 fallback, rather
+  than for configured workers that have no work, while preserving the parallel
+  reuse budget when workers are active.
+- Stream a complete, proven single-run LZMA2 input through its dictionary
+  when that is smaller than buffering the full output. Short runs and
+  multi-run streams retain their existing worker dispatch.
+- Export capped LZMA2 dictionaries and incremental run decoding into a
+  positional sink, with bounded memory, cancellation, partial writes and
+  per-file checksum segments. Output stays provisional until run completion
+  and the consumer's checksum and repair-epoch checks succeed.
+- Expose the BCJ2 decoder's requested input stream so threaded consumers
+  can refill it without waiting on unrelated inputs.
 - Buffered LZMA2 encoding retains its completed output if the allocator
   cannot shrink the result buffer. Successful shrinking still releases the
   unused capacity without an extra output copy, for solid and parallel input.

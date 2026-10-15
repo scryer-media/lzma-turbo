@@ -4,10 +4,12 @@
 //! the SDK built without `Z7_ST`. This file needs no reference binary: it
 //! covers the paths a few hundred kilobytes never reach — `MatchFinder_MoveBlock`
 //! running from the hash thread under both critical sections, the `hashBuf`
-//! ring wrapping many times, and `MatchFinder_Normalize3` on the high hash —
+//! ring and cyclic buffer wrapping many times —
 //! and checks the things that must hold whatever the finder does: the stream
 //! decodes back, and the same input gives the same bytes every time and
 //! through every entry point.
+//! UInt32 position normalization needs a separate boundary test or a stream
+//! beyond 4 GiB; these short LZMA2 blocks do not exercise it.
 
 #![cfg(all(feature = "std", feature = "enc"))]
 
@@ -69,7 +71,7 @@ fn round_trip(prop: u8, encoded: &[u8], src: &[u8], what: &str) {
 }
 
 /// Every match finder, at dictionaries smaller than the input, which is what
-/// makes the window slide and the hash normalize.
+/// makes the window slide and the cyclic buffer wrap.
 #[test]
 fn the_threaded_finder_round_trips_at_every_match_finder() {
     let src = corpus(3_000_000);

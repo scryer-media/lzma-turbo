@@ -38,7 +38,7 @@ use crate::error::XzErrorKind;
 
 #[inline]
 fn get_u32le(d: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]])
+    u32::from_le_bytes(d[i..i + 4].try_into().expect("four-byte word"))
 }
 
 #[inline]
@@ -48,7 +48,7 @@ fn set_u32le(d: &mut [u8], i: usize, v: u32) {
 
 #[inline]
 fn get_u32be(d: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]])
+    u32::from_be_bytes(d[i..i + 4].try_into().expect("four-byte word"))
 }
 
 #[inline]
@@ -58,10 +58,13 @@ fn set_u32be(d: &mut [u8], i: usize, v: u32) {
 
 #[inline]
 fn get_u16le(d: &[u8], i: usize) -> u32 {
-    u32::from(u16::from_le_bytes([d[i], d[i + 1]]))
+    u32::from(u16::from_le_bytes(
+        d[i..i + 2].try_into().expect("two-byte word"),
+    ))
 }
 
 #[inline]
+#[cfg(any(not(target_arch = "x86_64"), test))]
 fn set_u16le(d: &mut [u8], i: usize, v: u16) {
     d[i..i + 2].copy_from_slice(&v.to_le_bytes());
 }
@@ -507,26 +510,37 @@ fn arm64_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     const FLAG: u32 = 1 << (24 - 4);
     const MASK: u32 = (1 << 24) - (FLAG << 1);
     let lim = data.len() & !3;
-    let mut j = 0usize;
-    while j != lim {
-        let mut v = get_u32le(data, j);
+    let words = data[..lim].chunks_exact_mut(4).enumerate();
+    #[cfg(target_arch = "x86_64")]
+    let mut words = words;
+    // Search before conversion, as the SDK's scan/convert loops do. The
+    // early-exit scan avoids evaluating both conversions for every SIMD lane.
+    #[cfg(target_arch = "x86_64")]
+    let words = core::iter::from_fn(|| {
+        words.find(|(_, instruction)| {
+            let v = get_u32le(instruction, 0);
+            v & 0xFC00_0000 == 0x9400_0000 || v & 0x9F00_0000 == 0x9000_0000
+        })
+    });
+    for (index, instruction) in words {
+        let mut v = get_u32le(instruction, 0);
         // C: `pc -= 4` before the loop and `p` points past the instruction,
         // so BR_PC_GET for the instruction at `j` is `pc + j`.
-        let pc_here = pc.wrapping_add(j as u32);
+        let pc_here = pc.wrapping_add((index as u32).wrapping_mul(4));
         if v.wrapping_sub(0x9400_0000) & 0xFC00_0000 == 0 {
+            rare_branch();
             let c = pc_here >> 2;
             v = convert_val(v, c, encoding);
             v &= 0x03FF_FFFF;
             v |= 0x9400_0000;
-            set_u32le(data, j, v);
-            j += 4;
+            set_u32le(instruction, 0, v);
             continue;
         }
         v = v.wrapping_sub(0x9000_0000);
         if v & 0x9F00_0000 == 0 {
+            rare_branch();
             v = v.wrapping_add(FLAG);
             if v & MASK != 0 {
-                j += 4;
                 continue;
             }
             let mut z = (v & 0xFFFF_FFE0) | (v >> 26);
@@ -536,9 +550,8 @@ fn arm64_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
             v |= 0x9000_0000;
             v |= z << 26;
             v |= 0x00FF_FFE0 & (z & ((FLAG << 1) - 1)).wrapping_sub(FLAG);
-            set_u32le(data, j, v);
+            set_u32le(instruction, 0, v);
         }
-        j += 4;
     }
     lim
 }
@@ -546,19 +559,21 @@ fn arm64_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
 /// C: `z7_BranchConv_ARM_Dec` / `_Enc`.
 fn arm_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let lim = data.len() & !3;
-    let mut j = 0usize;
-    while j != lim {
-        if data[j + 3] == 0xEB {
-            let v = get_u32le(data, j);
+    for (index, instruction) in data[..lim].chunks_exact_mut(4).enumerate() {
+        if instruction[3] == 0xEB {
+            rare_branch();
+            let v = get_u32le(instruction, 0);
             // C: `pc += 8 - 4` and `p` points past the instruction: an ARM
             // branch offset is relative to the instruction after next.
-            let c = pc.wrapping_add(j as u32).wrapping_add(8) >> 2;
+            let c = pc
+                .wrapping_add((index as u32).wrapping_mul(4))
+                .wrapping_add(8)
+                >> 2;
             let mut v = convert_val(v, c, encoding);
             v &= 0x00FF_FFFF;
             v |= 0xEB00_0000;
-            set_u32le(data, j, v);
+            set_u32le(instruction, 0, v);
         }
-        j += 4;
     }
     lim
 }
@@ -566,49 +581,101 @@ fn arm_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
 /// C: `z7_BranchConv_PPC_Dec` / `_Enc`.
 fn ppc_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let lim = data.len() & !3;
-    let mut j = 0usize;
-    while j != lim {
-        let v = get_u32be(data, j);
-        if v.wrapping_sub(0x4800_0001) & 0xFC00_0003 == 0 {
-            let c = pc.wrapping_add(j as u32);
-            let mut v = convert_val(v, c, encoding);
+    for (index, instruction) in data[..lim].chunks_exact_mut(4).enumerate() {
+        // BranchConv_PPC tests the encoded word before swapping its bytes.
+        let v = get_u32le(instruction, 0);
+        if v.wrapping_sub(0x0100_0048) & 0x0300_00FC == 0 {
+            rare_branch();
+            let c = pc.wrapping_add((index as u32).wrapping_mul(4));
+            let mut v = convert_val(v.swap_bytes(), c, encoding);
             v &= 0x03FF_FFFF;
             v |= 0x4800_0000;
-            set_u32be(data, j, v);
+            set_u32be(instruction, 0, v);
         }
-        j += 4;
     }
     lim
 }
 
-/// C: `z7_BranchConv_SPARC_Dec` / `_Enc`, the branch without
-/// `BR_SPARC_USE_ROTATE`.
+// C: z7_BranchConv_SPARC_Dec / _Enc, BR_SPARC_USE_ROTATE.
 fn sparc_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     const FLAG: u32 = 1 << 22;
     let lim = data.len() & !3;
-    let mut j = 0usize;
-    while j != lim {
-        let mut v = get_u32be(data, j);
-        v = v.wrapping_add(5 << 29);
-        v ^= 7 << 29;
-        v = v.wrapping_add(FLAG);
-        if v & (FLAG << 1).wrapping_neg() == 0 {
-            v <<= 2;
-            let c = pc.wrapping_add(j as u32);
+    let words = data[..lim].chunks_exact_mut(4).enumerate();
+    #[cfg(target_arch = "x86_64")]
+    let mut words = words;
+    // C: BranchConv_SPARC's GetUi16a predicate, before GetBe32a conversion.
+    #[cfg(target_arch = "x86_64")]
+    let words = core::iter::from_fn(|| {
+        words.find(|(_, instruction)| matches!(get_u16le(instruction, 0) & 0xC0FF, 0x0040 | 0xC07F))
+    });
+    for (index, instruction) in words {
+        let mut v = get_u32be(instruction, 0).rotate_left(2);
+        v = v.wrapping_add((FLAG << 2) - 1);
+        if v & 3u32.wrapping_sub(FLAG << 3) == 0 {
+            rare_branch();
+            let c = pc.wrapping_add((index as u32).wrapping_mul(4));
             v = convert_val(v, c, encoding);
             v &= (FLAG << 3) - 1;
-            v = v.wrapping_sub(FLAG << 2);
-            v >>= 2;
-            v |= 1 << 30;
-            set_u32be(data, j, v);
+            v = v.wrapping_sub((FLAG << 2) - 1);
+            v = v.rotate_right(2);
+            set_u32be(instruction, 0, v);
         }
-        j += 4;
     }
     lim
+}
+
+// C: Z7_UNLIKELY on the conversion arms in Bra.c. Preserve its branch
+// probabilities on x86-64; other targets retain their existing hints.
+#[inline(always)]
+fn rare_branch() {
+    #[cfg(target_arch = "x86_64")]
+    core::hint::cold_path();
 }
 
 /// C: `z7_BranchConv_ARMT_Dec` / `_Enc`.
 fn armt_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if encoding {
+            armt_word_conv::<true>(data, pc)
+        } else {
+            armt_word_conv::<false>(data, pc)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    armt_bytewise_conv(data, pc, encoding)
+}
+
+// C: BranchConv_ARMT, with its overlapping halfword predicate read as one
+// word. A four-byte slice proves every load/store's bounds once. Advancing
+// two bytes on a miss and four on a hit preserves the SDK's consumed length.
+#[cfg(target_arch = "x86_64")]
+fn armt_word_conv<const ENCODING: bool>(data: &mut [u8], pc: u32) -> usize {
+    let size = data.len() & !1;
+    let mut rest = &mut data[..size];
+    let mut p = 0usize;
+    while rest.len() >= 4 {
+        let instruction = &mut rest[..4];
+        let word = get_u32le(instruction, 0);
+        let advance = if word & 0xF800_F800 == 0xF800_F000 {
+            let v = ((word & 0xFFFF) << 11) | ((word >> 16) & 0x7FF);
+            let c = pc.wrapping_add(p as u32).wrapping_add(4) >> 1;
+            let v = convert_val(v, c, ENCODING);
+            let first = ((v >> 11) & 0x7FF) | 0xF000;
+            let second = v | 0xF800;
+            set_u32le(instruction, 0, first | (second << 16));
+            4
+        } else {
+            2
+        };
+        rest = &mut rest[advance..];
+        p += advance;
+    }
+    p
+}
+
+#[cfg(any(not(target_arch = "x86_64"), test))]
+fn armt_bytewise_conv(data: &mut [u8], pc: u32, encoding: bool) -> usize {
     let size = data.len() & !1;
     if size <= 2 {
         return 0;
@@ -929,6 +996,24 @@ pub fn riscv_encode(data: &mut [u8], pc: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn thumb_word_pairs_match_the_sdk_bytewise_scan() {
+        for first in 0u8..=255 {
+            for second in 0u8..=255 {
+                for pc in [0, 2, 0xFFFF_FFFC, 0xFFFF_FFFE] {
+                    for encoding in [false, true] {
+                        let src = [first ^ second, first, first.wrapping_add(second), second];
+                        let (mut a, mut b) = (src, src);
+                        let got = armt_conv(&mut a, pc, encoding);
+                        let want = armt_bytewise_conv(&mut b, pc, encoding);
+                        assert_eq!((got, a), (want, b), "{pc} {encoding} {src:?}");
+                    }
+                }
+            }
+        }
+    }
 
     /// The word scan must name the same byte as the byte scan, for every
     /// length and every alignment, over bytes chosen to be exactly the ones a

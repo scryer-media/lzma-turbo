@@ -5,10 +5,12 @@
 //! the fast parser (`GetOptimumFast`), and the price tables that feed them
 //! (`FillDistancesPrices`, `FillAlignPrices`).
 //!
-//! Not ported: the `Z7_ST`-guarded multi-threaded match finder, and
-//! `LzmaEnc_Encode`'s progress callback.
+//! The threaded and inline match finders live in `lz_find_mt`.
+//! Not ported: `LzmaEnc_Encode`'s progress callback.
 
-use alloc::{vec, vec::Vec};
+#[cfg(any(not(any(target_arch = "arm", target_arch = "aarch64")), test))]
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::enc::consts::*;
 use crate::enc::finder::{Finder, FinderMode};
@@ -18,7 +20,7 @@ use crate::enc::price::{
     lit_enc_matched_get_price, price, price_0, price_1,
 };
 use crate::enc::props::{self, LzmaEncProps};
-use crate::enc::range_enc::RangeEnc;
+use crate::enc::range_enc::{RangeEnc, RangeOutput};
 use crate::enc::stream::{SeqInStream, SeqOutStream};
 use crate::error::Error;
 
@@ -287,6 +289,7 @@ pub(crate) struct LzmaEnc {
     rep_len_probs: LenEnc,
 
     /// C: `p->g_FastPos`, on the heap because it is 16 KiB.
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     g_fast_pos: Vec<u8>,
 
     len_enc: LenPriceEnc,
@@ -350,6 +353,7 @@ impl LzmaEnc {
             pos_encoders: [0; K_NUM_FULL_DISTANCES],
             len_probs: LenEnc::new(),
             rep_len_probs: LenEnc::new(),
+            #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
             g_fast_pos: fast_pos_init(),
             len_enc: LenPriceEnc::new(),
             rep_len_enc: LenPriceEnc::new(),
@@ -458,17 +462,19 @@ impl LzmaEnc {
     }
 
     // -----------------------------------------------------------------------
-    // Position slots. C: the `GetPosSlot*` macros, `LZMA_LOG_BSR` undefined.
+    // Position slots. C: `GetPosSlot*`; ARM selects `LZMA_LOG_BSR`.
     // -----------------------------------------------------------------------
 
     /// C: `GetPosSlot1(pos)`.
     #[inline]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_pos_slot1(&self, pos: u32) -> u32 {
         u32::from(self.g_fast_pos[pos as usize])
     }
 
     /// C: `GetPosSlot2(pos, res)`, i.e. `BSR2_RET`.
     #[inline]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_pos_slot2(&self, pos: u32) -> u32 {
         let zz = if pos < (1 << (K_NUM_LOG_BITS + 6)) {
             6
@@ -480,12 +486,34 @@ impl LzmaEnc {
 
     /// C: `GetPosSlot(pos, res)`.
     #[inline]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_pos_slot(&self, pos: u32) -> u32 {
         if (pos as usize) < K_NUM_FULL_DISTANCES {
             u32::from(self.g_fast_pos[(pos as usize) & (K_NUM_FULL_DISTANCES - 1)])
         } else {
             self.get_pos_slot2(pos)
         }
+    }
+
+    /// C: `GetPosSlot1` with `LZMA_LOG_BSR`.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[inline]
+    fn get_pos_slot1(&self, pos: u32) -> u32 {
+        pos_slot_clz(pos)
+    }
+
+    /// C: `GetPosSlot2` with `LZMA_LOG_BSR`.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[inline]
+    fn get_pos_slot2(&self, pos: u32) -> u32 {
+        pos_slot_clz(pos)
+    }
+
+    /// C: `GetPosSlot` with `LZMA_LOG_BSR`.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[inline]
+    fn get_pos_slot(&self, pos: u32) -> u32 {
+        pos_slot_clz(pos)
     }
 
     // -----------------------------------------------------------------------
@@ -1054,7 +1082,8 @@ impl LzmaEnc {
                     break;
                 }
 
-                position += 1;
+                // C: GetOptimum's UInt32 position and look-ahead wrap.
+                position = position.wrapping_add(1);
 
                 let mut prev = cur - opt!(cur).len as usize;
                 let state;
@@ -1236,7 +1265,7 @@ impl LzmaEnc {
                         let len = buf.match_len(data, data2, 3, limit as usize) as u32;
 
                         let state2 = u32::from(K_LITERAL_NEXT_STATES[state as usize]);
-                        let pos_state2 = (position + 1) & self.pb_mask;
+                        let pos_state2 = position.wrapping_add(1) & self.pb_mask;
                         let base = lit_price + self.get_price_rep_0(state2, pos_state2);
                         let offset = cur + len as usize;
                         if last < offset {
@@ -1309,9 +1338,9 @@ impl LzmaEnc {
                             && buf[data + len2 as usize - 1] == buf[data2 + len2 as usize - 1]
                     } {
                         let state2 = u32::from(K_REP_NEXT_STATES[state as usize]);
-                        let mut pos_state2 = (position + len) & self.pb_mask;
-                        let lit_at =
-                            self.lit_probs_at(position + len, buf[data + len as usize - 1]);
+                        let mut pos_state2 = position.wrapping_add(len) & self.pb_mask;
+                        let lit_at = self
+                            .lit_probs_at(position.wrapping_add(len), buf[data + len as usize - 1]);
                         base += self.rep_len_enc.get_price_len(pos_state, len)
                             + price_0(
                                 &self.prob_prices,
@@ -1418,9 +1447,11 @@ impl LzmaEnc {
                                 len2 -= len;
 
                                 let state2 = u32::from(K_MATCH_NEXT_STATES[state as usize]);
-                                let mut pos_state2 = (position + len) & self.pb_mask;
-                                let lit_at =
-                                    self.lit_probs_at(position + len, buf[data + len as usize - 1]);
+                                let mut pos_state2 = position.wrapping_add(len) & self.pb_mask;
+                                let lit_at = self.lit_probs_at(
+                                    position.wrapping_add(len),
+                                    buf[data + len as usize - 1],
+                                );
                                 base += price_0(
                                     &self.prob_prices,
                                     self.is_match[state2 as usize][pos_state2 as usize],
@@ -1661,22 +1692,26 @@ impl LzmaEnc {
 
     /// C: `WriteEndMarker`.
     fn write_end_marker(&mut self, pos_state: u32, out: &mut dyn SeqOutStream) {
+        let mut bound = RangeOutput(out);
+        let mut range = self.rc.range;
         {
             let prob = &mut self.is_match[self.state as usize][pos_state as usize];
-            self.rc.encode_bit_1(prob, out);
+            range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
             let prob = &mut self.is_rep[self.state as usize];
-            self.rc.encode_bit_0(prob, out);
+            range = self.rc.encode_bit_0_with_range(range, prob, &mut bound);
         }
         self.state = u32::from(K_MATCH_NEXT_STATES[self.state as usize]);
 
-        self.len_probs.encode(&mut self.rc, 0, pos_state, out);
+        self.rc.range = range;
+        self.len_probs.encode(&mut self.rc, 0, pos_state, bound.0);
+        range = self.rc.range;
 
         {
             // C: `RcTree_Encode_PosSlot(..., (1 << kNumPosSlotBits) - 1)`.
             let mut m = 1usize;
             loop {
                 let prob = &mut self.pos_slot_encoder[0][m];
-                self.rc.encode_bit_1(prob, out);
+                range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
                 m = (m << 1) + 1;
                 if m >= (1 << K_NUM_POS_SLOT_BITS) {
                     break;
@@ -1686,7 +1721,9 @@ impl LzmaEnc {
         {
             // C: `RangeEnc_EncodeDirectBits(..., 30 - kNumAlignBits)`, all ones.
             for _ in 0..(30 - K_NUM_ALIGN_BITS) {
-                self.rc.encode_direct_bit(u32::MAX, out);
+                range = self
+                    .rc
+                    .encode_direct_bit_with_range(range, u32::MAX, &mut bound);
             }
         }
         {
@@ -1694,13 +1731,14 @@ impl LzmaEnc {
             let mut m = 1usize;
             loop {
                 let prob = &mut self.pos_align_encoder[m];
-                self.rc.encode_bit_1(prob, out);
+                range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
                 m = (m << 1) + 1;
                 if m >= K_ALIGN_TABLE_SIZE {
                     break;
                 }
             }
         }
+        self.rc.range = range;
     }
 
     /// C: `CheckErrors`.
@@ -1794,6 +1832,9 @@ impl LzmaEnc {
         // Common::win is a stored raw allocation pointer, not a pointer
         // borrowed from a slice that finder advancement could invalidate.
         let window_storage = self.mf.window_storage();
+        // C: UInt32 positions wrap independently of the total byte count.
+        // Each block returns after bounded progress, so its modulo difference
+        // is the exact number of bytes to add to now_pos64, including at 4 GiB.
         let mut now_pos32 = self.now_pos64 as u32;
         let start_pos32 = now_pos32;
 
@@ -1912,42 +1953,45 @@ impl LzmaEnc {
                         );
                     }
                 } else {
+                    // C: keep range local through the complete match/rep selector.
+                    let mut bound = RangeOutput(out);
+                    let mut range = self.rc.range;
                     let prob = &mut self.is_match[self.state as usize][pos_state as usize];
-                    self.rc.encode_bit_1(prob, out);
+                    range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
 
                     if (dist as usize) < LZMA_NUM_REPS {
                         let prob = &mut self.is_rep[self.state as usize];
-                        self.rc.encode_bit_1(prob, out);
+                        range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
 
                         if dist == 0 {
                             let prob = &mut self.is_rep_g0[self.state as usize];
-                            self.rc.encode_bit_0(prob, out);
+                            range = self.rc.encode_bit_0_with_range(range, prob, &mut bound);
                             // C takes `probs = &p->isRep0Long[p->state][posState]`
                             // before the short-rep branch changes `p->state`, so
                             // the update lands in the old state's slot.
                             let si = self.state as usize;
                             let prob = &mut self.is_rep0_long[si][pos_state as usize];
                             if len != 1 {
-                                self.rc.encode_bit_1_base(prob);
+                                range = self.rc.encode_bit_1_base_with_range(range, prob);
                             } else {
-                                self.rc.encode_bit_0_base(prob);
+                                range = self.rc.encode_bit_0_base_with_range(range, prob);
                                 self.state = u32::from(K_SHORT_REP_NEXT_STATES[si]);
                             }
                         } else {
                             let prob = &mut self.is_rep_g0[self.state as usize];
-                            self.rc.encode_bit_1(prob, out);
+                            range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
                             let prob = &mut self.is_rep_g1[self.state as usize];
                             if dist == 1 {
-                                self.rc.encode_bit_0_base(prob);
+                                range = self.rc.encode_bit_0_base_with_range(range, prob);
                                 dist = self.reps[1];
                             } else {
-                                self.rc.encode_bit_1(prob, out);
+                                range = self.rc.encode_bit_1_with_range(range, prob, &mut bound);
                                 let prob = &mut self.is_rep_g2[self.state as usize];
                                 if dist == 2 {
-                                    self.rc.encode_bit_0_base(prob);
+                                    range = self.rc.encode_bit_0_base_with_range(range, prob);
                                     dist = self.reps[2];
                                 } else {
-                                    self.rc.encode_bit_1_base(prob);
+                                    range = self.rc.encode_bit_1_base_with_range(range, prob);
                                     dist = self.reps[3];
                                     self.reps[3] = self.reps[2];
                                 }
@@ -1957,28 +2001,30 @@ impl LzmaEnc {
                             self.reps[0] = dist;
                         }
 
-                        self.rc.norm_pub(out);
+                        range = self.rc.norm_with_range(range, &mut bound);
+                        self.rc.range = range;
 
                         if len != 1 {
                             self.rep_len_probs.encode(
                                 &mut self.rc,
                                 len - LZMA_MATCH_LEN_MIN,
                                 pos_state,
-                                out,
+                                bound.0,
                             );
                             self.rep_len_enc_counter -= 1;
                             self.state = u32::from(K_REP_NEXT_STATES[self.state as usize]);
                         }
                     } else {
                         let prob = &mut self.is_rep[self.state as usize];
-                        self.rc.encode_bit_0(prob, out);
+                        range = self.rc.encode_bit_0_with_range(range, prob, &mut bound);
+                        self.rc.range = range;
                         self.state = u32::from(K_MATCH_NEXT_STATES[self.state as usize]);
 
                         self.len_probs.encode(
                             &mut self.rc,
                             len - LZMA_MATCH_LEN_MIN,
                             pos_state,
-                            out,
+                            bound.0,
                         );
 
                         dist -= LZMA_NUM_REPS as u32;
@@ -1989,6 +2035,7 @@ impl LzmaEnc {
 
                         self.match_price_count += 1;
                         let pos_slot = self.get_pos_slot(dist);
+                        range = self.rc.range;
                         {
                             let mut sym = pos_slot + (1 << K_NUM_POS_SLOT_BITS);
                             let lps = get_len_to_pos_state(len);
@@ -1997,12 +2044,14 @@ impl LzmaEnc {
                                 let bit = (sym >> (K_NUM_POS_SLOT_BITS - 1)) & 1;
                                 sym <<= 1;
                                 let prob = &mut self.pos_slot_encoder[lps][i];
-                                self.rc.encode_bit(prob, bit, out);
+                                range = self.rc.encode_bit_with_range(range, prob, bit, &mut bound);
                                 if sym >= (1 << (K_NUM_POS_SLOT_BITS * 2)) {
                                     break;
                                 }
                             }
                         }
+
+                        self.rc.range = range;
 
                         if dist >= K_START_POS_MODEL_INDEX {
                             let footer_bits = (pos_slot >> 1) - 1;
@@ -2013,13 +2062,16 @@ impl LzmaEnc {
                                     &mut self.pos_encoders[base..],
                                     footer_bits,
                                     dist,
-                                    out,
+                                    bound.0,
                                 );
                             } else {
                                 let mut pos2 = (dist | 0xF) << (32 - footer_bits);
                                 loop {
-                                    self.rc
-                                        .encode_direct_bit(0u32.wrapping_sub(pos2 >> 31), out);
+                                    range = self.rc.encode_direct_bit_with_range(
+                                        range,
+                                        0u32.wrapping_sub(pos2 >> 31),
+                                        &mut bound,
+                                    );
                                     pos2 = pos2.wrapping_add(pos2);
                                     if pos2 == 0xF000_0000 {
                                         break;
@@ -2034,15 +2086,17 @@ impl LzmaEnc {
                                         dist >>= 1;
                                     }
                                     let prob = &mut self.pos_align_encoder[m];
-                                    self.rc.encode_bit(prob, bit, out);
+                                    range =
+                                        self.rc.encode_bit_with_range(range, prob, bit, &mut bound);
                                     m = (m << 1) + bit as usize;
                                 }
+                                self.rc.range = range;
                             }
                         }
                     }
                 }
 
-                now_pos32 += len;
+                now_pos32 = now_pos32.wrapping_add(len);
                 self.additional_offset -= len;
 
                 if self.additional_offset == 0 {
@@ -2076,7 +2130,7 @@ impl LzmaEnc {
                     {
                         break;
                     }
-                    let processed = now_pos32 - start_pos32;
+                    let processed = now_pos32.wrapping_sub(start_pos32);
 
                     if max_pack_size != 0 {
                         if processed as usize + K_NUM_OPTS + 300 >= max_unpack_size as usize
@@ -2085,14 +2139,14 @@ impl LzmaEnc {
                             break;
                         }
                     } else if processed >= (1 << 17) {
-                        self.now_pos64 += u64::from(now_pos32 - start_pos32);
+                        self.now_pos64 += u64::from(processed);
                         return self.check_errors();
                     }
                 }
             }
         }
 
-        self.now_pos64 += u64::from(now_pos32 - start_pos32);
+        self.now_pos64 += u64::from(now_pos32.wrapping_sub(start_pos32));
         self.flush(now_pos32, out)
     }
 
@@ -2131,7 +2185,13 @@ impl LzmaEnc {
 
     /// C: `LzmaEnc_Alloc`. `data_limit` is [`LzmaEnc::set_data_limit`]'s
     /// promise for this stream.
-    fn alloc(&mut self, keep_window_size: u32, data_limit: u64, direct: bool) -> Result<(), Error> {
+    fn alloc(
+        &mut self,
+        keep_window_size: u32,
+        data_limit: u64,
+        direct: bool,
+        owned: bool,
+    ) -> Result<(), Error> {
         {
             let lclp = self.lc + self.lp;
             if self.lit_probs.is_empty() || self.lclp != lclp {
@@ -2189,6 +2249,7 @@ impl LzmaEnc {
             data_limit,
             direct,
             mode == FinderMode::Inline,
+            owned,
         )
     }
 
@@ -2334,7 +2395,12 @@ impl LzmaEnc {
     }
 
     /// C: `LzmaEnc_AllocAndInit`.
-    fn alloc_and_init(&mut self, keep_window_size: u32, direct: bool) -> Result<(), Error> {
+    fn alloc_and_init(
+        &mut self,
+        keep_window_size: u32,
+        direct: bool,
+        owned: bool,
+    ) -> Result<(), Error> {
         let mut i = (K_END_POS_MODEL_INDEX / 2) as usize;
         while (i as u32) < K_DIC_LOG_SIZE_MAX {
             if self.dict_size <= (1u32 << i) {
@@ -2350,7 +2416,7 @@ impl LzmaEnc {
         self.need_init = true;
         // The promise is for this stream alone.
         let data_limit = core::mem::replace(&mut self.data_limit, u64::MAX);
-        self.alloc(keep_window_size, data_limit, direct)?;
+        self.alloc(keep_window_size, data_limit, direct, owned)?;
         self.init_state();
         self.init_prices();
         Ok(())
@@ -2359,14 +2425,14 @@ impl LzmaEnc {
     /// C: `LzmaEnc_Prepare` / `LzmaEnc_PrepareForLzma2`. The stream itself is
     /// passed to [`Self::code_one_block`] rather than stored.
     pub(crate) fn prepare(&mut self, keep_window_size: u32) -> Result<(), Error> {
-        self.alloc_and_init(keep_window_size, false)
+        self.alloc_and_init(keep_window_size, false, false)
     }
 
     /// C: `LzmaEnc_MemPrepare`, whose `MatchFinder_SET_DIRECT_INPUT_BUF` also
     /// sets `expectedDataSize` from the source length.
     pub(crate) fn mem_prepare(&mut self, src_len: u64, keep_window_size: u32) -> Result<(), Error> {
         self.set_data_size(src_len);
-        self.alloc_and_init(keep_window_size, false)
+        self.alloc_and_init(keep_window_size, false, false)
     }
 
     /// [`Self::mem_prepare`] with the C's `directInput` as well: a threaded
@@ -2381,7 +2447,28 @@ impl LzmaEnc {
         keep_window_size: u32,
     ) -> Result<(), Error> {
         self.set_data_size(src_len);
-        self.alloc_and_init(keep_window_size, true)
+        self.alloc_and_init(keep_window_size, true, false)
+    }
+
+    // C: LzmaEnc_MemPrepare with an owned MtCoder input block. Ownership
+    // supplies the single-threaded window without a borrowed pointer.
+    #[cfg(feature = "std")]
+    pub(crate) fn mem_prepare_owned(
+        &mut self,
+        src_len: usize,
+        keep_window_size: u32,
+    ) -> Result<(), Error> {
+        // Larger custom blocks retain the streamed-window implementation.
+        // This bound keeps every direct position below normalization.
+        assert!(src_len <= 1 << 30);
+        self.set_data_size(src_len as u64);
+        self.alloc_and_init(keep_window_size, true, true)
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn exchange_owned_input(&mut self, input: &mut super::lz_find::MatchWindow) {
+        assert!(matches!(self.mf, Finder::St(_)));
+        core::mem::swap(&mut self.mf.cfg().buf_base, input);
     }
 
     /// The threaded match finder's handle, when one is in use.
@@ -2525,6 +2612,10 @@ impl SeqOutStream for LimitedSink<'_> {
 }
 
 /// C: `LzmaEnc_FastPosInit`.
+#[cfg(any(
+    all(test, feature = "std"),
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
 fn fast_pos_init() -> Vec<u8> {
     let mut g = vec![0u8; 1 << K_NUM_LOG_BITS];
     g[0] = 0;
@@ -2540,10 +2631,77 @@ fn fast_pos_init() -> Vec<u8> {
     g
 }
 
+/// C: `BSR2_RET` / `GetPosSlot`, with `LZMA_LOG_BSR` enabled on ARM.
+/// The parser also computes `GetPosSlot2` speculatively for distances below
+/// 128, then ignores it. Define 0/1 here before subtracting or shifting.
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    all(test, feature = "std")
+))]
+#[inline]
+fn pos_slot_clz(pos: u32) -> u32 {
+    if pos < 2 {
+        return pos;
+    }
+    let zz = 30 - pos.leading_zeros();
+    zz * 2 + (pos >> zz)
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::enc::stream::{NoStream, SliceStream};
+
+    #[test]
+    fn arm_position_slots_match_the_table_family() {
+        let table = fast_pos_init();
+        let enc = LzmaEnc::new().unwrap();
+        let check = |pos: u32| {
+            let expected = if pos < 128 {
+                u32::from(table[pos as usize])
+            } else {
+                let zz = if pos < (1 << (K_NUM_LOG_BITS + 6)) {
+                    6
+                } else {
+                    6 + K_NUM_LOG_BITS as u32 - 1
+                };
+                u32::from(table[(pos >> zz) as usize]) + zz * 2
+            };
+            assert_eq!(pos_slot_clz(pos), expected, "distance {pos}");
+            assert_eq!(enc.get_pos_slot(pos), expected, "selected distance {pos}");
+            if pos >= 128 {
+                assert_eq!(enc.get_pos_slot2(pos), expected);
+            }
+            if (pos as usize) < table.len() {
+                assert_eq!(enc.get_pos_slot1(pos), expected);
+            }
+        };
+        for pos in 0..if cfg!(miri) { 256 } else { 1 << 20 } {
+            check(pos);
+        }
+        for bit in 1..32 {
+            for pos in [(1u32 << bit) - 1, 1u32 << bit, (1u32 << bit) + 1] {
+                check(pos);
+            }
+        }
+        for pos in [
+            K_LZMA_MAX_HISTORY_SIZE - 1,
+            K_LZMA_MAX_HISTORY_SIZE,
+            u32::MAX,
+        ] {
+            check(pos);
+        }
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..if cfg!(miri) { 16 } else { 65_536 } {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            check(seed);
+        }
+        assert_eq!(pos_slot_clz(0), 0);
+        assert_eq!(pos_slot_clz(1), 1);
+    }
 
     #[test]
     fn the_window_match_lengths_equal_the_bytewise_oracle() {
@@ -2607,6 +2765,81 @@ mod tests {
             }
         }
         out
+    }
+
+    fn encode_across_position_wrap<const CHECKED: bool>(
+        src: &[u8],
+        props: &LzmaEncProps,
+        before_wrap: u64,
+    ) -> Vec<u8> {
+        let mut enc = alloc::boxed::Box::new(LzmaEnc::new().unwrap());
+        enc.set_props(props).unwrap();
+        enc.mem_prepare(src.len() as u64, 0).unwrap();
+        let mut out = Vec::new();
+        let mut stream = SliceStream::new(src);
+        let shared = enc.mt_handle();
+        let mut run = |stream: &mut dyn SeqInStream| {
+            enc.code_one_block_kernel::<CHECKED>(stream, &mut out, 0, 0)?;
+            assert!(!enc.finished);
+            let consumed = enc.now_pos64;
+            // Only low lp/pb position bits affect coding. Preserve all four
+            // possible bits while placing the next block across UInt32 wrap.
+            let shifted = (1u64 << 32) - before_wrap + (consumed & 15);
+            enc.now_pos64 = shifted;
+            while !enc.finished {
+                enc.code_one_block_kernel::<CHECKED>(stream, &mut out, 0, 0)?;
+            }
+            assert_eq!(enc.now_pos64, shifted + src.len() as u64 - consumed);
+            Ok(())
+        };
+        if let Some(sh) = shared {
+            crate::enc::lz_find_mt::with_threads(&sh, &mut stream, || run(&mut NoStream)).unwrap();
+        } else {
+            run(&mut stream).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn encoder_position_wrap_preserves_output_and_processed_count() {
+        let mut seed = 0x7139_ab5du32;
+        let data: Vec<u8> = (0..320 * 1024)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 1024 < 768 { (seed & 3) as u8 } else { 0 }
+            })
+            .collect();
+        for (kind, fast, threads) in [
+            (MatchFinderKind::Hc4, true, 1),
+            (MatchFinderKind::Bt4, false, 1),
+            (MatchFinderKind::Bt4, false, 2),
+        ] {
+            let props = LzmaEncProps::new()
+                .with_dict_size(4096)
+                .with_match_finder(kind)
+                .with_fast_mode(fast)
+                .with_fast_bytes(32)
+                .with_num_threads(threads)
+                .with_end_mark(true);
+            // Cross wrap both in the final block and before an ordinary
+            // 128 KiB progress return. No four-GiB fixture is needed.
+            for len in [160 * 1024, 320 * 1024] {
+                let src = &data[..len];
+                let expected = encode::<true>(src, &props);
+                for before_wrap in [16, 256] {
+                    assert_eq!(
+                        encode_across_position_wrap::<true>(src, &props, before_wrap),
+                        expected
+                    );
+                    assert_eq!(
+                        encode_across_position_wrap::<false>(src, &props, before_wrap),
+                        expected
+                    );
+                }
+            }
+        }
     }
 
     /// The same parser instantiated with checked and unchecked window reads.

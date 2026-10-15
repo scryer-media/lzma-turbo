@@ -173,11 +173,24 @@ impl XzAdaptiveDecoder {
         self.pool.as_ref().map_or(0, XzPool::spawned)
     }
 
-    /// Bytes the decoder is holding: input not yet consumed, plus the blocks
-    /// workers are decoding.
+    /// Bytes awaiting consumption or delivery: buffered input, worker jobs,
+    /// completed blocks awaiting order, and partially delivered output.
     #[must_use]
     pub fn in_flight_bytes(&self) -> u64 {
-        (self.buf.len() - self.cursor) as u64 + self.outstanding_bytes
+        ((self.buf.len() - self.cursor) as u64).saturating_add(self.held_block_bytes())
+    }
+
+    fn held_block_bytes(&self) -> u64 {
+        let ready = self
+            .ready
+            .values()
+            .fold(self.outstanding_bytes, |held, done| {
+                held.saturating_add(done.unpacked_len as u64)
+                    .saturating_add(done.bytes.len() as u64)
+            });
+        // The whole output allocation remains owned until its final byte is
+        // delivered, even when only a small suffix is left.
+        ready.saturating_add(self.part.as_ref().map_or(0, |(_, len, _)| *len as u64))
     }
 
     /// Total output handed to the caller so far.
@@ -576,17 +589,24 @@ impl XzAdaptiveDecoder {
                 Dispatch::Busy
             });
         }
-        if self.outstanding >= self.threads {
+        let held_blocks = self.outstanding + self.ready.len() + usize::from(self.part.is_some());
+        if held_blocks >= self.threads {
             return Ok(Dispatch::Busy);
         }
         // One worker's cost, against the caller's limit.
         let cost = unpacked + padded;
-        if self.outstanding > 0 && self.outstanding_bytes + cost > self.opts.memory_limit {
+        if held_blocks > 0 && self.held_block_bytes().saturating_add(cost) > self.opts.memory_limit
+        {
             return Ok(Dispatch::Busy);
         }
 
         let mut bytes = self.spare_in.pop().unwrap_or_default();
         bytes.clear();
+        // The block size is known; do not double a recycled packed buffer
+        // when a later block exceeds its capacity by only a few bytes.
+        bytes
+            .try_reserve_exact(padded_usize)
+            .map_err(|_| self.err(XzErrorKind::Lzma(crate::Error::Alloc)))?;
         bytes.extend_from_slice(&self.avail()[..padded_usize]);
         let file_offset = self.offset();
         let unpacked_offset = self.planned_out;
@@ -982,4 +1002,96 @@ enum Dispatch {
     Busy,
     /// It cannot go to a worker at all; the chase takes it.
     No,
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn recycled_packed_input_does_not_double_for_a_larger_block() {
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        let archive = crate::encode_xz(&[7; 4096], &props, CheckType::Crc64, 4096).unwrap();
+        let header_size = super::super::block::header_size_from_first_byte(archive[12]).unwrap();
+        let header = BlockHeader::parse(&archive[12..12 + header_size]).unwrap();
+        let packed = header.compressed_size.unwrap();
+        let padded = header_size + packed as usize + (4 - packed as usize % 4) % 4 + 8;
+        let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(2));
+        dec.flags.check = CheckType::Crc64;
+        dec.check_size = 8;
+        dec.buf = archive[12..12 + padded].to_vec();
+        dec.spare_in.push(Vec::with_capacity(padded - 1));
+        assert!(matches!(
+            dec.try_dispatch(header_size, packed, 4096).unwrap(),
+            Dispatch::Sent
+        ));
+        let done = dec.pool.as_ref().unwrap().collect().unwrap();
+        done.res.unwrap();
+        assert_eq!(done.bytes.capacity(), padded);
+        assert_eq!(&done.out[..4096], &[7; 4096]);
+    }
+
+    fn completed(index: u64) -> XzDone {
+        XzDone {
+            index,
+            stream: 0,
+            block_in_stream: index,
+            file_offset: 0,
+            unpacked_len: 64,
+            res: Ok(()),
+            out: alloc::vec![0; 64],
+            bytes: alloc::vec![0; 12],
+            checks: None,
+        }
+    }
+
+    #[test]
+    fn completed_blocks_keep_adaptive_admission_and_feed_budget() {
+        let mut dec =
+            XzAdaptiveDecoder::new(XzOptions::default().with_threads(3).with_memory_limit(240));
+        dec.buf = alloc::vec![0; 12];
+        dec.outstanding = 1;
+        dec.outstanding_bytes = 76;
+        dec.ready.insert(1, completed(1));
+        dec.ready.insert(2, completed(2));
+        assert_eq!(dec.in_flight_bytes(), 240);
+        assert_eq!(dec.feed(&[0; 12]).unwrap(), 0);
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 64).unwrap(),
+            Dispatch::Busy
+        ));
+        assert_eq!(dec.cursor, 0);
+        assert_eq!(dec.spawned_threads(), 0);
+
+        // A higher thread ceiling must not evade the byte limit either.
+        dec.set_threads(8);
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 64).unwrap(),
+            Dispatch::Busy
+        ));
+    }
+
+    #[test]
+    fn partially_delivered_output_keeps_its_full_admission_cost() {
+        let mut dec =
+            XzAdaptiveDecoder::new(XzOptions::default().with_threads(1).with_memory_limit(76));
+        dec.buf = alloc::vec![0; 12];
+        dec.ready.insert(0, completed(0));
+        let mut left = 1;
+        assert!(dec.emit(&mut |_, _| {}, &mut left).unwrap());
+        assert_eq!(dec.in_flight_bytes(), 76);
+        assert_eq!(dec.feed(&[0; 12]).unwrap(), 0);
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 64).unwrap(),
+            Dispatch::Busy
+        ));
+        let mut left = 63;
+        assert!(dec.emit(&mut |_, _| {}, &mut left).unwrap());
+        assert!(dec.part.is_none());
+        assert_eq!(dec.in_flight_bytes(), 12);
+        assert_eq!(dec.feed(&[0; 12]).unwrap(), 12);
+    }
 }

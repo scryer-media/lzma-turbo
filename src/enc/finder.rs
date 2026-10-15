@@ -115,8 +115,8 @@ impl Finder {
     /// C: `MatchFinder_Create` or `MatchFinderMt_Create`. `data_limit` is the
     /// promise [`MatchFinder::create`] documents. `direct` asks the threaded
     /// finder for no window, the input being a block it will read in place
-    /// (`MatchFinderMt::create`); the single-threaded finder always reads
-    /// through its window and ignores it. `inline` is
+    /// (`MatchFinderMt::create`). `owned` installs the worker's input Vec as
+    /// the single-threaded window before Init. `inline` is
     /// [`FinderMode::Inline`], for the threaded finder.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
@@ -128,12 +128,16 @@ impl Finder {
         data_limit: u64,
         #[cfg_attr(not(feature = "std"), allow(unused_variables))] direct: bool,
         #[cfg_attr(not(feature = "std"), allow(unused_variables))] inline: bool,
+        owned: bool,
     ) -> Result<(), Error> {
         match self {
             Finder::St(mf) => {
-                // A finder switched back from the threaded one keeps the
-                // flag that one was last created with.
-                mf.direct_input = false;
+                // Reset a previous finder's mode. An owned block replaces
+                // any old streamed window before the finder is initialized.
+                mf.direct_input = owned;
+                if owned {
+                    mf.buf_base = super::lz_find::MatchWindow::default();
+                }
                 mf.create(
                     history_size,
                     keep_add_buffer_before,
@@ -176,7 +180,7 @@ impl Finder {
         if mode != FinderMode::St {
             let retained_window = if direct {
                 match self {
-                    Finder::St(mf) => mf.buf_base.len(),
+                    Finder::St(mf) => mf.buf_base.allocated_words(),
                     Finder::Mt(mt) => mt.windows().0,
                 }
             } else {

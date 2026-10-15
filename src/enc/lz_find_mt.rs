@@ -84,7 +84,6 @@
 //! commented-out `MatchFinderMt_GetMatches_Bt4` / `MatchFinderMt4_Skip` /
 //! `BT5_USE_H4` variants.
 
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,6 +141,9 @@ const fn bt_block_offset(i: u32) -> usize {
 /// ordered by a semaphore or an event, so the orderings are not load-bearing;
 /// they are spelled `SeqCst` because nothing here is hot enough to be worth a
 /// weaker argument.
+/// C: `CMatchFinderMt::btDummy` / `kMtCacheLineDummy` isolate concurrently
+/// written groups. Give each handshake its own extent despite Rust ordering.
+#[repr(align(128))]
 pub(crate) struct MtSync {
     /// C: `p->numProcessedBlocks`.
     num_processed_blocks: AtomicU32,
@@ -346,43 +348,86 @@ fn get_heads(
     heads: &mut [u32],
     crc: &[u32; 256],
 ) {
+    // C: GetHeads_LOOP indexes the table directly. Every masked CRC term
+    // has only bits from mask; the unmasked input term needs its low bits.
+    // Failed proofs retain the indexed path, including partial mutations
+    // before an out-of-range value, rather than rejecting the call early.
+    let domain = match kind {
+        Heads::H2 => Some(0xffff),
+        Heads::H3 => Some(mask),
+        Heads::H3b => Some(0xff_ffff),
+        Heads::H4 | Heads::H5 if mask & 0xffff == 0xffff => Some(mask),
+        Heads::H4b | Heads::H5b if mask & 0xff_ffff == 0xff_ffff => Some(mask),
+        _ => None,
+    };
+    let trusted = domain.is_some_and(|last| (last as usize) < hash.len());
+    // SAFETY: the domain proof covers every value formed by the selected
+    // family, for arbitrary CRC contents. The checked instantiation needs
+    // no domain proof. Both retain the original checked input-window extent.
+    unsafe {
+        if trusted {
+            get_heads_kind::<true>(kind, p, pos, hash, mask, heads, crc);
+        } else {
+            get_heads_kind::<false>(kind, p, pos, hash, mask, heads, crc);
+        }
+    }
+}
+
+/// # Safety
+/// With TRUSTED, every hash value of kind is below hash.len(), as proved
+/// by get_heads. With false, this is the original checked implementation.
+unsafe fn get_heads_kind<const TRUSTED: bool>(
+    kind: Heads,
+    p: &[u8],
+    pos: u32,
+    hash: &mut [u32],
+    mask: u32,
+    heads: &mut [u32],
+    crc: &[u32; 256],
+) {
     let masked = |shift: u32| -> [u32; 256] { core::array::from_fn(|i| (crc[i] << shift) & mask) };
-    match kind {
-        Heads::H2 => heads_loop::<2>(p, pos, hash, heads, |w| ui16w(w[0], w[1])),
-        Heads::H3 => heads_loop::<3>(p, pos, hash, heads, |w| {
-            (crc[usize::from(w[0])] ^ ui16w(w[1], w[2])) & mask
-        }),
-        Heads::H3b => heads_loop::<3>(p, pos, hash, heads, |w| {
-            ui16w(w[0], w[1]) ^ (u32::from(w[2]) << 16)
-        }),
-        Heads::H4 => {
-            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
-            heads_loop::<4>(p, pos, hash, heads, |w| {
-                c0[usize::from(w[0])] ^ c1[usize::from(w[3])] ^ ui16w(w[1], w[2])
-            });
-        }
-        Heads::H4b => {
-            let c0 = masked(0);
-            heads_loop::<4>(p, pos, hash, heads, |w| c0[usize::from(w[0])] ^ ui24hiw(w));
-        }
-        Heads::H5 => {
-            let (c0, c1, c2) = (
-                masked(0),
-                masked(K_LZ_HASH_CRC_SHIFT_1),
-                masked(K_LZ_HASH_CRC_SHIFT_2),
-            );
-            heads_loop::<5>(p, pos, hash, heads, |w| {
-                c0[usize::from(w[0])]
-                    ^ c1[usize::from(w[3])]
-                    ^ c2[usize::from(w[4])]
-                    ^ ui16w(w[1], w[2])
-            });
-        }
-        Heads::H5b => {
-            let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
-            heads_loop::<5>(p, pos, hash, heads, |w| {
-                c0[usize::from(w[0])] ^ c1[usize::from(w[4])] ^ ui24hiw(w)
-            });
+    // SAFETY: each closure computes precisely its family's SDK hash value;
+    // the caller proves its complete domain when TRUSTED is selected.
+    unsafe {
+        match kind {
+            Heads::H2 => heads_loop::<2, TRUSTED>(p, pos, hash, heads, |w| ui16w(w[0], w[1])),
+            Heads::H3 => heads_loop::<3, TRUSTED>(p, pos, hash, heads, |w| {
+                (crc[usize::from(w[0])] ^ ui16w(w[1], w[2])) & mask
+            }),
+            Heads::H3b => heads_loop::<3, TRUSTED>(p, pos, hash, heads, |w| {
+                ui16w(w[0], w[1]) ^ (u32::from(w[2]) << 16)
+            }),
+            Heads::H4 => {
+                let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+                heads_loop::<4, TRUSTED>(p, pos, hash, heads, |w| {
+                    c0[usize::from(w[0])] ^ c1[usize::from(w[3])] ^ ui16w(w[1], w[2])
+                });
+            }
+            Heads::H4b => {
+                let c0 = masked(0);
+                heads_loop::<4, TRUSTED>(p, pos, hash, heads, |w| {
+                    c0[usize::from(w[0])] ^ ui24hiw(w)
+                });
+            }
+            Heads::H5 => {
+                let (c0, c1, c2) = (
+                    masked(0),
+                    masked(K_LZ_HASH_CRC_SHIFT_1),
+                    masked(K_LZ_HASH_CRC_SHIFT_2),
+                );
+                heads_loop::<5, TRUSTED>(p, pos, hash, heads, |w| {
+                    c0[usize::from(w[0])]
+                        ^ c1[usize::from(w[3])]
+                        ^ c2[usize::from(w[4])]
+                        ^ ui16w(w[1], w[2])
+                });
+            }
+            Heads::H5b => {
+                let (c0, c1) = (masked(0), masked(K_LZ_HASH_CRC_SHIFT_1));
+                heads_loop::<5, TRUSTED>(p, pos, hash, heads, |w| {
+                    c0[usize::from(w[0])] ^ c1[usize::from(w[4])] ^ ui24hiw(w)
+                });
+            }
         }
     }
 }
@@ -401,8 +446,12 @@ fn ui24hiw<const N: usize>(w: &[u8; N]) -> u32 {
 
 /// C: `GetHeads_LOOP(v)`, with `value` as `v` over the `N` bytes at each
 /// position.
+///
+/// # Safety
+/// With TRUSTED, value(w) must be below hash.len() for every input window.
+/// With false, all table accesses are checked.
 #[inline(always)]
-fn heads_loop<const N: usize>(
+unsafe fn heads_loop<const N: usize, const TRUSTED: bool>(
     p: &[u8],
     mut pos: u32,
     hash: &mut [u32],
@@ -416,8 +465,20 @@ fn heads_loop<const N: usize>(
     for (w, head) in p.windows(N).zip(heads.iter_mut()) {
         let w: &[u8; N] = w.try_into().expect("a window of N bytes");
         let v = value(w) as usize;
-        *head = pos.wrapping_sub(hash[v]);
-        hash[v] = pos;
+        if TRUSTED {
+            // SAFETY: the family entry proof establishes v < hash.len().
+            // The hash thread exclusively owns this whole table, and the
+            // input/output slices are disjoint from it. Preserve the SDK's
+            // read, distance output, then replacement order.
+            unsafe {
+                let slot = hash.as_mut_ptr().add(v);
+                *head = pos.wrapping_sub(slot.read());
+                slot.write(pos);
+            }
+        } else {
+            *head = pos.wrapping_sub(hash[v]);
+            hash[v] = pos;
+        }
         pos = pos.wrapping_add(1);
     }
 }
@@ -549,10 +610,14 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
 /// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-// On x86-64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
+// On x86-64 and ARM64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
 // one is the tests' and other targets'.
 #[cfg_attr(
-    all(feature = "asm", target_arch = "x86_64", not(feature = "kernel-ab")),
+    all(
+        feature = "asm",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "kernel-ab")
+    ),
     allow(dead_code)
 )]
 pub(super) fn get_matches_spec_n_2(
@@ -828,11 +893,10 @@ pub(super) fn get_matches_spec_n_2(
     Some((di, pos))
 }
 
-/// The tree walk the bt thread runs: the register-shaped kernel in
-/// [`crate::enc::bt_kernel`] on x86-64 with the `asm` feature, where it is the
-/// SDK's `LzFindOpt.asm` shape, and [`get_matches_spec_n_2`] elsewhere. The
-/// two give the same answer and effects (`the_register_walk_is_the_checked_walk_on_any_tables`).
-/// With `kernel-ab`, `LZMA_TURBO_TREE_KERNEL` picks one at run time.
+// The bt thread uses the register-shaped kernel with `asm`: SDK assembly on
+// x86-64, its portable pointer walk on ARM64. Other targets keep the slice
+// walk. The register-walk differential tests compare answers and mutations.
+// With `kernel-ab`, LZMA_TURBO_TREE_KERNEL selects the benchmark variant.
 type TreeWalk = fn(
     &[u8],
     usize,
@@ -861,13 +925,17 @@ fn tree_walk() -> TreeWalk {
             get_matches_spec_n_2
         }
     }
-    #[cfg(all(not(feature = "kernel-ab"), feature = "asm", target_arch = "x86_64"))]
+    #[cfg(all(
+        not(feature = "kernel-ab"),
+        feature = "asm",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         crate::enc::bt_kernel::get_matches_spec_n_2_reg
     }
     #[cfg(all(
         not(feature = "kernel-ab"),
-        not(all(feature = "asm", target_arch = "x86_64"))
+        not(all(feature = "asm", any(target_arch = "x86_64", target_arch = "aarch64")))
     ))]
     {
         get_matches_spec_n_2
@@ -1180,20 +1248,27 @@ impl Common {
         }
     }
 
-    /// The window.
+    /// Retained history and the caller's published readable prefix.
     ///
     /// # Safety
     ///
-    /// The caller must be a thread the block protocol allows to read the
-    /// window: the bt and lz threads always may (they read strictly below
-    /// `stream_pos`, and the hash thread only appends above it or moves the
-    /// whole window with both critical sections held), and the hash thread may
-    /// when it is not itself writing.
-    unsafe fn win(&self) -> &[u8] {
-        // SAFETY: `win` points at `win_len` initialised bytes for as long as
-        // the owning `MtShared` lives, which outlives every thread that holds
-        // a clone of the `Arc`.
-        unsafe { core::slice::from_raw_parts(self.win, self.win_len) }
+    /// `cur + avail` must be a prefix published to this caller. BT and LZ
+    /// hold their block's slide lock until the returned view dies; the hash
+    /// thread may borrow its own prefix only while it is not writing. Direct
+    /// input is immutable. No reference may cover the concurrently appended
+    /// tail, even when the caller would never actually read those bytes.
+    #[inline]
+    unsafe fn win(&self, cur: usize, avail: usize) -> &[u8] {
+        // Keep synthetic oversized availability on the old physical bounds
+        // path rather than introducing an earlier overflow/bounds panic.
+        // This clamp checks allocation extent, not publication: callers must
+        // still establish the prefix and its lifetime as specified above.
+        let end = cur.saturating_add(avail).min(self.win_len);
+        // SAFETY: the live allocation contains win_len initialized bytes;
+        // the caller guarantees no writes or slide in the published prefix.
+        // Construct this view directly: slicing a full-window reference
+        // afterwards would already have borrowed the writable append tail.
+        unsafe { core::slice::from_raw_parts(self.win, end) }
     }
 
     /// The low hash table, which only the lz thread touches.
@@ -1330,7 +1405,9 @@ impl Common {
     }
 }
 
-/// C: the `CMatchFinder` window fields the hash thread owns.
+/// C: the `CMatchFinder` window fields the hash thread owns. The SDK keeps
+/// them in a separate allocation; preserve that cache-line isolation here.
+#[repr(align(128))]
 struct HashState {
     /// C: `mf->pos`.
     pos: u32,
@@ -1358,7 +1435,8 @@ impl HashState {
 }
 
 /// C: the `CMatchFinderMt` fields between `btSync` and `hashSync`, which the
-/// bt thread owns.
+/// bt thread owns, separated from LZ state by `btDummy`.
+#[repr(align(128))]
 struct BtState {
     /// C: `p->hashBufPos`.
     hash_buf_pos: u32,
@@ -1376,7 +1454,92 @@ struct BtState {
     cyclic_buffer_pos: u32,
 }
 
+/// Only real producer acquisition grants `Produced`: a header in range is
+/// insufficient for manually populated buffers. Never survives a handoff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecordOrigin {
+    Untrusted,
+    Produced,
+    Empty,
+    Parked,
+}
+
+/// A local SDK `btBufPos` cursor, confined to one acquired producer block.
+/// No reference covers the other blocks that the producer may be writing.
+struct HeldRecords<'a> {
+    start: *const u32,
+    next: *const u32,
+    end: *const u32,
+    base: usize,
+    _held: core::marker::PhantomData<&'a Common>,
+}
+
+impl<'a> HeldRecords<'a> {
+    /// # Safety
+    /// `l` holds a nonempty real-produced block. Its records partition the
+    /// published extent into a count followed by that even number of words.
+    /// The caller must not release the block while this view exists.
+    #[inline]
+    unsafe fn new(c: &'a Common, l: &LzState) -> Self {
+        let base = l.bt_buf_pos & !(BT_BLOCK_SIZE as usize - 1);
+        // SAFETY: acquisition certifies this physical block and its current
+        // record/end. All offsets stay inside that block, including one-past.
+        let (start, next, end) = unsafe {
+            let start = c.bufs.add(c.bt_base + base).cast_const();
+            (
+                start,
+                start.add(l.bt_buf_pos - base),
+                start.add(l.bt_buf_pos_limit - base),
+            )
+        };
+        Self {
+            start,
+            next,
+            end,
+            base,
+            _held: core::marker::PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// The cursor is not at its end.
+    #[inline]
+    unsafe fn count(&self) -> usize {
+        // SAFETY: the next complete record begins with an initialized count.
+        unsafe { self.next.read() as usize }
+    }
+
+    /// # Safety
+    /// The cursor is not at its end. Returns the current record's pairs.
+    #[inline]
+    unsafe fn advance(&mut self) -> *const u32 {
+        // SAFETY: the producer's record partition bounds count + 1; advancing
+        // lands at another record or exactly at the held block's end.
+        unsafe {
+            let count = self.count();
+            let pairs = self.next.add(1);
+            self.next = pairs.add(count);
+            pairs
+        }
+    }
+
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.next == self.end
+    }
+
+    #[inline]
+    fn position(&self) -> usize {
+        // SAFETY: both pointers remain in the same held allocation and next
+        // is at or after start. Only this numeric index survives the view.
+        self.base + unsafe { self.next.offset_from(self.start) as usize }
+    }
+}
+
 /// C: the `CMatchFinderMt` fields above `btSync`, which the lz thread owns.
+/// Preserve `kMtCacheLineDummy` separation from other writers even when
+/// Rust reorders the surrounding shared fields.
+#[repr(align(128))]
 struct LzState {
     /// C: `p->pointerToCurPos`, as an index into the window.
     pointer_to_cur_pos: usize,
@@ -1390,6 +1553,16 @@ struct LzState {
     bt_num_avail_bytes: u32,
     /// C: `p->failure_LZ_BT`.
     failure_lz_bt: bool,
+    record_origin: RecordOrigin,
+}
+
+impl LzState {
+    #[inline]
+    fn has_produced_record(&self) -> bool {
+        self.record_origin == RecordOrigin::Produced
+            && self.bt_buf_pos < self.bt_buf_pos_limit
+            && self.bt_num_avail_bytes != 0
+    }
 }
 
 /// The whole of `CMatchFinderMt`, as the three threads divide it.
@@ -1439,9 +1612,9 @@ pub(crate) struct MtShared {
 /// The allocations behind [`Common`]'s pointers.
 #[derive(Default)]
 struct Owned {
-    win: Vec<u8>,
-    tab: Vec<u32>,
-    bufs: Vec<u32>,
+    win: super::lz_find::MatchWindow,
+    tab: super::lz_find::MatchTables,
+    bufs: super::lz_find::MatchTables,
 }
 
 /// The block [`run_block`] hands the hash thread, as the C's
@@ -1513,6 +1686,7 @@ impl MtShared {
                 lz_pos: 0,
                 bt_num_avail_bytes: 0,
                 failure_lz_bt: false,
+                record_origin: RecordOrigin::Untrusted,
             }),
             hash_sync: MtSync::new(),
             bt_sync: MtSync::new(),
@@ -1832,7 +2006,8 @@ fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
             let sub_value = h.pos - c.history_size - 1;
             // C: `MatchFinder_REDUCE_OFFSETS`.
             h.pos -= sub_value;
-            h.stream_pos -= sub_value;
+            // Read-ahead can wrap streamPos before pos reaches normalization.
+            h.stream_pos = h.stream_pos.wrapping_sub(sub_value);
             // SAFETY: the high hash is this thread's range.
             let hash = unsafe { c.high_hash() };
             crate::enc::lz_find::normalize3(sub_value, &mut hash[..=c.hash_mask as usize]);
@@ -1842,7 +2017,7 @@ fn hash_fill_block(sh: &MtShared, h: &mut HashState, offset: usize) {
         // SAFETY: the window below `stream_pos` is stable here:
         // this thread is the only writer and is not writing, and
         // `move_block` cannot run while this block is held.
-        let win = unsafe { c.win() };
+        let win = unsafe { c.win(h.buffer, h.avail() as usize) };
         // SAFETY: the high hash is this thread's range.
         let hash = unsafe { c.high_hash() };
         get_heads(
@@ -1972,7 +2147,7 @@ fn bt_get_matches(
             // SAFETY: the window below `stream_pos` is stable while this
             // thread holds a `hash_buf` block: `move_block` waits on
             // `hash_sync.cs`, which `get_next_block` left locked.
-            let win = unsafe { c.win() };
+            let win = unsafe { c.win(b.buffer, b.hash_num_avail as usize) };
             // SAFETY: `son` is the bt thread's exclusive range.
             let son = unsafe { c.son() };
             // The `hash_buf` block `hash_buf_pos` is in: `hash_buf_pos` stays
@@ -2213,6 +2388,7 @@ impl MatchFinderMt {
             // ends, and nothing else holds `sh`.
             let own = unsafe {
                 *sh.common.get() = Common::empty();
+                (*sh.lz_state.get()).record_origin = RecordOrigin::Untrusted;
                 &mut *sh.own.get()
             };
             if mfb.buf_base.is_empty() {
@@ -2288,6 +2464,7 @@ impl MatchFinderMt {
             // The buffers leave `sh` here, so nothing may point into them
             // from it until they come back.
             *sh.common.get() = Common::empty();
+            (*sh.lz_state.get()).record_origin = RecordOrigin::Untrusted;
             &mut *sh.own.get()
         };
         // A finder [`crate::enc::finder::Finder::make_mt`] has just made
@@ -2320,7 +2497,7 @@ impl MatchFinderMt {
             // otherwise pay in full.
             // The old buffers go first, so the two are never held at once.
             drop(core::mem::take(&mut bufs));
-            bufs = crate::enc::lz_find::zeroed_vec(bufs_len)?;
+            bufs = super::lz_find::MatchTables::new(bufs_len)?;
             #[cfg(test)]
             {
                 self.mfb.allocs += 1;
@@ -2433,7 +2610,7 @@ impl MatchFinderMt {
             .checked_add(add_after)
             .ok_or(Error::Param)?;
         let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
-        Ok(base + (hash_words + bt_words + 2) as u64 * 4)
+        Ok(base + super::lz_find::MatchTables::padded_words(hash_words + bt_words + 2)? as u64 * 4)
     }
 
     /// What this finder has allocated, in bytes: the window, the tables, and
@@ -2444,7 +2621,8 @@ impl MatchFinderMt {
             Some(sh) => {
                 // SAFETY: the lz thread, outside a stream; see `create`.
                 let own = unsafe { &*sh.own.get() };
-                own.win.len() as u64 + (own.tab.len() as u64 + own.bufs.len() as u64) * 4
+                own.win.allocated_words() as u64
+                    + (own.tab.allocated_words() as u64 + own.bufs.allocated_words() as u64) * 4
             }
             None => self.mfb.allocated(),
         }
@@ -2454,11 +2632,14 @@ impl MatchFinderMt {
     /// threads read now, in bytes.
     pub(crate) fn windows(&self) -> (usize, usize) {
         let Some(sh) = &self.sh else {
-            return (self.mfb.buf_base.len(), 0);
+            return (self.mfb.buf_base.allocated_words(), 0);
         };
         // SAFETY: the lz thread, outside a stream; see `create`.
         let own = unsafe { &*sh.own.get() };
-        (own.win.len() + self.mfb.buf_base.len(), sh.common().win_len)
+        (
+            own.win.allocated_words() + self.mfb.buf_base.allocated_words(),
+            sh.common().win_len,
+        )
     }
 
     /// C: `MatchFinderMt_InitMt`, "call it before `IMatchFinder::Init()`".
@@ -2518,6 +2699,7 @@ impl MatchFinderMt {
             l.pointer_to_cur_pos = h.buffer;
             l.bt_num_avail_bytes = 0;
             l.failure_lz_bt = false;
+            l.record_origin = RecordOrigin::Untrusted;
             // C: "1; // optimal smallest value".
             l.lz_pos = 1;
         }
@@ -2589,6 +2771,11 @@ impl MatchFinderMt {
     /// C: `MatchFinderMt_Destruct`'s half that ends the threads: tell the
     /// stopped pair to return and wait for both.
     fn retire_threads(&mut self) {
+        if let Some(sh) = &self.sh {
+            // SAFETY: only the caller owns LZ state; no consumer call is live
+            // while retiring the pair or replacing its allocations.
+            unsafe { (*sh.lz_state.get()).record_origin = RecordOrigin::Untrusted };
+        }
         if let Some((hash, bt)) = self.threads.take() {
             let sh = self.shared();
             // C: "we want thread to be in Stopped state before sending EXIT
@@ -2623,9 +2810,14 @@ impl MatchFinderMt {
     /// C: the bytes `p->pointerToCurPos` points into.
     #[inline]
     pub(crate) fn window(&self) -> &[u8] {
-        // SAFETY: the lz thread may always read the window; see
-        // `Common::win`.
-        unsafe { self.shared().common().win() }
+        let sh = self.shared();
+        // SAFETY: only the LZ thread owns this state. Its held block keeps
+        // this published prefix stable until the borrow of self ends.
+        unsafe {
+            let l = &*sh.lz_state.get();
+            sh.common()
+                .win(l.pointer_to_cur_pos, l.bt_num_avail_bytes as usize)
+        }
     }
 
     /// C: `mf->result`, as `CheckErrors` reads it.
@@ -2659,8 +2851,12 @@ impl MatchFinderMt {
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
         let l = unsafe { &mut *sh.lz_state.get() };
+        // Revoke the old block before releasing it or invoking an inline
+        // producer. Only normal completion below can certify its successor.
+        l.record_origin = RecordOrigin::Untrusted;
         if l.failure_lz_bt {
             l.bt_buf_pos = BT_BUFFER_SIZE;
+            l.record_origin = RecordOrigin::Parked;
         } else {
             let bi = if c.inline {
                 // SAFETY: inline, this thread is the bt thread too, and holds
@@ -2691,8 +2887,20 @@ impl MatchFinderMt {
                 l.bt_buf_pos = BT_BUFFER_SIZE;
                 l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
                 l.failure_lz_bt = true;
+                l.record_origin = RecordOrigin::Parked;
                 // C: "we don't want to decrease AvailBytes, that was load
                 // before".
+            } else {
+                // bt_get_matches concatenates completed even-count records;
+                // tail bytes append zero records. None/panic publishes header
+                // zero instead, before the filled release. No other writer
+                // can touch this block until we hand it back. Inline uses the
+                // same builder and must return normally to reach this point.
+                l.record_origin = if num_items == 2 {
+                    RecordOrigin::Empty
+                } else {
+                    RecordOrigin::Produced
+                };
             }
 
             if l.lz_pos >= MT_MAX_VAL_FOR_NORMALIZE - BT_BLOCK_SIZE {
@@ -2851,7 +3059,12 @@ fn mix_matches_kernel<const CHECKED: bool>(
 /// its published current position and availability, and checks output room.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bool>(
+unsafe fn mix_matches_kind<
+    const CHECKED: bool,
+    const MIX: u8,
+    const TRUSTED: bool,
+    const POSITIONAL: bool,
+>(
     crc: &[u32; 256],
     hash: &mut [u32],
     win: &[u8],
@@ -2892,6 +3105,18 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
             "short mixer output"
         );
     }
+    // C: MixMatches2/3/4 form the history address from the logical position.
+    // The intermediate integer base may wrap before the physical window has
+    // a full dictionary. For an accepted head, m - head <= cur proves the
+    // final index equals cur - (m - head), without forming an invalid pointer.
+    let position_base = cur.wrapping_sub(m as usize);
+    let history_index = |head: u32| {
+        if POSITIONAL {
+            position_base.wrapping_add(head as usize)
+        } else {
+            cur - (m - head) as usize
+        }
+    };
     let read = |index| {
         if CHECKED {
             win[index]
@@ -2915,16 +3140,21 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
     let temp = crc[usize::from(read(cur))] ^ u32::from(read(cur + 1));
     let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
     let c2 = if CHECKED {
-        core::mem::replace(&mut hash[h2], m)
+        hash[h2]
     } else {
         // SAFETY: h2 is masked below K_HASH2_SIZE, covered by the
         // table extent guaranteed by the caller or checked at entry.
-        // No other hash borrow is live.
-        unsafe { hash.as_mut_ptr().add(h2).replace(m) }
+        unsafe { hash.as_ptr().add(h2).read() }
     };
 
     if MIX == 2 {
-        if c2 >= match_min_pos && read(cur - (m - c2) as usize) == read(cur) {
+        if CHECKED {
+            hash[h2] = m;
+        } else {
+            // SAFETY: the same masked h2 and table extent as its read.
+            unsafe { hash.as_mut_ptr().add(h2).write(m) };
+        }
+        if c2 >= match_min_pos && read(history_index(c2)) == read(cur) {
             write(di, 2);
             write(di + 1, m - c2 - 1);
             di += 2;
@@ -2934,19 +3164,32 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
 
     let h3 = ((temp ^ (u32::from(read(cur + 2)) << 8)) & (K_HASH3_SIZE - 1)) as usize;
     let c3 = if CHECKED {
-        core::mem::replace(&mut hash[K_FIX3_HASH_SIZE + h3], m)
+        hash[K_FIX3_HASH_SIZE + h3]
     } else {
         // SAFETY: h3 is masked below K_HASH3_SIZE. The caller or entry
         // check guarantees the table includes the K_FIX3_HASH_SIZE offset.
-        unsafe { hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).replace(m) }
+        unsafe { hash.as_ptr().add(K_FIX3_HASH_SIZE + h3).read() }
     };
+    // C: MixMatches3/4 fetch both independent heads before either store.
+    // In particular, the h3 load need not wait behind the h2 update.
+    if CHECKED {
+        hash[h2] = m;
+        hash[K_FIX3_HASH_SIZE + h3] = m;
+    } else {
+        // SAFETY: both indices have the same masked bounds as their reads;
+        // h2's table precedes h3's, and no hash borrow is live.
+        unsafe {
+            hash.as_mut_ptr().add(h2).write(m);
+            hash.as_mut_ptr().add(K_FIX3_HASH_SIZE + h3).write(m);
+        }
+    }
 
     if MIX == 3 {
         if c2 >= match_min_pos {
-            let back = (m - c2) as usize;
-            if read(cur - back) == read(cur) {
+            let previous = history_index(c2);
+            if read(previous) == read(cur) {
                 write(di + 1, m - c2 - 1);
-                if read(cur - back + 2) == read(cur + 2) {
+                if read(previous + 2) == read(cur + 2) {
                     write(di, 3);
                     return di + 2;
                 }
@@ -2955,8 +3198,8 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
             }
         }
         if c3 >= match_min_pos {
-            let back = (m - c3) as usize;
-            if read(cur - back) == read(cur) {
+            let previous = history_index(c3);
+            if read(previous) == read(cur) {
                 write(di, 3);
                 write(di + 1, m - c3 - 1);
                 di += 2;
@@ -2968,11 +3211,11 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
     // C: `MixMatches4`. `BT5_USE_H4` is not defined in the SDK, so there
     // is no fourth hash here.
     if c2 >= match_min_pos {
-        let back = (m - c2) as usize;
-        if read(cur - back) == read(cur) {
+        let previous = history_index(c2);
+        if read(previous) == read(cur) {
             write(di + 1, m - c2 - 1);
-            if read(cur - back + 2) == read(cur + 2) {
-                if read(cur - back + 3) == read(cur + 3) {
+            if read(previous + 2) == read(cur + 2) {
+                if read(previous + 3) == read(cur + 3) {
                     write(di, 4);
                     return di + 2;
                 }
@@ -2984,10 +3227,10 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
         }
     }
     if c3 >= match_min_pos {
-        let back = (m - c3) as usize;
-        if read(cur - back) == read(cur) {
+        let previous = history_index(c3);
+        if read(previous) == read(cur) {
             write(di + 1, m - c3 - 1);
-            if read(cur - back + 3) == read(cur + 3) {
+            if read(previous + 3) == read(cur + 3) {
                 write(di, 4);
                 return di + 2;
             }
@@ -2996,6 +3239,207 @@ unsafe fn mix_matches_kind<const CHECKED: bool, const MIX: u8, const TRUSTED: bo
         }
     }
     di
+}
+
+/// C: the separately compiled `MixMatches2/3/4` consumer functions.
+///
+/// # Safety
+/// The caller owns the low hash and held window, establishes the trusted
+/// mixer contract for MIX, and reserves four output words.
+#[inline(never)]
+unsafe fn mix_matches_sdk<const CHECKED: bool, const MIX: u8>(
+    c: &Common,
+    l: &LzState,
+    min_pos: u32,
+    d: &mut [u32],
+) -> usize {
+    // SAFETY: the caller guarantees exclusive low-hash ownership, held
+    // window/history, lookahead and output extent as specified above.
+    unsafe {
+        mix_matches_kind::<CHECKED, MIX, true, true>(
+            &c.crc,
+            c.low_hash(),
+            // GetMatches has decremented availability but not advanced cur.
+            c.win(
+                l.pointer_to_cur_pos,
+                (l.bt_num_avail_bytes as usize).saturating_add(1),
+            ),
+            l.pointer_to_cur_pos,
+            l.lz_pos,
+            min_pos,
+            d,
+            0,
+        )
+    }
+}
+
+/// C: `MatchFinderMt_GetMatches` over a real produced record. The indexed
+/// consumer remains independent for arbitrary buffers and short destinations.
+///
+/// # Safety
+/// The caller owns LZ state, its low hash and the held nonempty record. The
+/// producer's history/window invariants hold, and d reserves count + four
+/// words (count alone for MIX == 0). No handoff occurs inside this function.
+#[inline]
+unsafe fn consume_matches<const MIX: u8, const SDK: bool>(
+    c: &Common,
+    l: &mut LzState,
+    mut records: HeldRecords<'_>,
+    d: &mut [u32],
+) -> usize {
+    // SAFETY: the caller supplies a nonempty produced record partition.
+    let count = unsafe { records.count() };
+    // SAFETY: the partition bounds the complete pair extent and next cursor.
+    let mut pairs = unsafe { records.advance() };
+    if c.inline && l.bt_num_avail_bytes < c.num_hash_bytes {
+        l.bt_num_avail_bytes -= 1;
+        l.bt_buf_pos = records.position();
+        l.lz_pos += 1;
+        l.pointer_to_cur_pos += 1;
+        return 0;
+    }
+
+    l.bt_num_avail_bytes -= 1;
+    l.bt_buf_pos = records.position();
+    // C: MatchFinderMt2_GetMatches advances the positions before its copy.
+    if MIX == 0 {
+        l.lz_pos += 1;
+        l.pointer_to_cur_pos += 1;
+    }
+    let mut di = 0;
+    if MIX != 0 && (count != 0 || l.bt_num_avail_bytes >= (BT_HASH_BYTES_MAX - 1) - 1) {
+        let min_pos = if count == 0 {
+            if l.lz_pos > c.history_size {
+                l.lz_pos - c.history_size
+            } else {
+                1
+            }
+        } else {
+            // SAFETY: every nonempty produced record has at least one pair;
+            // its first distance is within the retained history.
+            l.lz_pos - unsafe { pairs.add(1).read() }
+        };
+        // SAFETY: producer availability/history and exclusive low hash are
+        // unchanged from the indexed caller; four output words are reserved.
+        di = unsafe {
+            if SDK && MIX != 3 {
+                mix_matches_sdk::<false, MIX>(c, l, min_pos, d)
+            } else {
+                // C: the alternative MatchFinderMt_GetMatches_Bt4 fuses
+                // MixMatches3 with this record consumption and pair copy.
+                // Preserve its position-relative history address here; the
+                // non-SDK consumer retains its original backward distance.
+                // The indexed fallback still uses the separate SDK mixer.
+                mix_matches_kind::<false, MIX, true, SDK>(
+                    &c.crc,
+                    c.low_hash(),
+                    // Restore the prefix before GetMatches' decrement.
+                    c.win(
+                        l.pointer_to_cur_pos,
+                        (l.bt_num_avail_bytes as usize).saturating_add(1),
+                    ),
+                    l.pointer_to_cur_pos,
+                    l.lz_pos,
+                    min_pos,
+                    d,
+                    0,
+                )
+            }
+        };
+    }
+    let mut left = count;
+    // SAFETY: d is exclusively borrowed, and the entry margin reserves all
+    // count words after at most four mixer words. The producer guarantees an
+    // even count; each pair read stays within the single held block.
+    unsafe {
+        let mut output = d.as_mut_ptr().add(di);
+        while left != 0 {
+            let length = pairs.read();
+            let distance = pairs.add(1).read();
+            pairs = pairs.add(2);
+            output.write(length);
+            output.add(1).write(distance);
+            output = output.add(2);
+            left -= 2;
+        }
+    }
+    if MIX != 0 {
+        l.lz_pos += 1;
+        l.pointer_to_cur_pos += 1;
+    }
+    di + count
+}
+
+/// C: SKIP_HEADER_MT / SKIP_FOOTER_MT, retaining the safe input span while
+/// consuming the SDK's direct record cursor. Returns unconsumed positions at
+/// a held-block boundary; the caller drops this view before any handoff.
+///
+/// # Safety
+/// The caller owns a nonempty produced block, LZ state and low hash; num is
+/// nonzero and within advertised input availability. Produced records form a
+/// complete partition, so each count advance reaches a record or exactly end.
+#[inline]
+unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num: u32) -> u32 {
+    // SAFETY: the caller holds the certified block and both consumer domains.
+    let (mut records, hash, win) = unsafe {
+        (
+            HeldRecords::new(c, l),
+            c.low_hash(),
+            c.win(l.pointer_to_cur_pos, l.bt_num_avail_bytes as usize),
+        )
+    };
+    let hash_len = match MIN_LEN {
+        3 => K_FIX4_HASH_SIZE,
+        2 => K_HASH2_SIZE as usize,
+        _ => 0,
+    };
+    let hash = &mut hash[..hash_len];
+    let mut avail = l.bt_num_avail_bytes;
+    let mut cur = l.pointer_to_cur_pos;
+    let mut pos = l.lz_pos;
+    if MIN_LEN != 0 && avail >= MIN_LEN {
+        let before = num;
+        let count = num.min(avail - (MIN_LEN - 1));
+        let span = count as usize + MIN_LEN as usize - 1;
+        for bytes in win[cur..][..span].windows(MIN_LEN as usize) {
+            let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+            let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+            hash[h2] = pos;
+            if MIN_LEN == 3 {
+                let h3 = ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                hash[K_FIX3_HASH_SIZE + h3] = pos;
+            }
+            pos += 1;
+            // SAFETY: the first record was nonempty; each preceding advance
+            // tested end before another iteration. Producer partition bounds it.
+            unsafe { records.advance() };
+            num -= 1;
+            if num == 0 || records.at_end() {
+                break;
+            }
+        }
+        let skipped = before - num;
+        avail = avail.wrapping_sub(skipped);
+        cur += skipped as usize;
+    }
+    if num != 0 && !records.at_end() {
+        loop {
+            avail = avail.wrapping_sub(1);
+            pos += 1;
+            cur += 1;
+            // SAFETY: as above, only complete records inside the held block.
+            unsafe { records.advance() };
+            num -= 1;
+            if num == 0 || records.at_end() {
+                break;
+            }
+        }
+    }
+    l.bt_num_avail_bytes = avail;
+    l.pointer_to_cur_pos = cur;
+    l.lz_pos = pos;
+    l.bt_buf_pos = records.position();
+    num
 }
 
 impl MatchFinderMt {
@@ -3018,33 +3462,77 @@ impl MatchFinderMt {
     /// there is no low hash to mix in.
     pub(crate) fn get_matches(&mut self, d: &mut [u32]) -> usize {
         #[cfg(feature = "kernel-ab")]
-        if crate::kernel_ab::encoder_checked() {
-            return self.get_matches_select::<true>(d);
+        if crate::kernel_ab::sdk_mixer() {
+            if crate::kernel_ab::encoder_checked() {
+                return self.get_matches_select::<true, true>(d);
+            }
+            return self.get_matches_select::<false, true>(d);
         }
-        self.get_matches_select::<false>(d)
+        #[cfg(feature = "kernel-ab")]
+        if crate::kernel_ab::encoder_checked() {
+            return self.get_matches_select::<true, false>(d);
+        }
+        self.get_matches_select::<false, {
+            cfg!(all(
+                target_arch = "x86_64",
+                feature = "asm",
+                not(feature = "kernel-ab")
+            ))
+        }>(d)
     }
 
     #[inline]
-    fn get_matches_select<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+    fn get_matches_select<const CHECKED: bool, const SDK: bool>(&mut self, d: &mut [u32]) -> usize {
         // C: the usual BT4 vtable selects MixMatches3. Keep its call site
         // separate from the other hash widths, avoiding a per-byte jump table.
         if self.shared().common().mix == Mix::Three {
-            return self.get_matches_kind::<3, CHECKED>(d);
+            return self.get_matches_kind::<3, CHECKED, SDK>(d);
         }
-        self.get_matches_other::<CHECKED>(d)
+        self.get_matches_other::<CHECKED, SDK>(d)
     }
 
     #[inline(never)]
-    fn get_matches_other<const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+    fn get_matches_other<const CHECKED: bool, const SDK: bool>(&mut self, d: &mut [u32]) -> usize {
         match self.shared().common().mix {
-            Mix::None => self.get_matches_kind::<0, CHECKED>(d),
-            Mix::Two => self.get_matches_kind::<2, CHECKED>(d),
-            Mix::Three => self.get_matches_kind::<3, CHECKED>(d),
-            Mix::Four => self.get_matches_kind::<4, CHECKED>(d),
+            Mix::None => self.get_matches_kind::<0, CHECKED, SDK>(d),
+            Mix::Two => self.get_matches_kind::<2, CHECKED, SDK>(d),
+            Mix::Three => self.get_matches_kind::<3, CHECKED, SDK>(d),
+            Mix::Four => self.get_matches_kind::<4, CHECKED, SDK>(d),
         }
     }
 
-    fn get_matches_kind<const MIX: u8, const CHECKED: bool>(&mut self, d: &mut [u32]) -> usize {
+    fn get_matches_kind<const MIX: u8, const CHECKED: bool, const SDK: bool>(
+        &mut self,
+        d: &mut [u32],
+    ) -> usize {
+        if !CHECKED {
+            let sh = self.shared();
+            let c = sh.common();
+            // SAFETY: only this consumer owns LZ state and the held block.
+            let l = unsafe { &mut *sh.lz_state.get() };
+            if l.has_produced_record() {
+                // SAFETY: real acquisition certifies the complete record
+                // partition; the cursor cannot survive this consumer call.
+                let records = unsafe { HeldRecords::new(c, l) };
+                // SAFETY: has_produced_record excludes the one-past end.
+                let count = unsafe { records.count() };
+                let extra = if MIX == 0 { 0 } else { 4 };
+                if count.checked_add(extra).is_some_and(|room| room <= d.len()) {
+                    // SAFETY: the producer certifies pairs/history; this check
+                    // separately reserves all BT and possible low-hash output.
+                    return unsafe { consume_matches::<MIX, SDK>(c, l, records, d) };
+                }
+            }
+        }
+        // No mutation precedes fallback. In particular a short destination
+        // retains the original partial hash/output/cursor effects on panic.
+        self.get_matches_indexed::<MIX, CHECKED, SDK>(d)
+    }
+
+    fn get_matches_indexed<const MIX: u8, const CHECKED: bool, const SDK: bool>(
+        &mut self,
+        d: &mut [u32],
+    ) -> usize {
         let sh = self.shared();
         let c = sh.common();
         // SAFETY: the lz thread owns `lz_state`.
@@ -3087,8 +3575,6 @@ impl MatchFinderMt {
         l.bt_num_avail_bytes = avail;
         l.bt_buf_pos = base + bt_pos + len as usize;
 
-        // SAFETY: the lz thread owns the low hash and holds the window.
-        let (hash, win) = unsafe { (c.low_hash(), c.win()) };
         let cur = l.pointer_to_cur_pos;
         let m = l.lz_pos;
         let mut di = 0;
@@ -3107,14 +3593,20 @@ impl MatchFinderMt {
                 // retain every position >= m, including after a window slide.
                 // di is zero and the branch below reserves both output pairs.
                 di = unsafe {
-                    if d.len() >= 4 {
-                        mix_matches_kind::<CHECKED, MIX, true>(
-                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
-                        )
+                    if SDK && d.len() >= 4 {
+                        mix_matches_sdk::<CHECKED, MIX>(c, l, m, d)
                     } else {
-                        mix_matches_kind::<CHECKED, MIX, false>(
-                            &c.crc, hash, win, cur, l.lz_pos, m, d, di,
-                        )
+                        let (hash, win) =
+                            (c.low_hash(), c.win(cur, (avail as usize).saturating_add(1)));
+                        if d.len() >= 4 {
+                            mix_matches_kind::<CHECKED, MIX, true, false>(
+                                &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                            )
+                        } else {
+                            mix_matches_kind::<CHECKED, MIX, false, false>(
+                                &c.crc, hash, win, cur, l.lz_pos, m, d, di,
+                            )
+                        }
                     }
                 };
             }
@@ -3128,14 +3620,20 @@ impl MatchFinderMt {
             // retained history; min_pos excludes every older low-hash entry.
             // di is zero and the branch below checks room for both pairs.
             di = unsafe {
-                if d.len() >= 4 {
-                    mix_matches_kind::<CHECKED, MIX, true>(
-                        &c.crc, hash, win, cur, m, min_pos, d, di,
-                    )
+                if SDK && d.len() >= 4 {
+                    mix_matches_sdk::<CHECKED, MIX>(c, l, min_pos, d)
                 } else {
-                    mix_matches_kind::<CHECKED, MIX, false>(
-                        &c.crc, hash, win, cur, m, min_pos, d, di,
-                    )
+                    let (hash, win) =
+                        (c.low_hash(), c.win(cur, (avail as usize).saturating_add(1)));
+                    if d.len() >= 4 {
+                        mix_matches_kind::<CHECKED, MIX, true, false>(
+                            &c.crc, hash, win, cur, m, min_pos, d, di,
+                        )
+                    } else {
+                        mix_matches_kind::<CHECKED, MIX, false, false>(
+                            &c.crc, hash, win, cur, m, min_pos, d, di,
+                        )
+                    }
                 }
             };
             let mut left = len;
@@ -3159,25 +3657,49 @@ impl MatchFinderMt {
     /// read only inline.
     pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
         match self.shared().common().mix {
-            Mix::None => self.skip_kind::<0>(stream, num),
-            Mix::Two => self.skip_kind::<2>(stream, num),
+            Mix::None => self.skip_kind::<0, false>(stream, num),
+            Mix::Two => self.skip_kind::<2, false>(stream, num),
             // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
             // "the difference is that MatchFinderMt3_Skip() updates hash for
             // last 3 bytes of stream".
-            Mix::Three | Mix::Four => self.skip_kind::<3>(stream, num),
+            Mix::Three | Mix::Four => self.skip_kind::<3, false>(stream, num),
         }
     }
 
     /// C: each specialized `MatchFinderMt*_Skip`, retaining the held block
     /// and window until `GET_NEXT_BLOCK_IF_REQUIRED` must hand them back.
-    fn skip_kind<const MIN_LEN: u32>(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
+    fn skip_kind<const MIN_LEN: u32, const CHECKED: bool>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        mut num: u32,
+    ) {
         loop {
             self.next_block_if_required(stream);
+            if !CHECKED {
+                let sh = self.shared();
+                let c = sh.common();
+                // SAFETY: only the consumer owns LZ state. Neither a held
+                // record view nor a window view survives this branch.
+                let l = unsafe { &mut *sh.lz_state.get() };
+                if l.has_produced_record() && num != 0 && num <= l.bt_num_avail_bytes {
+                    // SAFETY: acquisition certifies every record through the
+                    // held end; num is within the input availability promise.
+                    num = unsafe { consume_skip::<MIN_LEN>(c, l, num) };
+                    if num == 0 {
+                        return;
+                    }
+                    continue;
+                }
+            }
             let sh = self.shared();
             let c = sh.common();
-            // SAFETY: the lz thread owns `lz_state` and the low hash, and may
-            // read the window.
-            let (l, hash, win) = unsafe { (&mut *sh.lz_state.get(), c.low_hash(), c.win()) };
+            // SAFETY: the LZ thread owns its state and low hash. The held
+            // block publishes this prefix and prevents slides during use.
+            let (l, hash, win) = unsafe {
+                let l = &mut *sh.lz_state.get();
+                let win = c.win(l.pointer_to_cur_pos, l.bt_num_avail_bytes as usize);
+                (l, c.low_hash(), win)
+            };
             // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
             // The inner loop stops before the next handoff, so these views
             // never survive a block release or a window slide.
@@ -3195,25 +3717,74 @@ impl MatchFinderMt {
             let mut pos = l.lz_pos;
             let mut bt_pos = l.bt_buf_pos - base;
             let bt_limit = l.bt_buf_pos_limit - base;
-            loop {
-                if MIN_LEN != 0 && avail >= MIN_LEN {
-                    let bytes = &win[cur..cur + MIN_LEN as usize];
-                    let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
-                    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-                    hash[h2] = pos;
-                    if MIN_LEN == 3 {
-                        let h3 =
-                            ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-                        hash[K_FIX3_HASH_SIZE + h3] = pos;
+            if CHECKED {
+                // The original indexed SDK port remains the differential
+                // reference for the entire held-block state transition.
+                loop {
+                    if MIN_LEN != 0 && avail >= MIN_LEN {
+                        let bytes = &win[cur..cur + MIN_LEN as usize];
+                        let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+                        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                        hash[h2] = pos;
+                        if MIN_LEN == 3 {
+                            let h3 =
+                                ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                            hash[K_FIX3_HASH_SIZE + h3] = pos;
+                        }
+                    }
+                    avail = avail.wrapping_sub(1);
+                    pos += 1;
+                    cur += 1;
+                    bt_pos += bt[bt_pos] as usize + 1;
+                    num -= 1;
+                    if num == 0 || bt_pos == bt_limit {
+                        break;
                     }
                 }
-                avail = avail.wrapping_sub(1);
-                pos += 1;
-                cur += 1;
-                bt_pos += bt[bt_pos] as usize + 1;
-                num -= 1;
-                if num == 0 || bt_pos == bt_limit {
-                    break;
+            } else {
+                if MIN_LEN != 0 && avail >= MIN_LEN {
+                    // C: the same consecutive cur pointers, bounded once
+                    // by the bytes this block published. A block handoff
+                    // discards the iterator before the window can move or
+                    // the low hash can normalize. Mix::Four also uses three
+                    // bytes here, including the SDK's last-three-byte tail.
+                    let before = num;
+                    let count = num.min(avail - (MIN_LEN - 1));
+                    let span = count as usize + MIN_LEN as usize - 1;
+                    for bytes in win[cur..][..span].windows(MIN_LEN as usize) {
+                        let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+                        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                        hash[h2] = pos;
+                        if MIN_LEN == 3 {
+                            let h3 =
+                                ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                            hash[K_FIX3_HASH_SIZE + h3] = pos;
+                        }
+                        pos += 1;
+                        bt_pos += bt[bt_pos] as usize + 1;
+                        num -= 1;
+                        if num == 0 || bt_pos == bt_limit {
+                            break;
+                        }
+                    }
+                    let skipped = before - num;
+                    avail = avail.wrapping_sub(skipped);
+                    cur += skipped as usize;
+                }
+                // C: no low hash for Bt2, or fewer than MIN_LEN bytes left.
+                // Failure parking still advances one published position at
+                // a time and must not discard an earlier availability promise.
+                if num != 0 && bt_pos != bt_limit {
+                    loop {
+                        avail = avail.wrapping_sub(1);
+                        pos += 1;
+                        cur += 1;
+                        bt_pos += bt[bt_pos] as usize + 1;
+                        num -= 1;
+                        if num == 0 || bt_pos == bt_limit {
+                            break;
+                        }
+                    }
                 }
             }
             l.bt_num_avail_bytes = avail;
@@ -3246,6 +3817,9 @@ struct MtRun<'s> {
 
 impl Drop for MtRun<'_> {
     fn drop(&mut self) {
+        // SAFETY: the consumer body has ended, including during unwinding.
+        // Revoke its certificate before releasing/stopping the producer pair.
+        unsafe { (*self.sh.lz_state.get()).record_origin = RecordOrigin::Untrusted };
         // C: `MatchFinderMt_Destruct`. "we want thread to be in Stopped state
         // before sending EXIT command. note: stop(btSync) will stop (htSync)
         // also."
@@ -3284,6 +3858,8 @@ pub(crate) fn run_block<T>(
     struct Stop<'a>(&'a MtShared);
     impl Drop for Stop<'_> {
         fn drop(&mut self) {
+            // SAFETY: the consumer body has ended and holds no record view.
+            unsafe { (*self.0.lz_state.get()).record_origin = RecordOrigin::Untrusted };
             // C: `MatchFinderMt_ReleaseStream`. Waits for the bt thread to
             // stop, and the bt thread stops the hash thread first.
             self.0.bt_sync.stop_writing();
@@ -3433,6 +4009,772 @@ mod tests {
     use crate::enc::{Lzma2Encoder, LzmaEncProps};
     use crate::error::Error;
 
+    /// A live reader argument must not borrow the hash thread's append tail.
+    #[test]
+    fn the_published_window_stays_disjoint_from_hash_append() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+
+        #[inline(never)]
+        fn hold_prefix(prefix: &[u8], request: Sender<()>, done: Receiver<()>) {
+            request.send(()).unwrap();
+            done.recv().unwrap();
+            // Check after the append, keeping this argument protected across it.
+            assert_eq!(prefix, &[53; 12]);
+        }
+
+        let mut mt = MatchFinderMt::new();
+        prepare(&mut mt, MatchFinderKind::Bt4, 32, false, true);
+        let sh = mt.shared();
+        // SAFETY: no threads or window views exist during fixture setup. Use
+        // the published pointer without reborrowing the owning allocation.
+        unsafe {
+            let c = &mut *sh.common.get();
+            assert!(c.win_len >= 32);
+            c.win_len = 32;
+            c.keep_size_after = 0;
+            core::slice::from_raw_parts_mut(c.win, c.win_len).fill(53);
+            let h = &mut *sh.hash_state.get();
+            h.buffer = 4;
+            h.pos = 5;
+            h.stream_pos = 13;
+            let l = &mut *sh.lz_state.get();
+            l.pointer_to_cur_pos = 4;
+            l.bt_num_avail_bytes = 8;
+        }
+
+        // Hold the same slide barriers as the two reader domains. The worker
+        // only appends; it neither runs a producer loop nor attempts a slide.
+        struct SlideLocks<'a>(&'a super::MtShared);
+        impl Drop for SlideLocks<'_> {
+            fn drop(&mut self) {
+                self.0.hash_sync.cs.leave();
+                self.0.bt_sync.cs.leave();
+            }
+        }
+        sh.bt_sync.cs.enter();
+        sh.hash_sync.cs.enter();
+        let locks = SlideLocks(sh);
+        let (request, requested) = channel();
+        let (completed, done) = channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // A disconnected request also exits, so reader unwinding
+                // cannot leave the scoped join waiting for a request.
+                if requested.recv().is_err() {
+                    return;
+                }
+                // SAFETY: this worker exclusively owns hash state until join;
+                // the reader uses only LZ state and the published prefix.
+                let h = unsafe { &mut *sh.hash_state.get() };
+                let bytes = [61; 4];
+                let mut input = SliceStream::new(&bytes);
+                sh.read_block(h, &mut input);
+                sh.read_block(h, &mut input); // Short read followed by EOF.
+                assert_eq!(h.avail(), 12);
+                assert!(h.stream_end_was_reached);
+                let _ = completed.send(());
+            });
+            hold_prefix(mt.window(), request, done);
+        });
+        // SAFETY: the worker has joined and the reader view has ended; the
+        // first sixteen bytes are now initialized and stable for this caller.
+        let published = unsafe { sh.common().win(4, 12) };
+        assert_eq!(&published[..12], &[53; 12]);
+        assert_eq!(&published[12..], &[61; 4]);
+        drop(locks);
+    }
+
+    /// Check physical clamping independently of a consumer sharing the helper.
+    #[test]
+    fn the_published_window_endpoints_preserve_history_and_clamp() {
+        let mut mt = MatchFinderMt::new();
+        prepare(&mut mt, MatchFinderKind::Bt4, 32, false, true);
+        let sh = mt.shared();
+        // SAFETY: exclusive fixture setup, with no running producers.
+        unsafe {
+            let c = &mut *sh.common.get();
+            assert!(c.win_len >= 32);
+            c.win_len = 32;
+            core::slice::from_raw_parts_mut(c.win, c.win_len).fill(37);
+        }
+        for (cur, avail, expected) in [
+            (0, 0, 0),
+            (4, 8, 12),
+            (5, 7, 12),
+            (12, 0, 12),
+            (31, 1, 32),
+            (31, usize::MAX, 32),
+            (usize::MAX, 1, 32),
+        ] {
+            // SAFETY: the entire initialized fixture is exclusively owned;
+            // oversized logical values test the physical clamp, not a claim
+            // that a real producer published those values.
+            let prefix = unsafe { sh.common().win(cur, avail) };
+            assert_eq!(prefix.len(), expected, "cur={cur}, avail={avail}");
+            assert!(prefix.iter().all(|&byte| byte == 37));
+        }
+        for (cur, avail, expected) in [(4, 8, 12), (5, 7, 12), (12, 0, 12)] {
+            // SAFETY: no producer or preceding byte view remains active.
+            unsafe {
+                let l = &mut *sh.lz_state.get();
+                l.pointer_to_cur_pos = cur;
+                l.bt_num_avail_bytes = avail;
+            }
+            assert_eq!(mt.window().len(), expected);
+        }
+        // The mixer sees remaining availability after decrement, before cur
+        // advances: reconstruct the same endpoint, not the shortened one.
+        // SAFETY: initialized exclusive fixture, as above.
+        assert_eq!(unsafe { sh.common().win(4, 7 + 1) }.len(), 12);
+    }
+
+    /// Both public LZMA2 output forms must keep already-consumed source bytes.
+    #[test]
+    fn the_published_window_retains_stored_chunks_and_reuse() {
+        for finder_threads in [1, 2] {
+            let props = LzmaEncProps::new()
+                .with_level(5)
+                .with_dict_size(1 << 12)
+                .with_num_threads(finder_threads);
+            let mut copied = Lzma2Encoder::new(&props).unwrap();
+            let mut direct = Lzma2Encoder::new(&props).unwrap();
+            // One block coder, not one finder thread: split_threads preserves
+            // the explicit finder count when no total budget was specified.
+            copied.set_threads(1);
+            direct.set_threads(1);
+            for len in [1usize, 17, 1] {
+                let src: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+                let mut expected = vec![1, 0, (len - 1) as u8];
+                expected.extend_from_slice(&src);
+                expected.push(0);
+                let mut stream_output = Vec::new();
+                // Solid encode_slice uses encode_subblock's SeqOutStream;
+                // solid encode_to_vec uses encode_subblock_into's MemoryOutput.
+                copied.encode_slice(&src, &mut stream_output).unwrap();
+                let memory_output = direct.encode_to_vec(&src).unwrap();
+                // A normal BT with one finder thread must use MatchFinderMt
+                // inline, rather than silently exercising the St window.
+                assert_eq!(copied.coder.finder_is_inline(), finder_threads == 1);
+                assert_eq!(direct.coder.finder_is_inline(), finder_threads == 1);
+                // Explicit stored control/header/payload/EOF, not just equality
+                // between two encoders that might both choose compressed output.
+                assert_eq!(stream_output, expected);
+                assert_eq!(memory_output, expected);
+            }
+        }
+    }
+
+    /// An oversized synthetic promise must keep the old physical-bound panic
+    /// and mutation order; a real parked promise must not become an empty view.
+    #[test]
+    fn the_published_window_preserves_parked_physical_bounds() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        for kind in [
+            MatchFinderKind::Bt2,
+            MatchFinderKind::Bt3,
+            MatchFinderKind::Bt4,
+            MatchFinderKind::Bt5,
+        ] {
+            for (cur, avail) in [(8, u32::MAX), (29, u32::MAX), (31, u32::MAX), (31, 1)] {
+                let run = |checked| {
+                    let mut mt = MatchFinderMt::new();
+                    prepare(&mut mt, kind, 32, false, true);
+                    // SAFETY: exclusive synthetic fixture with no producer;
+                    // its physical window, parking words and state are live.
+                    unsafe {
+                        let sh = mt.shared();
+                        let c = &mut *sh.common.get();
+                        assert!(c.win_len >= 32);
+                        c.win_len = 32;
+                        core::slice::from_raw_parts_mut(c.win, c.win_len).fill(37);
+                        c.low_hash().fill(0);
+                        c.bt_park().fill(0);
+                        let l = &mut *sh.lz_state.get();
+                        l.pointer_to_cur_pos = cur;
+                        l.lz_pos = 97;
+                        l.bt_num_avail_bytes = avail;
+                        l.bt_buf_pos = BT_BUFFER_SIZE;
+                        l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
+                        l.failure_lz_bt = true;
+                        l.record_origin = super::RecordOrigin::Parked;
+                    }
+                    let before = skip_state(&mt);
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        if checked {
+                            skip_reference(&mut mt, &mut NoStream, 1);
+                        } else {
+                            mt.skip(&mut NoStream, 1);
+                        }
+                    }));
+                    let after = skip_state(&mt);
+                    let must_panic = cur == 31 && avail > 1 && kind != MatchFinderKind::Bt2;
+                    assert_eq!(result.is_err(), must_panic);
+                    if must_panic {
+                        assert_eq!(after, before);
+                    } else {
+                        assert_eq!(after.cur, cur + 1);
+                        assert_eq!(after.pos, 98);
+                        assert_eq!(after.avail, avail - 1);
+                        assert_eq!(after.bt_pos, BT_BUFFER_SIZE + 1);
+                        assert_eq!(after.origin, super::RecordOrigin::Parked);
+                    }
+                    (result.is_err(), after)
+                };
+                assert_eq!(run(false), run(true), "{kind:?}, cur={cur}, avail={avail}");
+            }
+        }
+    }
+
+    fn skip_reference(mt: &mut MatchFinderMt, stream: &mut dyn SeqInStream, num: u32) {
+        match mt.shared().common().mix {
+            Mix::None => mt.skip_kind::<0, true>(stream, num),
+            Mix::Two => mt.skip_kind::<2, true>(stream, num),
+            Mix::Three | Mix::Four => mt.skip_kind::<3, true>(stream, num),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SkipState {
+        cur: usize,
+        bt_pos: usize,
+        bt_limit: usize,
+        pos: u32,
+        avail: u32,
+        failed: bool,
+        origin: super::RecordOrigin,
+        low_hash: Vec<u32>,
+    }
+
+    fn skip_state(mt: &MatchFinderMt) -> SkipState {
+        let sh = mt.shared();
+        // SAFETY: these tests run inline, with no producer threads. The
+        // test thread exclusively owns LZ state and its low-hash table.
+        let (l, low_hash) = unsafe { (&*sh.lz_state.get(), sh.common().low_hash().to_vec()) };
+        SkipState {
+            cur: l.pointer_to_cur_pos,
+            bt_pos: l.bt_buf_pos,
+            bt_limit: l.bt_buf_pos_limit,
+            pos: l.lz_pos,
+            avail: l.bt_num_avail_bytes,
+            failed: l.failure_lz_bt,
+            origin: l.record_origin,
+            low_hash,
+        }
+    }
+
+    /// Compare the whole LZ-owned transition, not just emitted matches:
+    /// every tail, low-hash family, BT entry width and failure-parking step.
+    fn check_skip_span_tails(kind: MatchFinderKind, parked: bool) {
+        let lengths: &[usize] = if cfg!(miri) {
+            &[1, 2, 3, 4, 5, 9]
+        } else {
+            &[1, 2, 3, 4, 5, 31, 257]
+        };
+        let prefixes: &[usize] = if cfg!(miri) { &[1] } else { &[0, 1, 7] };
+        for &len in lengths {
+            for &prefix in prefixes {
+                for varied in [false, true] {
+                    let run = |checked: bool| {
+                        let mut mt = MatchFinderMt::new();
+                        prepare(&mut mt, kind, prefix + len, false, true);
+                        {
+                            let sh = mt.shared();
+                            let c = sh.common();
+                            // SAFETY: inline fixture, before any call;
+                            // no producer can access these buffers.
+                            unsafe {
+                                // SAFETY: create published this initialized extent;
+                                // no window references or producers are active.
+                                // Reborrow its pointer, not the owner: DerefMut
+                                // on the owner would invalidate the published tag.
+                                let win = core::slice::from_raw_parts_mut(c.win, c.win_len);
+                                for (i, byte) in win.iter_mut().enumerate() {
+                                    *byte = (i.wrapping_mul(37) + i / 7) as u8;
+                                }
+                                c.low_hash().fill(0x1234_5678);
+                                let l = &mut *sh.lz_state.get();
+                                l.pointer_to_cur_pos = prefix;
+                                l.bt_num_avail_bytes = len as u32;
+                                l.lz_pos = 97;
+                                if parked {
+                                    c.bt_park().fill(0);
+                                    l.bt_buf_pos = BT_BUFFER_SIZE;
+                                    l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
+                                    l.failure_lz_bt = true;
+                                } else {
+                                    let bt = c.bt_block(0);
+                                    bt.fill(0xfeed_1234);
+                                    let mut at = 2;
+                                    for i in 0..len {
+                                        let words = if varied { 2 * (i % 3) } else { 0 };
+                                        bt[at] = words as u32;
+                                        at += words + 1;
+                                    }
+                                    bt[0] = at as u32;
+                                    bt[1] = len as u32;
+                                    l.bt_buf_pos = 2;
+                                    l.bt_buf_pos_limit = at;
+                                }
+                            }
+                        }
+                        let mut states = Vec::new();
+                        let mut left = len as u32;
+                        // Force both returns within a held block and
+                        // its exact end, including the short tail.
+                        for requested in [1, 2, 5, left] {
+                            if left == 0 {
+                                break;
+                            }
+                            let n = requested.min(left);
+                            if checked {
+                                skip_reference(&mut mt, &mut NoStream, n);
+                            } else {
+                                mt.skip(&mut NoStream, n);
+                            }
+                            states.push(skip_state(&mt));
+                            left -= n;
+                        }
+                        states
+                    };
+                    assert_eq!(run(false), run(true), "len={len}, prefix={prefix}");
+                }
+            }
+        }
+    }
+
+    // Each family/state pair is a separate CI Miri shard. Keep the full
+    // Cartesian product above: the combined test exceeds a runner's hour
+    // limit because Miri interprets each allocation and table comparison.
+    macro_rules! skip_span_tail_test {
+        ($name:ident, $kind:ident, $parked:literal) => {
+            #[test]
+            fn $name() {
+                check_skip_span_tails(MatchFinderKind::$kind, $parked);
+            }
+        };
+    }
+
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt2, Bt2, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt3, Bt3, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt4, Bt4, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_tails_bt5, Bt5, false);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt2, Bt2, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt3, Bt3, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt4, Bt4, true);
+    skip_span_tail_test!(skip_spans_preserve_checked_parked_tails_bt5, Bt5, true);
+
+    /// Short destinations must enter the old path before any mutation. A
+    /// synthetic rewrite explicitly revokes acquisition provenance; a plausible
+    /// header alone never authorizes unchecked record consumption.
+    #[test]
+    fn held_records_preserve_short_output_and_synthetic_failure_state() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        for sdk in [false, true] {
+            for kind in [
+                MatchFinderKind::Bt2,
+                MatchFinderKind::Bt3,
+                MatchFinderKind::Bt4,
+                MatchFinderKind::Bt5,
+            ] {
+                for synthetic in [None, Some(1), Some(3), Some(u32::MAX)] {
+                    for room in [0, 1, 2, 3, 4, 8] {
+                        let run = |indexed| {
+                            let mut mt = MatchFinderMt::new();
+                            let bytes = [0u8; 300];
+                            prepare(&mut mt, kind, bytes.len(), false, true);
+                            let mut stream = SliceStream::new(&bytes);
+                            assert_eq!(mt.get_num_available_bytes(&mut stream), 300);
+                            assert_eq!(skip_state(&mt).origin, super::RecordOrigin::Produced);
+                            // Use the independent indexed Skip to reach a record
+                            // with history, without making setup depend on the port.
+                            skip_reference(&mut mt, &mut stream, 7);
+                            if let Some(count) = synthetic {
+                                let sh = mt.shared();
+                                // SAFETY: inline fixture owns this held block. Revoke
+                                // trust before writing anything the producer did not
+                                // certify; no references to its records are active.
+                                unsafe {
+                                    let l = &mut *sh.lz_state.get();
+                                    l.record_origin = super::RecordOrigin::Untrusted;
+                                    sh.common()
+                                        .bufs
+                                        .add(sh.common().bt_base + l.bt_buf_pos)
+                                        .write(count);
+                                }
+                            }
+                            let mut output = vec![0xdead_beef; room];
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                if indexed {
+                                    // Preserve the preceding product's exact panic
+                                    // order. CHECKED=true is the valid-input oracle,
+                                    // but its mixer writes hashes before a short
+                                    // output panic; the product preflights that room.
+                                    macro_rules! preceding {
+                                        ($mix:literal) => {
+                                            if sdk {
+                                                mt.get_matches_indexed::<$mix, false, true>(
+                                                    &mut output,
+                                                )
+                                            } else {
+                                                mt.get_matches_indexed::<$mix, false, false>(
+                                                    &mut output,
+                                                )
+                                            }
+                                        };
+                                    }
+                                    match mt.shared().common().mix {
+                                        Mix::None => preceding!(0),
+                                        Mix::Two => preceding!(2),
+                                        Mix::Three => preceding!(3),
+                                        Mix::Four => preceding!(4),
+                                    }
+                                } else if sdk {
+                                    mt.get_matches_select::<false, true>(&mut output)
+                                } else {
+                                    mt.get_matches_select::<false, false>(&mut output)
+                                }
+                            }))
+                            .map_err(|_| ());
+                            (result, output, skip_state(&mt))
+                        };
+                        assert_eq!(
+                            run(false),
+                            run(true),
+                            "{kind:?}, {synthetic:?}, {room}, sdk={sdk}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Real inline producers exercise variable BT records, handoffs, input
+    /// refills and window moves. A second stream starts near the SDK's
+    /// normalization boundary; both routes must leave identical low hashes
+    /// and cursors after every skip, then return identical future matches.
+    #[test]
+    fn skip_spans_preserve_checked_streams_and_normalization() {
+        check_consumer_streams(false);
+    }
+
+    #[test]
+    fn the_sdk_consumer_preserves_checked_streams_and_normalization() {
+        check_consumer_streams(true);
+    }
+
+    /// Acquire actual producer records, then consume that one held block
+    /// with the threaded tail rule. No synthetic header grants provenance.
+    #[test]
+    fn the_sdk_fused_consumer_preserves_produced_threaded_tails() {
+        for len in [1, 2, 3, 4, 5, 7, 8, 17, 31] {
+            for alphabet in [1, 7] {
+                let bytes: Vec<u8> = (0..len).map(|i| (i % alphabet) as u8).collect();
+                let mut mt = MatchFinderMt::new();
+                let mut reference = MatchFinderMt::new();
+                prepare(&mut mt, MatchFinderKind::Bt4, len, false, true);
+                prepare(&mut reference, MatchFinderKind::Bt4, len, false, true);
+                assert_eq!(
+                    mt.get_num_available_bytes(&mut SliceStream::new(&bytes)),
+                    len as u32
+                );
+                assert_eq!(
+                    reference.get_num_available_bytes(&mut SliceStream::new(&bytes)),
+                    len as u32
+                );
+                assert_eq!(skip_state(&mt).origin, super::RecordOrigin::Produced);
+                assert_eq!(skip_state(&reference).origin, super::RecordOrigin::Produced);
+                // SAFETY: inline production has returned, no producer thread
+                // exists, and no references to Common are held. Both real
+                // record partitions cover the complete small input. Only
+                // GetMatches consumes them below; no producer handshake or
+                // refill can observe this temporary threaded tail policy.
+                unsafe {
+                    (*mt.shared().common.get()).inline = false;
+                    (*reference.shared().common.get()).inline = false;
+                }
+                for _ in 0..len {
+                    assert!(skip_state(&mt).avail != 0);
+                    // SAFETY: this test owns LZ state exclusively and no
+                    // producer or consumer call is active during inspection.
+                    assert!(unsafe { &*mt.shared().lz_state.get() }.has_produced_record());
+                    let mut got = [0xdead_beef; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
+                    let mut want = got;
+                    assert_eq!(
+                        mt.get_matches_select::<false, true>(&mut got),
+                        reference.get_matches_select::<true, false>(&mut want)
+                    );
+                    assert_eq!(got, want);
+                    assert_eq!(skip_state(&mt), skip_state(&reference));
+                }
+                // SAFETY: same exclusive test ownership; restore the
+                // original policy before normal finder teardown.
+                unsafe {
+                    (*mt.shared().common.get()).inline = true;
+                    (*reference.shared().common.get()).inline = true;
+                }
+            }
+        }
+    }
+
+    /// A held block needs no running producer. Exercise both the inline
+    /// tail rule and the threaded SDK tail rule with identical owned state.
+    #[test]
+    fn the_sdk_consumer_preserves_checked_held_block_tails() {
+        for kind in [
+            MatchFinderKind::Bt2,
+            MatchFinderKind::Bt3,
+            MatchFinderKind::Bt4,
+            MatchFinderKind::Bt5,
+        ] {
+            for inline in [false, true] {
+                for len in 1..=7 {
+                    let setup = || {
+                        let mut mt = MatchFinderMt::new();
+                        prepare(&mut mt, kind, 8 + len, false, true);
+                        let sh = mt.shared();
+                        // SAFETY: inline allocation, no threads started.
+                        // All subsequent calls consume this single held
+                        // block without invoking the producer handshake.
+                        unsafe {
+                            (*sh.common.get()).inline = inline;
+                            let c = sh.common();
+                            // SAFETY: create published this initialized extent;
+                            // no window references or producers are active.
+                            // Mutate through that pointer without retagging its owner.
+                            core::slice::from_raw_parts_mut(c.win, c.win_len).fill(0);
+                            let bt = c.bt_block(0);
+                            bt.fill(0);
+                            bt[0] = (2 + len) as u32;
+                            bt[1] = len as u32;
+                            let l = &mut *sh.lz_state.get();
+                            l.pointer_to_cur_pos = 8;
+                            l.lz_pos = 9;
+                            l.bt_num_avail_bytes = len as u32;
+                            l.bt_buf_pos = 2;
+                            l.bt_buf_pos_limit = 2 + len;
+                        }
+                        mt
+                    };
+                    let mut mt = setup();
+                    let mut reference = setup();
+                    for _ in 0..len {
+                        let mut got = [0xdead_beef; 8];
+                        let mut want = got;
+                        assert_eq!(
+                            mt.get_matches_select::<false, true>(&mut got),
+                            reference.get_matches_select::<true, false>(&mut want)
+                        );
+                        assert_eq!(got, want);
+                        assert_eq!(skip_state(&mt), skip_state(&reference));
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_consumer_streams(sdk: bool) {
+        for kind in [
+            MatchFinderKind::Bt2,
+            MatchFinderKind::Bt3,
+            MatchFinderKind::Bt4,
+            MatchFinderKind::Bt5,
+        ] {
+            for near_wrap in [false, true] {
+                let setup = || {
+                    let mut mt = MatchFinderMt::new();
+                    let history = if cfg!(miri) { 1 << 12 } else { 1 << 16 };
+                    let extent = if near_wrap { history + 257 } else { 4096 };
+                    prepare(&mut mt, kind, extent, false, true);
+                    // Remove the promised-size cap before streaming beyond
+                    // it, exactly as an unknown-length encoder stream does.
+                    mt.mfb.expected_data_size = u64::MAX;
+                    if !cfg!(miri) || near_wrap {
+                        mt.create(
+                            history as u32,
+                            K_NUM_OPTS as u32,
+                            LZMA_MATCH_LEN_MAX,
+                            LZMA_MATCH_LEN_MAX + 1,
+                            u64::MAX,
+                            false,
+                            true,
+                        )
+                        .expect("uncapped stream");
+                        mt.init_mt().expect("init_mt");
+                        mt.init();
+                    }
+                    if near_wrap {
+                        let sh = mt.shared();
+                        // SAFETY: inline fixture before the first read, with
+                        // empty tables and no producer threads. A high
+                        // logical position requires a whole physical history
+                        // margin, even when every tree entry is empty.
+                        unsafe {
+                            let pos = u32::MAX - 127;
+                            let prefix = sh.common().history_size as usize;
+                            let h = &mut *sh.hash_state.get();
+                            h.pos = pos;
+                            h.stream_pos = pos;
+                            h.buffer = prefix;
+                            let b = &mut *sh.bt_state.get();
+                            b.pos = pos;
+                            b.buffer = prefix;
+                            b.cyclic_buffer_pos = pos % sh.common().cyclic_buffer_size;
+                            let l = &mut *sh.lz_state.get();
+                            l.lz_pos = pos;
+                            l.pointer_to_cur_pos = prefix;
+                        }
+                    }
+                    mt
+                };
+                let mut mt = setup();
+                let mut reference = setup();
+                let len = if cfg!(miri) || near_wrap {
+                    257
+                } else {
+                    mt.shared().common().win_len * 2 + 17
+                };
+                let bytes: Vec<u8> = (0..len)
+                    .map(|i| ((i.wrapping_mul(37) ^ (i / 19)) % 251) as u8)
+                    .collect();
+                let mut source = SliceStream::new(&bytes);
+                let mut reference_source = SliceStream::new(&bytes);
+                let mut matches = vec![0; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
+                let mut reference_matches = matches.clone();
+                let mut iteration = 0;
+                let mut consumed = 0;
+                loop {
+                    let avail = mt.get_num_available_bytes(&mut source);
+                    assert_eq!(
+                        avail,
+                        reference.get_num_available_bytes(&mut reference_source)
+                    );
+                    if avail == 0 {
+                        break;
+                    }
+                    assert_eq!(skip_state(&mt).origin, super::RecordOrigin::Produced);
+                    let n = if sdk && (avail <= 8 || iteration % 6 == 0) {
+                        0
+                    } else {
+                        [1, 2, 3, 17, 273, 4096][iteration % 6].min(if sdk {
+                            avail.saturating_sub(8)
+                        } else {
+                            avail
+                        })
+                    };
+                    if n != 0 {
+                        mt.skip(&mut source, n);
+                        skip_reference(&mut reference, &mut reference_source, n);
+                    }
+                    consumed += n as usize;
+                    assert_eq!(skip_state(&mt), skip_state(&reference));
+                    let avail = mt.get_num_available_bytes(&mut source);
+                    assert_eq!(
+                        avail,
+                        reference.get_num_available_bytes(&mut reference_source)
+                    );
+                    if avail != 0 {
+                        let (count, reference_count) = if sdk {
+                            (
+                                mt.get_matches_select::<false, true>(&mut matches),
+                                reference.get_matches_select::<true, false>(&mut reference_matches),
+                            )
+                        } else {
+                            (
+                                mt.get_matches_select::<false, false>(&mut matches),
+                                reference.get_matches_select::<true, false>(&mut reference_matches),
+                            )
+                        };
+                        consumed += 1;
+                        assert_eq!(count, reference_count);
+                        assert_eq!(matches, reference_matches);
+                        assert_eq!(&matches[..count], &reference_matches[..reference_count]);
+                        assert_eq!(skip_state(&mt), skip_state(&reference));
+                    }
+                    iteration += 1;
+                }
+                assert!(!mt.failed());
+                assert!(!reference.failed());
+                assert_eq!(consumed, bytes.len());
+                if near_wrap {
+                    assert!(skip_state(&mt).pos < u32::MAX - 127);
+                    assert!(skip_state(&reference).pos < u32::MAX - 127);
+                }
+                if !cfg!(miri) && !near_wrap {
+                    // Starting at zero, only applying a window slide can
+                    // make the physical cursor smaller than its advances.
+                    assert!(mt.cur() < consumed);
+                    assert!(reference.cur() < consumed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hash_normalization_preserves_wrapped_read_ahead_and_queued_distances() {
+        let mut mt = MatchFinderMt::new();
+        prepare(&mut mt, MatchFinderKind::Bt4, 64, false, true);
+        let sh = mt.shared();
+        let c = sh.common();
+        let old_pos = u32::MAX - 7;
+        let sub = old_pos - c.history_size - 1;
+        // SAFETY: inline finder, no producer threads started; these disjoint
+        // ranges belong to the sole test thread for this entire call.
+        unsafe {
+            c.high_hash().fill(old_pos - 1);
+            c.low_hash().fill(0xdead_beef);
+            c.son().fill(0x1234_5678);
+            let h = &mut *sh.hash_state.get();
+            h.pos = old_pos;
+            h.stream_pos = old_pos.wrapping_add(64);
+            h.buffer = 0;
+            assert_eq!(h.avail(), 64);
+            super::hash_fill_block(sh, h, 0);
+            assert_eq!(h.stream_pos, old_pos.wrapping_add(64).wrapping_sub(sub));
+            assert_eq!(h.pos, c.history_size + 1 + 61);
+            assert_eq!(h.avail(), 3);
+            assert_eq!(h.buffer, 61);
+            let heads = c.hash_block(0);
+            assert_eq!(&heads[..2], &[63, 64]);
+            assert!(heads[2..63].iter().all(|&distance| distance == 1));
+            assert!(c.low_hash().iter().all(|&value| value == 0xdead_beef));
+            assert!(c.son().iter().all(|&value| value == 0x1234_5678));
+        }
+    }
+
+    /// SDK `CMatchFinderMt::btDummy` keeps independently written state off
+    /// a shared cache line. Cover every owner and handshake in the port,
+    /// whose Rust field order is not the SDK's C field order.
+    #[test]
+    fn threaded_owners_have_separate_cache_lines() {
+        use super::{BtState, HashState, LzState, MtShared, MtSync};
+        use core::mem::{offset_of, size_of};
+
+        let regions = [
+            (
+                "hash",
+                offset_of!(MtShared, hash_state),
+                size_of::<HashState>(),
+            ),
+            ("bt", offset_of!(MtShared, bt_state), size_of::<BtState>()),
+            ("lz", offset_of!(MtShared, lz_state), size_of::<LzState>()),
+            (
+                "hash sync",
+                offset_of!(MtShared, hash_sync),
+                size_of::<MtSync>(),
+            ),
+            (
+                "bt sync",
+                offset_of!(MtShared, bt_sync),
+                size_of::<MtSync>(),
+            ),
+        ];
+        for (owner, start, size) in regions {
+            assert_eq!(start % 128, 0, "{owner}: {regions:?}");
+            assert_eq!(size % 128, 0, "{owner}: {regions:?}");
+        }
+    }
+
     /// The `cyclicBufferSize` whose bt thread panics on purpose. Zero, the
     /// default, matches nothing: a cyclic buffer is never empty. Keyed on a
     /// size no other test uses, so that tests running alongside are not hit.
@@ -3535,9 +4877,11 @@ mod tests {
             let promised = mt.get_num_available_bytes(&mut NoStream);
             assert_eq!(promised as usize, src.len(), "first block's promise");
             mt.skip(&mut NoStream, promised);
+            assert_eq!(skip_state(&mt).origin, super::RecordOrigin::Parked);
             Ok(mt.failed())
         });
         assert_eq!(r, Ok(true), "the stream panic was not reported");
+        assert_eq!(skip_state(&mt).origin, super::RecordOrigin::Untrusted);
     }
 
     /// A small generator with a fixed seed: the cases are the same on every
@@ -3571,28 +4915,30 @@ mod tests {
                 } else {
                     K_FIX4_HASH_SIZE
                 };
-                let m = 1024;
-                let mut hash: Vec<u32> = (0..size).map(|_| rng.below(m)).collect();
+                let m = [256, 1024, u32::MAX - 256][case_no % 3];
+                let mut hash: Vec<u32> = (0..size).map(|_| m - 1 - rng.below(256)).collect();
                 let mut checked_hash = hash.clone();
                 let mut trusted_hash = hash.clone();
+                let mut positional_hash = hash.clone();
                 let alphabet = [1, 2, 4, 256][case_no % 4];
                 let win: Vec<u8> = (0..260).map(|_| rng.below(alphabet) as u8).collect();
                 let mut out = [0xDEAD_BEEF; 8];
                 let mut checked_out = out;
                 let mut trusted_out = out;
+                let mut positional_out = out;
                 let min = m - 256 + rng.below(256);
                 // SAFETY: every generated hash entry is below m. The
                 // retained 256 bytes cover min, and the window/output
                 // allocations include the kernel's lookahead and margin.
                 let got = unsafe {
                     match mix {
-                        Mix::Two => mix_matches_kind::<false, 2, false>(
+                        Mix::Two => mix_matches_kind::<false, 2, false, false>(
                             &crc, &mut hash, &win, 256, m, min, &mut out, 2,
                         ),
-                        Mix::Three => mix_matches_kind::<false, 3, false>(
+                        Mix::Three => mix_matches_kind::<false, 3, false, false>(
                             &crc, &mut hash, &win, 256, m, min, &mut out, 2,
                         ),
-                        Mix::Four => mix_matches_kind::<false, 4, false>(
+                        Mix::Four => mix_matches_kind::<false, 4, false, false>(
                             &crc, &mut hash, &win, 256, m, min, &mut out, 2,
                         ),
                         Mix::None => unreachable!(),
@@ -3602,7 +4948,7 @@ mod tests {
                 // output margins stated above satisfy the trusted contract.
                 let trusted = unsafe {
                     match mix {
-                        Mix::Two => mix_matches_kind::<false, 2, true>(
+                        Mix::Two => mix_matches_kind::<false, 2, true, false>(
                             &crc,
                             &mut trusted_hash,
                             &win,
@@ -3612,7 +4958,7 @@ mod tests {
                             &mut trusted_out,
                             2,
                         ),
-                        Mix::Three => mix_matches_kind::<false, 3, true>(
+                        Mix::Three => mix_matches_kind::<false, 3, true, false>(
                             &crc,
                             &mut trusted_hash,
                             &win,
@@ -3622,7 +4968,7 @@ mod tests {
                             &mut trusted_out,
                             2,
                         ),
-                        Mix::Four => mix_matches_kind::<false, 4, true>(
+                        Mix::Four => mix_matches_kind::<false, 4, true, false>(
                             &crc,
                             &mut trusted_hash,
                             &win,
@@ -3630,6 +4976,43 @@ mod tests {
                             m,
                             min,
                             &mut trusted_out,
+                            2,
+                        ),
+                        Mix::None => unreachable!(),
+                    }
+                };
+                // SAFETY: the identical trusted margins also prove the
+                // position-relative integer address, including base wrap.
+                let positional = unsafe {
+                    match mix {
+                        Mix::Two => mix_matches_kind::<false, 2, true, true>(
+                            &crc,
+                            &mut positional_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut positional_out,
+                            2,
+                        ),
+                        Mix::Three => mix_matches_kind::<false, 3, true, true>(
+                            &crc,
+                            &mut positional_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut positional_out,
+                            2,
+                        ),
+                        Mix::Four => mix_matches_kind::<false, 4, true, true>(
+                            &crc,
+                            &mut positional_hash,
+                            &win,
+                            256,
+                            m,
+                            min,
+                            &mut positional_out,
                             2,
                         ),
                         Mix::None => unreachable!(),
@@ -3650,6 +5033,9 @@ mod tests {
                 assert_eq!(trusted, want);
                 assert_eq!(trusted_out, checked_out);
                 assert_eq!(trusted_hash, checked_hash);
+                assert_eq!(positional, want);
+                assert_eq!(positional_out, checked_out);
+                assert_eq!(positional_hash, checked_hash);
                 assert_eq!(out, checked_out);
                 assert_eq!(hash, checked_hash);
             }
@@ -3674,16 +5060,29 @@ mod tests {
         let mut rng = Rng(0x5EED_4EAD_5000_0001);
         let crc: [u32; 256] = core::array::from_fn(|_| rng.next());
         for (kind, bytes, big) in KINDS {
-            let cases = if big { 2 } else { 12 };
+            // Native runs prove every 24-bit family's full table domain.
+            // Miri checks trusted H2/H3/H4/H5 with 16-bit tables; the
+            // fallback test below exercises all big families without
+            // allocating their two copies of a 64-MiB table under Miri.
+            if cfg!(miri) && big {
+                continue;
+            }
+            let cases = if cfg!(miri) || big { 2 } else { 12 };
             for case_no in 0..cases {
                 // C: `hashMask` keeps its low 16 bits set, and 24 for the
                 // `bigHash` kinds that mix in an unmasked 24-bit value.
-                let mask: u32 = if big {
+                let mask: u32 = if cfg!(miri) {
+                    0xffff
+                } else if big {
                     0x00FF_FFFF
                 } else {
                     (1 << (16 + rng.below(7))) - 1
                 };
-                let n = rng.below(3000) as usize;
+                let n = if cfg!(miri) {
+                    8 + case_no
+                } else {
+                    rng.below(3000) as usize
+                };
                 let alphabet = if case_no % 2 == 0 { 3 } else { 256 };
                 let p: Vec<u8> = (0..n + bytes - 1 + rng.below(3) as usize)
                     .map(|_| rng.below(alphabet) as u8)
@@ -3703,6 +5102,97 @@ mod tests {
                 assert!(hash == want_hash, "{kind:?} case {case_no}: tables differ");
             }
         }
+    }
+
+    /// Failed domain proofs fall back without changing panic order or the
+    /// already-written prefix. Arbitrary masks must retain LOCAL_CRC's
+    /// original checked values, even outside the SDK's normal mask domain.
+    #[test]
+    fn get_heads_domain_fallback_preserves_checked_mutations() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let mut rng = Rng(0x5EED_4EAD_5000_0002);
+        let masks: &[u32] = if cfg!(miri) {
+            &[0x53, u32::MAX]
+        } else {
+            &[0, 0x53, 0xffff, 0xff_ffff, u32::MAX]
+        };
+        let table_lengths: &[usize] = if cfg!(miri) { &[1, 257] } else { &[0, 1, 257] };
+        let counts: &[usize] = if cfg!(miri) { &[0, 4] } else { &[0, 1, 9] };
+        for (kind, width) in [
+            (Heads::H2, 2),
+            (Heads::H3, 3),
+            (Heads::H3b, 3),
+            (Heads::H4, 4),
+            (Heads::H4b, 4),
+            (Heads::H5, 5),
+            (Heads::H5b, 5),
+        ] {
+            for &mask in masks {
+                for &table_len in table_lengths {
+                    for &count in counts {
+                        for short in [false, true] {
+                            for random_crc in [false, true] {
+                                let crc: [u32; 256] =
+                                    core::array::from_fn(
+                                        |_| {
+                                            if random_crc { rng.next() } else { 0 }
+                                        },
+                                    );
+                                let len = count + width - 1;
+                                let len = if short { len.saturating_sub(1) } else { len };
+                                let input: Vec<u8> =
+                                    (0..len).map(|i| if i < width { 0 } else { 255 }).collect();
+                                let mut hash: Vec<u32> =
+                                    (0..table_len).map(|_| rng.next()).collect();
+                                let mut checked_hash = hash.clone();
+                                let mut heads = vec![0xdead_beef; count];
+                                let mut checked_heads = heads.clone();
+                                let pos = u32::MAX - 3;
+                                let got = catch_unwind(AssertUnwindSafe(|| {
+                                    get_heads(kind, &input, pos, &mut hash, mask, &mut heads, &crc);
+                                }));
+                                let want = catch_unwind(AssertUnwindSafe(|| {
+                                    // SAFETY: false retains all original input
+                                    // and table checks, with no domain contract.
+                                    unsafe {
+                                        super::get_heads_kind::<false>(
+                                            kind,
+                                            &input,
+                                            pos,
+                                            &mut checked_hash,
+                                            mask,
+                                            &mut checked_heads,
+                                            &crc,
+                                        );
+                                    }
+                                }));
+                                assert_eq!(got.is_err(), want.is_err(), "{kind:?} mask={mask}");
+                                assert_eq!(heads, checked_heads);
+                                assert_eq!(hash, checked_hash);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hash = [7];
+        let mut heads = [0xdead_beef; 3];
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            get_heads(
+                Heads::H2,
+                &[0, 0, 1, 0],
+                11,
+                &mut hash,
+                0,
+                &mut heads,
+                &[0; 256],
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(hash, [11]);
+        assert_eq!(heads, [4, 0xdead_beef, 0xdead_beef]);
     }
 
     /// A window that ends before the last byte a head hashes is refused, as
@@ -3850,6 +5340,21 @@ mod tests {
             c.cbp,
             c.cyclic,
         );
+        if let Some((end, next_pos)) = got {
+            // Every successful backend publishes a complete record partition,
+            // including zero matches and the long-match copy path.
+            let mut cursor = c.di;
+            let mut records = 0;
+            while cursor < end {
+                let count = d[cursor] as usize;
+                assert_eq!(count % 2, 0);
+                cursor = cursor.checked_add(1 + count).expect("record extent");
+                assert!(cursor <= end);
+                records += 1;
+            }
+            assert_eq!(cursor, end);
+            assert_eq!(records, next_pos.wrapping_sub(c.pos) as usize);
+        }
         (got, son, d)
     }
 
@@ -3937,6 +5442,39 @@ mod tests {
         }
     }
 
+    /// Each native assembly variant gets the complete oracle suite. Other
+    /// architectures and Miri run the portable implementation once.
+    fn register_variants() -> &'static [Kernel] {
+        #[cfg(all(
+            not(miri),
+            any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "macos")
+            )
+        ))]
+        {
+            &[
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<0>,
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<1>,
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<2>,
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<3>,
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<4>,
+            ]
+        }
+        #[cfg(not(all(
+            not(miri),
+            any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "macos")
+            )
+        )))]
+        {
+            &[crate::enc::bt_kernel::get_matches_spec_n_2_reg]
+        }
+    }
+
     /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
     /// every access checked, on the same generated tables and under the same
     /// conditions: the same answer, the same tree, the same matches. It runs
@@ -3944,12 +5482,18 @@ mod tests {
     /// exercises the same margin wrapper and the portable pointer walk.
     #[test]
     fn the_register_walk_is_the_checked_walk_on_any_tables() {
+        for &reg in register_variants() {
+            the_register_walk_is_the_checked_walk_on_any_tables_for(reg);
+        }
+    }
+
+    fn the_register_walk_is_the_checked_walk_on_any_tables_for(reg: Kernel) {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let (mut walked, mut refused) = (0_u32, 0_u32);
         for case_no in 0..WALK_CASES {
             let c = case(&mut rng);
             let want = walk(&c, get_matches_spec_n_2_checked);
-            let got = walk(&c, crate::enc::bt_kernel::get_matches_spec_n_2_reg);
+            let got = walk(&c, reg);
             assert!(got == want, "case {case_no}");
             if want.0.is_some() {
                 walked += 1;
@@ -3967,6 +5511,12 @@ mod tests {
     /// touches anything, as the slice walk does.
     #[test]
     fn the_register_walk_refuses_what_it_cannot_vouch_for() {
+        for &reg in register_variants() {
+            the_register_walk_refuses_what_it_cannot_vouch_for_for(reg);
+        }
+    }
+
+    fn the_register_walk_refuses_what_it_cannot_vouch_for_for(reg: Kernel) {
         let mut rng = Rng(11);
         let base = loop {
             let c = case(&mut rng);
@@ -3974,7 +5524,6 @@ mod tests {
                 break c;
             }
         };
-        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
         assert_eq!(walk(&base, reg), walk(&base, get_matches_spec_n_2_checked));
         type Break = (&'static str, fn(&mut Case));
         let breaks: [Break; 6] = [
@@ -4005,6 +5554,12 @@ mod tests {
     /// Also cover exact long-match output, early limits, and oversized limits.
     #[test]
     fn the_register_walk_hands_short_output_to_the_slice_walk() {
+        for &reg in register_variants() {
+            the_register_walk_hands_short_output_to_the_slice_walk_for(reg);
+        }
+    }
+
+    fn the_register_walk_hands_short_output_to_the_slice_walk_for(reg: Kernel) {
         let mut c = Case {
             win: vec![7; 28],
             len_limit_0: 24,
@@ -4022,7 +5577,6 @@ mod tests {
             cbp: 8,
             cyclic: 16,
         };
-        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
         for (d_len, limit) in [(3, 0), (3, 1), (12, 10), (120, 1), (120, usize::MAX)] {
             c.d_len = d_len;
             c.limit = limit;
@@ -4039,7 +5593,12 @@ mod tests {
     /// including a corrupt child on the last permitted tree iteration.
     #[test]
     fn the_register_walk_preserves_sdk_modes_and_error_order() {
-        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for &reg in register_variants() {
+            the_register_walk_preserves_sdk_modes_and_error_order_for(reg);
+        }
+    }
+
+    fn the_register_walk_preserves_sdk_modes_and_error_order_for(reg: Kernel) {
         for (pos, cbp) in [(24, 24), (40, 8), (24, 8), (u32::MAX - 2, 4)] {
             let mut c = Case {
                 win: vec![7; 99],
@@ -4080,13 +5639,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_register_walk_repeats_nodes_up_to_each_output_boundary() {
+        for &reg in register_variants() {
+            the_register_walk_repeats_nodes_up_to_each_output_boundary_for(reg);
+        }
+    }
+
+    fn the_register_walk_repeats_nodes_up_to_each_output_boundary_for(reg: Kernel) {
+        for delta in [1, 2, 3, 17, 31] {
+            for cbp in [0, 17, 56] {
+                for limit in [0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 24, 27, usize::MAX] {
+                    let mut c = Case {
+                        win: vec![7; 168],
+                        len_limit_0: 159,
+                        pos: 128,
+                        cur: 128,
+                        son: (0..128).map(|i| i * 3 + 1).collect(),
+                        cut: 1,
+                        d_len: 1024,
+                        di: 2,
+                        max_len_0: 3,
+                        heads: vec![delta; 8],
+                        hi: 0,
+                        limit,
+                        hsize: 8,
+                        cbp,
+                        cyclic: 64,
+                    };
+                    assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+                    // End repetition at a changed head, including an invalid
+                    // one just beyond the output threshold.
+                    c.heads[4] = 0;
+                    assert_eq!(walk(&c, reg), walk(&c, get_matches_spec_n_2_checked));
+                }
+            }
+        }
+    }
+
     /// C: GetMatchesSpecN_2's length extension. Exercise every mismatch byte
     /// around word boundaries, both ordering directions, and every alignment.
     /// The current window ends exactly at the match limit: a word load must
     /// fit completely, and the remaining bytes must use the scalar tail.
     #[test]
     fn the_register_walk_bounds_every_word_and_tail() {
-        let reg = crate::enc::bt_kernel::get_matches_spec_n_2_reg;
+        for &reg in register_variants() {
+            the_register_walk_bounds_every_word_and_tail_for(reg);
+        }
+    }
+
+    fn the_register_walk_bounds_every_word_and_tail_for(reg: Kernel) {
         for alignment in 0..16 {
             if cfg!(miri) && alignment != 0 && alignment != 15 {
                 continue;
@@ -4164,6 +5766,17 @@ mod tests {
         panics: bool,
         trace: &mut Vec<u32>,
     ) {
+        drive_checked::<false>(mt, stream, seed, calls, panics, trace);
+    }
+
+    fn drive_checked<const CHECKED: bool>(
+        mt: &mut MatchFinderMt,
+        stream: &mut dyn SeqInStream,
+        seed: u64,
+        calls: usize,
+        panics: bool,
+        trace: &mut Vec<u32>,
+    ) {
         let mut rng = Rng(seed);
         let mut d = vec![0u32; (LZMA_MATCH_LEN_MAX * 2 + 2) as usize];
         for _ in 0..calls {
@@ -4178,10 +5791,18 @@ mod tests {
             }
             if rng.below(4) == 0 {
                 let n = 1 + rng.below(avail.min(40));
-                mt.skip(stream, n);
+                if CHECKED {
+                    skip_reference(mt, stream, n);
+                } else {
+                    mt.skip(stream, n);
+                }
                 trace.push(u32::MAX - n);
             } else {
-                let k = mt.get_matches(&mut d);
+                let k = if CHECKED {
+                    mt.get_matches_select::<true, false>(&mut d)
+                } else {
+                    mt.get_matches(&mut d)
+                };
                 trace.push(k as u32);
                 trace.extend_from_slice(&d[..k]);
             }
@@ -4319,7 +5940,14 @@ mod tests {
                 let mut input = SliceStream::new(&src);
                 let copied_run = catch_unwind(AssertUnwindSafe(|| {
                     with_threads(&sh, &mut input, || {
-                        drive(&mut copied, &mut NoStream, seed, calls, panics, &mut want);
+                        drive_checked::<true>(
+                            &mut copied,
+                            &mut NoStream,
+                            seed,
+                            calls,
+                            panics,
+                            &mut want,
+                        );
                         Ok(())
                     })
                 }));
@@ -4335,6 +5963,8 @@ mod tests {
                     })
                 }));
                 drop(block);
+                assert_eq!(skip_state(&direct).origin, super::RecordOrigin::Untrusted);
+                assert_eq!(skip_state(&copied).origin, super::RecordOrigin::Untrusted);
 
                 assert_eq!(copied_run.is_err(), panics, "{what}");
                 assert_eq!(direct_run.is_err(), panics, "{what}");
@@ -4524,7 +6154,7 @@ mod tests {
         let threaded = make(false);
         let inline = make(true);
         // SAFETY: no thread has been started.
-        let words = |mt: &MatchFinderMt| unsafe { (*mt.shared().own.get()).bufs.len() };
+        let words = |mt: &MatchFinderMt| unsafe { (&*mt.shared().own.get()).bufs.len() };
         assert_eq!(words(&threaded), HASH_BUFFER_SIZE + BT_BUFFER_SIZE + 2);
         assert_eq!(
             words(&inline),

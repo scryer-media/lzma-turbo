@@ -246,7 +246,37 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     let check_size = job.check.size();
     let bytes = core::mem::take(&mut job.bytes);
 
-    // The header. Its CRC-32 is checked before any field in it is used.
+    let (header, header_size, packed_len) = block_header(job, &bytes)?;
+    let data_end = header_size + packed_len;
+    let padded_end = data_end + (4 - (packed_len % 4)) % 4;
+    if padded_end + check_size > bytes.len() {
+        return Err(XzErrorKind::TruncatedInput);
+    }
+    // Spec §3.3: validate padding before decoding, on both delivery paths.
+    if bytes[data_end..padded_end].iter().any(|&b| b != 0) {
+        return Err(XzErrorKind::BadPadding);
+    }
+    let mut dec = block_decoder(job, &header)?;
+    let (used, status) = dec.decode_block(
+        job.unpacked_len,
+        &bytes[header_size..data_end],
+        FinishMode::End,
+    )?;
+    let result = finish_block(
+        job,
+        &header,
+        dec,
+        used == packed_len && status == Status::FinishedWithMark,
+        &bytes[padded_end..padded_end + check_size],
+    );
+    job.bytes = bytes;
+    result
+}
+
+/// Shared index/header agreement checks for buffered workers and bounded input.
+fn block_header(job: &XzJob, bytes: &[u8]) -> Result<(BlockHeader, usize, usize), XzErrorKind> {
+    let check_size = job.check.size();
+    // Its CRC-32 is checked before any field in it is used.
     let header_size = bytes
         .first()
         .copied()
@@ -271,16 +301,10 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     {
         return Err(XzErrorKind::SizeMismatch);
     }
-    let data_end = header_size + packed_len;
-    let padded_end = data_end + (4 - (packed_len % 4)) % 4;
-    if padded_end + check_size > bytes.len() {
-        return Err(XzErrorKind::TruncatedInput);
-    }
-    // Spec §3.3: the padding is null bytes.
-    if bytes[data_end..padded_end].iter().any(|&b| b != 0) {
-        return Err(XzErrorKind::BadPadding);
-    }
+    Ok((header, header_size, packed_len))
+}
 
+fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, XzErrorKind> {
     // The LZMA2, decoded straight into the block's output buffer, which is
     // also its dictionary.
     let want = job.unpacked_len;
@@ -293,7 +317,17 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     }
     let mut dec = Lzma2Decoder::new_probs_only(header.chain.dict_prop)?;
     dec.set_block_dic(out, want);
-    let (used, status) = dec.decode_block(want, &bytes[header_size..data_end], FinishMode::End)?;
+    Ok(dec)
+}
+
+fn finish_block(
+    job: &mut XzJob,
+    header: &BlockHeader,
+    mut dec: Lzma2Decoder,
+    exact_marked_input: bool,
+    expected: &[u8],
+) -> Result<Option<BlockCheck>, XzErrorKind> {
+    let want = job.unpacked_len;
     let produced = dec.dic_pos();
     // Reaching the index's sizes is not the end of an LZMA2 stream: the end
     // marker is a control byte of its own, inside the compressed size, and a
@@ -301,14 +335,12 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     // well its sizes line up. C: `Lzma2Dec_DecodeToDic`, which only reports
     // `LZMA_STATUS_FINISHED_WITH_MARK` from `LZMA2_STATE_FINISHED`, and the
     // `XzUnpacker_Code` caller that will not close a block before it.
-    let marked = status == Status::FinishedWithMark;
     let mut out = dec.take_block_dic();
     // The block's boundaries came from the index, so a block that did not
     // consume exactly its compressed data, or did not produce exactly what
     // the index promised, does not match the file it came from.
-    if used != packed_len || produced != want || !marked {
+    if produced != want || !exact_marked_input {
         job.out = out;
-        job.bytes = bytes;
         return Err(XzErrorKind::SizeMismatch);
     }
 
@@ -321,9 +353,82 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
     // The check, on this thread, over the bytes this thread produced.
     let mut running = RunningCheck::new(job.check, job.unpacked_offset, &job.plan, job.verify);
     running.update(&out[..want]);
-    let checks = running.finish(&bytes[padded_end..padded_end + check_size]);
+    let checks = running.finish(expected);
 
     job.out = out;
-    job.bytes = bytes;
     checks.map(Some)
+}
+
+/// C: `XzDecMt_Decode_ST` refills a bounded input buffer while retaining coder
+/// state. Keep this reader's stronger contract: no output before block checks.
+pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
+    job: &mut XzJob,
+    src: &mut R,
+) -> std::io::Result<Option<BlockCheck>> {
+    use std::io::SeekFrom;
+    let stream = job.stream;
+    let block = job.block_in_stream;
+    let offset = job.file_offset;
+    let located =
+        |kind| std::io::Error::from(super::error::XzError::in_block(kind, stream, block, offset));
+    let mut header_bytes = [0u8; 1024];
+    src.read_exact(&mut header_bytes[..1])?;
+    let header_size = header_size_from_first_byte(header_bytes[0])
+        .ok_or_else(|| located(XzErrorKind::BadBlockHeader))?;
+    if header_size as u64 + job.check.size() as u64 > job.unpadded_size {
+        return Err(located(XzErrorKind::BadBlockHeader));
+    }
+    src.read_exact(&mut header_bytes[1..header_size])?;
+    let (header, _, packed_len) =
+        block_header(job, &header_bytes[..header_size]).map_err(located)?;
+    let data_start = offset
+        .checked_add(header_size as u64)
+        .ok_or_else(|| located(XzErrorKind::SizeMismatch))?;
+    let data_end = data_start
+        .checked_add(packed_len as u64)
+        .ok_or_else(|| located(XzErrorKind::SizeMismatch))?;
+    let padding = (4 - packed_len % 4) % 4;
+    let trailer_len = padding + job.check.size();
+    let mut trailer = [0u8; 67];
+    src.seek(SeekFrom::Start(data_end))?;
+    src.read_exact(&mut trailer[..trailer_len])?;
+    if trailer[..padding].iter().any(|&b| b != 0) {
+        return Err(located(XzErrorKind::BadPadding));
+    }
+    src.seek(SeekFrom::Start(data_start))?;
+    let mut dec = block_decoder(job, &header).map_err(located)?;
+    let mut input = core::mem::take(&mut job.bytes);
+    let capacity = packed_len.min(256 << 10);
+    if input.len() < capacity {
+        input
+            .try_reserve_exact(capacity - input.len())
+            .map_err(|_| located(XzErrorKind::Lzma(crate::Error::Alloc)))?;
+        input.resize(capacity, 0);
+    }
+    let mut used_total = 0;
+    let mut status = Status::NotSpecified;
+    while used_total < packed_len {
+        let size = (packed_len - used_total).min(capacity);
+        src.read_exact(&mut input[..size])?;
+        let (used, next_status) = dec
+            .decode_block(job.unpacked_len, &input[..size], FinishMode::End)
+            .map_err(|e| located(XzErrorKind::Lzma(e)))?;
+        used_total += used;
+        status = next_status;
+        if used != size || status == Status::FinishedWithMark {
+            break;
+        }
+    }
+    job.bytes = input;
+    let checks = finish_block(
+        job,
+        &header,
+        dec,
+        used_total == packed_len && status == Status::FinishedWithMark,
+        &trailer[padding..trailer_len],
+    )
+    .map_err(located)?;
+    // Match the buffered reader's cursor after the complete padded block.
+    src.seek(SeekFrom::Start(data_end + trailer_len as u64))?;
+    Ok(checks)
 }
