@@ -196,8 +196,7 @@ pub trait SeqOutStream {
     /// A sink that queues what it is given can take the allocation
     /// ([`core::mem::take`]) instead of copying it. The default copies through
     /// [`SeqOutStream::write`] and leaves `data` its capacity. Block-threaded
-    /// encoding uses [`Self::write_buffer`] to retain initialized tail storage;
-    /// a sink implementing ownership transfer should override that method too.
+    /// encoding uses [`Self::write_buffer`], whose default delegates here.
     ///
     /// C: `ISeqOutStream` has nothing like it; `Lzma2Enc_MtCallback_Write`
     /// passes the block's buffer to `ISeqOutStream_Write` and keeps it.
@@ -218,7 +217,10 @@ pub trait SeqOutStream {
     /// only `packSize` to the sink. Keeping the initialized tail lets the
     /// next block encode directly into it without zeroing it again. A sink
     /// may transfer ownership and return any initialized replacement buffer;
-    /// only `data[..written]` is output. The default retains the buffer.
+    /// only `data[..written]` is output. The default truncates to that prefix
+    /// and delegates to [`Self::write_vec`], preserving existing ownership
+    /// overrides. Copying sinks can override this method to retain the
+    /// initialized tail as well as the allocation.
     ///
     /// # Errors
     ///
@@ -229,7 +231,11 @@ pub trait SeqOutStream {
         data: &mut alloc::vec::Vec<u8>,
         written: usize,
     ) -> Result<(), Error> {
-        self.write(data.get(..written).ok_or(Error::Param)?)
+        if written > data.len() {
+            return Err(Error::Param);
+        }
+        data.truncate(written);
+        self.write_vec(data)
     }
 }
 
@@ -238,5 +244,13 @@ impl SeqOutStream for alloc::vec::Vec<u8> {
         self.try_reserve(data.len()).map_err(|_| Error::Alloc)?;
         self.extend_from_slice(data);
         Ok(())
+    }
+
+    fn write_buffer(
+        &mut self,
+        data: &mut alloc::vec::Vec<u8>,
+        written: usize,
+    ) -> Result<(), Error> {
+        self.write(data.get(..written).ok_or(Error::Param)?)
     }
 }

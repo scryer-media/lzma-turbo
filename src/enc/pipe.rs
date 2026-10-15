@@ -118,6 +118,10 @@ impl SeqOutStream for Sink {
         }
         Ok(())
     }
+
+    fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), Error> {
+        self.write(data.get(..written).ok_or(Error::Param)?)
+    }
 }
 
 /// One LZMA2 stream being encoded on its own thread from pushed input.
@@ -305,5 +309,37 @@ impl Lzma2Pipe {
             // A clean finish with the input still open, or a panic.
             _ => Error::InternalFailure,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_delivery_preserves_initialized_storage_even_on_error() {
+        let (tx, output) = mpsc::channel();
+        let (_return_tx, spare) = mpsc::channel();
+        let mut sink = Sink {
+            tx,
+            spare,
+            buf: Vec::new(),
+        };
+        let mut block = vec![7; OUT_BATCH + 32];
+        let allocation = block.as_ptr();
+        sink.write_buffer(&mut block, OUT_BATCH).unwrap();
+        assert_eq!(output.recv().unwrap(), vec![7; OUT_BATCH]);
+        assert_eq!(block.len(), OUT_BATCH + 32);
+        assert_eq!(block.as_ptr(), allocation);
+        assert!(block.iter().all(|&byte| byte == 7));
+        assert_eq!(
+            sink.write_buffer(&mut block, OUT_BATCH + 33),
+            Err(Error::Param)
+        );
+        assert!(sink.buf.is_empty());
+        drop(output);
+        assert_eq!(sink.write_buffer(&mut block, OUT_BATCH), Err(Error::Write));
+        assert_eq!(block.len(), OUT_BATCH + 32);
+        assert_eq!(block.as_ptr(), allocation);
     }
 }

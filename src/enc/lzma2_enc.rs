@@ -3209,10 +3209,10 @@ mod tests {
         let mut out = Vec::new();
         let cb = enc.mt_callback(&mut out, 2).unwrap();
         cb.code(0, 0, &src, true).unwrap();
-        let (len, cap) = {
+        let (len, cap, allocation) = {
             let buf = cb.out_bufs[0].lock().unwrap();
             assert_eq!(buf.data.len(), room);
-            (buf.written, buf.data.capacity())
+            (buf.written, buf.data.capacity(), buf.data.as_ptr())
         };
         assert!(len > src.len() && len <= room);
         // What was reserved, not the next power of two above the length.
@@ -3220,8 +3220,15 @@ mod tests {
 
         // The same buffer takes a second, shorter block as it is.
         cb.write(0).unwrap();
+        {
+            let buf = cb.out_bufs[0].lock().unwrap();
+            assert_eq!(buf.data.len(), room);
+            assert_eq!(buf.data.as_ptr(), allocation);
+        }
         cb.code(0, 0, &src[..1000], true).unwrap();
-        assert_eq!(cb.out_bufs[0].lock().unwrap().data.capacity(), cap);
+        let buf = cb.out_bufs[0].lock().unwrap();
+        assert_eq!(buf.data.capacity(), cap);
+        assert_eq!(buf.data.as_ptr(), allocation);
     }
 
     /// A sink that keeps what it is handed is handed every block whole, once,
@@ -3244,13 +3251,21 @@ mod tests {
                 self.blocks.push(core::mem::take(data));
                 Ok(())
             }
-            fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), Error> {
-                let mut block = core::mem::take(data);
-                block.truncate(written);
-                self.blocks.push(block);
-                Ok(())
-            }
         }
+
+        // A pre-existing sink implements only write_vec. The compatibility
+        // default must transfer the original allocation, without its tail.
+        let mut legacy = Keeps::default();
+        let mut prefix = b"blockunused tail".to_vec();
+        let allocation = prefix.as_ptr();
+        assert_eq!(legacy.write_buffer(&mut prefix, 17), Err(Error::Param));
+        assert_eq!(prefix, b"blockunused tail");
+        assert!(legacy.blocks.is_empty());
+        legacy.write_buffer(&mut prefix, 5).unwrap();
+        assert_eq!(legacy.blocks[0], b"block");
+        assert_eq!(legacy.blocks[0].as_ptr(), allocation);
+        assert_eq!(legacy.writes, 0);
+        assert_eq!(prefix.capacity(), 0);
 
         let src = mixed(300_000);
         let props = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);

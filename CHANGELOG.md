@@ -2,6 +2,8 @@
 
 ## 0.9.1 - 2026-10-11
 
+- Preserve existing `SeqOutStream::write_vec` ownership overrides during
+  parallel block delivery, while built-in copying sinks retain reusable storage.
 - Release surplus completed parallel encoder buffers after ordered delivery,
   retaining reusable buffers for active coders without reducing concurrency.
 - Decode XZ filters into caller output with bounded carry storage, avoiding
