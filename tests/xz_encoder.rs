@@ -822,6 +822,96 @@ fn queued_blocks_stay_ahead_of_a_block_that_starts_streaming() {
     decode_every_way(&xz, &data, "queued block, then a streaming one");
 }
 
+#[test]
+fn xz_finish_delivers_streamed_output_in_bounded_batches() {
+    struct Batches {
+        bytes: Vec<u8>,
+        largest: usize,
+        finishing: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl Write for Batches {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.finishing.get() {
+                self.largest = self.largest.max(buf.len());
+            }
+            // Exercise short writes during final compressed data and footer.
+            let count = buf.len().min(4001);
+            self.bytes.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // The initial dictionary is smaller than the pull encoder's window:
+    // most output becomes available only when finish supplies EOF.
+    let mut state = 0x1234_5678u32;
+    let data: Vec<u8> = (0..(1 << 20) + 1)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 20);
+    let finishing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut writer = XzWriter::new(
+        Batches {
+            bytes: Vec::new(),
+            largest: 0,
+            finishing: finishing.clone(),
+        },
+        &props,
+    )
+    .unwrap();
+    for chunk in data.chunks(64 << 10) {
+        writer.write_all(chunk).unwrap();
+    }
+    finishing.set(true);
+    let sink = writer.finish().unwrap();
+    assert!(
+        sink.bytes.len() > 1 << 19,
+        "fixture must remain incompressible"
+    );
+    assert!(
+        sink.largest <= 256 << 10,
+        "finish accumulated {} bytes",
+        sink.largest
+    );
+    decode_every_way(&sink.bytes, &data, "bounded finish batches");
+    xz_accepts(&sink.bytes, &data, "bounded finish batches");
+}
+
+#[test]
+fn xz_finish_preserves_the_destination_error() {
+    struct RefuseAtFinish(std::rc::Rc<std::cell::Cell<bool>>);
+    impl Write for RefuseAtFinish {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.get() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "finish sink",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+    let mut writer = XzWriter::new(RefuseAtFinish(armed.clone()), &props).unwrap();
+    writer.write_all(&vec![7; (1 << 16) + 1]).unwrap();
+    writer.flush().unwrap();
+    armed.set(true);
+    let error = writer.finish().err().expect("sink must refuse EOF output");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "finish sink");
+}
+
 /// A sink that, while armed, refuses every third write, and takes only part
 /// of the others.
 struct Flaky {
@@ -860,7 +950,7 @@ impl Write for Flaky {
 fn xz_writer_takes_nothing_from_a_write_that_fails() {
     let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
     let data = mixed(0x5eed_0008, (4 << 20).min(max_len()));
-    for block in [0u64, 1 << 16] {
+    for (block, threads) in [(0u64, 1), (0, 3), (1 << 16, 1), (1 << 16, 3)] {
         let armed = std::rc::Rc::new(std::cell::Cell::new(true));
         let mut w = XzWriter::new(
             Flaky {
@@ -872,6 +962,7 @@ fn xz_writer_takes_nothing_from_a_write_that_fails() {
         )
         .expect("writer");
         w.set_block_size(block);
+        w.set_threads(threads);
         let mut refused = 0;
         for chunk in data.chunks(10_000) {
             loop {
@@ -891,5 +982,63 @@ fn xz_writer_takes_nothing_from_a_write_that_fails() {
         let sink = w.finish().expect("finish");
         assert!(refused > 0, "block {block}: the sink never refused a write");
         decode_every_way(&sink.out, &data, &format!("block {block}, retried writes"));
+    }
+}
+
+#[test]
+fn xz_parallel_writer_delivers_blocks_without_batch_copy() {
+    struct Blocks {
+        bytes: Vec<u8>,
+        largest: usize,
+    }
+    impl Write for Blocks {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.largest = self.largest.max(bytes.len());
+            let n = bytes.len().min(4001);
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let block = 1usize << 16;
+    let mut state = 0x1234_5678u32;
+    let data: Vec<u8> = (0..7 * block + 71)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let props = LzmaEncProps::new()
+        .with_level(1)
+        .with_dict_size(block as u32);
+    for threads in [1, 3] {
+        let expected =
+            encode_xz_mt(&data, &props, CheckType::Crc64, block as u64, &[], threads).unwrap();
+        let mut writer = XzWriter::new(
+            Blocks {
+                bytes: Vec::new(),
+                largest: 0,
+            },
+            &props,
+        )
+        .unwrap();
+        writer.set_block_size(block as u64);
+        writer.set_threads(threads);
+        // One large Write must deliver multiple batches, and finish a partial
+        // batch, without an aggregate packed-output copy in either phase.
+        writer.write_all(&data).unwrap();
+        let sink = writer.finish().unwrap();
+        assert_eq!(sink.bytes, expected);
+        assert!(
+            sink.largest <= block + (block >> 10) + 16,
+            "delivered a whole batch: {} bytes",
+            sink.largest
+        );
+        decode_every_way(&sink.bytes, &data, "parallel block delivery");
+        xz_accepts(&sink.bytes, &data, "parallel block delivery");
     }
 }

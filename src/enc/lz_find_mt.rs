@@ -5434,15 +5434,31 @@ mod tests {
     /// Each native assembly variant gets the complete oracle suite. Other
     /// architectures and Miri run the portable implementation once.
     fn register_variants() -> &'static [Kernel] {
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        #[cfg(all(
+            not(miri),
+            any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "macos")
+            )
+        ))]
         {
             &[
                 crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<0>,
                 crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<1>,
                 crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<2>,
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<3>,
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                crate::enc::bt_kernel::get_matches_spec_n_2_reg_variant::<4>,
             ]
         }
-        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        #[cfg(not(all(
+            not(miri),
+            any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "macos")
+            )
+        )))]
         {
             &[crate::enc::bt_kernel::get_matches_spec_n_2_reg]
         }

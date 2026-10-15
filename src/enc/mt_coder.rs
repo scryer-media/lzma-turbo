@@ -78,6 +78,35 @@ pub(crate) trait MtCoderCallback: Sync {
         self.code(coder_index, out_buf_index, src, finished)
     }
 
+    /// Opt in to emitting while encoding a block that owns the write turn.
+    fn direct_output(&self) -> bool {
+        false
+    }
+
+    /// The caller holds the ordered write turn through this call. True means
+    /// delivery is complete and `write` must not deliver this block again.
+    fn code_ordered(
+        &self,
+        coder_index: usize,
+        out_buf_index: usize,
+        src: &[u8],
+        finished: bool,
+    ) -> Result<bool, Error> {
+        self.code(coder_index, out_buf_index, src, finished)
+            .map(|()| false)
+    }
+
+    fn code_owned_ordered(
+        &self,
+        coder_index: usize,
+        out_buf_index: usize,
+        src: &mut super::lz_find::MatchWindow,
+        finished: bool,
+    ) -> Result<bool, Error> {
+        self.code_owned(coder_index, out_buf_index, src, finished)
+            .map(|()| false)
+    }
+
     /// C: `IMtCoderCallback2::Write`. Emits a finished block; called in block
     /// order.
     fn write(&self, out_buf_index: usize) -> Result<(), Error>;
@@ -116,6 +145,7 @@ struct Block {
     /// C: `bufIndex`, with `(unsigned)(int)-1` for "no buffer".
     buf_index: Option<usize>,
     finished: bool,
+    delivered: bool,
 }
 
 /// The state behind `readEvent`: only the thread holding that token touches
@@ -232,6 +262,7 @@ impl MtCoder<'_, '_> {
                     res: Ok(()),
                     buf_index: None,
                     finished: false,
+                    delivered: false,
                 };
                 BLOCKS_MAX
             ]),
@@ -401,6 +432,18 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
             self.read_event.set();
 
             let mut buf_index = None;
+            let mut delivered = false;
+            // Claim only an idle write turn for this exact block. Out-of-order
+            // workers keep the SDK buffered path and never wait here.
+            let owns_write_turn = res.is_ok() && self.coder.callback.direct_output() && {
+                let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                if g.write_index == Some(bi) {
+                    g.write_index = None;
+                    true
+                } else {
+                    false
+                }
+            };
             if res.is_ok() {
                 let bufi = {
                     let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,15 +452,33 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                     head
                 };
                 buf_index = Some(bufi);
-                res = match in_data {
-                    Some(src) => self.coder.callback.code(index, bufi, src, finished),
+                let encoded = match in_data {
+                    Some(src) if owns_write_turn => {
+                        self.coder.callback.code_ordered(index, bufi, src, finished)
+                    }
+                    Some(src) => self
+                        .coder
+                        .callback
+                        .code(index, bufi, src, finished)
+                        .map(|()| false),
                     None => {
                         in_buf.truncate(size);
-                        self.coder
-                            .callback
-                            .code_owned(index, bufi, &mut in_buf, finished)
+                        if owns_write_turn {
+                            self.coder.callback.code_owned_ordered(
+                                index,
+                                bufi,
+                                &mut in_buf,
+                                finished,
+                            )
+                        } else {
+                            self.coder
+                                .callback
+                                .code_owned(index, bufi, &mut in_buf, finished)
+                                .map(|()| false)
+                        }
                     }
                 };
+                res = encoded.map(|done| delivered = done);
                 if let Err(e) = res {
                     self.set_error(e);
                 }
@@ -429,13 +490,16 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                     res,
                     buf_index,
                     finished,
+                    delivered,
                 };
             }
 
             // C: the writer hand-off. The thread whose block is the next one
             // to write claims the write turn; every other thread marks its
             // block ready and moves on.
-            let turn = {
+            let turn = if owns_write_turn {
+                Some(bi)
+            } else {
                 let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let wi = g.write_index;
                 if wi == Some(bi) {
@@ -463,8 +527,9 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
 
             let mut write_buf = buf_index;
             let mut write_finished = finished;
+            let mut write_delivered = delivered;
             loop {
-                if let (Ok(()), Some(bufi)) = (res, write_buf) {
+                if let (Ok(()), Some(bufi), false) = (res, write_buf, write_delivered) {
                     res = self.coder.callback.write(bufi);
                     if let Err(e) = res {
                         *self.write_res.lock().unwrap_or_else(|e| e.into_inner()) = Err(e);
@@ -502,6 +567,7 @@ impl<'a, 'i, 'c> Run<'a, 'i, 'c> {
                 }
                 write_buf = block.buf_index;
                 write_finished = block.finished;
+                write_delivered = block.delivered;
             }
 
             if write_finished || res.is_err() {

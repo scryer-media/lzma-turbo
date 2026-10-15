@@ -22,6 +22,7 @@
 //! - `LZMA_TURBO_BT_ASM`: `sdk` for the complete upstream x86-64 walk,
 //!   `sdk-wide` for that flow with the bounded match extension, or
 //!   `current` (default) for the shipping register/word-scan variant.
+//!   On macOS ARM64, `sdk-arm64` selects the complete upstream instruction flow.
 //! - `LZMA_TURBO_ENCODER`: `checked` for checked parser window reads and
 //!   low-hash accesses, or `unchecked` (default).
 //! - `LZMA_TURBO_FINDER`: `st` for the C's single-threaded match finder where
@@ -92,11 +93,20 @@ pub(crate) fn tree_kernel_reg() -> bool {
     }) == 1
 }
 
-/// Diagnostic x86-64 walk selection; normal builds retain their fixed kernel.
-#[cfg(all(target_arch = "x86_64", not(miri)))]
+/// Diagnostic native walk selection; normal builds retain their fixed kernel.
+#[cfg(all(
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "macos")
+    ),
+    not(miri)
+))]
 pub(crate) fn bt_variant() -> u8 {
     static CACHED: AtomicU8 = AtomicU8::new(UNSET);
     cached(&CACHED, "LZMA_TURBO_BT_ASM", |v| match v {
+        "sdk-arm64" if cfg!(all(target_arch = "aarch64", target_os = "macos")) => 2,
+        "sdk-arm64-wide" if cfg!(all(target_arch = "aarch64", target_os = "macos")) => 3,
+        "sdk-arm64-negative" if cfg!(all(target_arch = "aarch64", target_os = "macos")) => 4,
         "sdk" => 1,
         "sdk-wide" => 2,
         _ => 0,

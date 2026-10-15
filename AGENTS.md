@@ -32,7 +32,7 @@ port rules and what was left out are in `docs/encoder.md`.
      `the_register_walk_*` tests in `src/enc/lz_find_mt.rs`. Native and Miri;
      Miri exercises the portable walk and its entry-margin wrapper, including
      unaligned whole-node copies and repeated nodes at each output boundary.
-     ARM64 production builds with `asm` select this portable walk; it is Rust
+     Non-macOS ARM64 builds with `asm` select this portable walk; it is Rust
      pointer code, covered by both native differential tests and Miri.
    - x86-64 assembly kernels: native-only. The fixed `asm` candidate selects
      `sdk_walk_faithful` in `src/enc/bt_kernel_x86_64_sdk.S`, the complete
@@ -48,6 +48,27 @@ port rules and what was left out are in `docs/encoder.md`.
      explicitly run all three variants through the same margin wrapper; no
      environment mutation is needed to select a test variant. Miri never
      executes assembly.
+   - macOS ARM64 `sdk_walk_arm64` in `src/enc/bt_kernel_aarch64_sdk.S`:
+     diagnostic-only complete SDK instruction flow. The six native
+     `the_register_walk_*` tests explicitly run it through the same checked
+     margin wrapper and compare output, tree mutations and error ordering.
+     `sdk_walk_arm64_wide` in `bt_kernel_aarch64_sdk_wide.S` carries the
+     portable bounded word scan and early child fetch into that flow. All six
+     tests explicitly exercise these assembly variants and pass on ARM64.
+     `sdk_walk_arm64_negative` in `bt_kernel_aarch64_negative.S` ports the
+     upstream x86 negative-offset control flow, child-first mismatch path
+     and long-copy loop to ARM64 with bounded word reads. The same six native
+     tests cover its output, tree mutations, tails and refusal ordering.
+     macOS ARM64 builds with `asm` select the negative-offset port;
+     Miri excludes this assembly and cannot verify it.
+   - Darwin anonymous output mappings in `src/enc/mapped_output.rs`:
+     `mapped_output_is_zeroed_bounded_and_owned_across_threads` checks native
+     mapping initialization, rejected sizes, independent lifetimes and Send.
+     `mapped_output_matches_owned_blocks_and_preserves_pending_storage`
+     checks encoder byte parity, pending-buffer isolation, reuse and write
+     errors. This OS FFI is native-only; Miri retains the Vec-backed path.
+     Only opted-in streamed byte sinks use mappings; custom ownership sinks
+     retain their existing Vec delivery. Mappings never become public Vecs.
    - Shared decoder/encoder `zeroed_vec` in `src/buffer.rs`:
      `a_zeroed_vec_is_zeroes_of_every_zeroable_type` in `src/enc/lz_find.rs`
      exercises the common allocator through the encoder wrapper, native and
@@ -74,6 +95,14 @@ port rules and what was left out are in `docs/encoder.md`.
      by `owned_blocks_match_copied_windows_and_return_their_allocation` in
      `src/enc/lzma2_enc.rs`, natively and under Miri, including write errors
      and reuse through both owned and copied windows.
+   - macOS `reclaim_surplus_output` consumes a surplus byte Vec and advises
+     only complete pages inside that allocation with `MADV_FREE` before
+     deallocation. No advised bytes are read again; other slots are untouched.
+     `reclaiming_surplus_output_preserves_live_allocations` exercises the
+     real FFI and verifies neighboring buffers and delivery natively. Large
+     consumed buffers first use `shrink_result` to reduce allocator retention;
+     realloc refusal preserves the existing advice/free fallback. Miri
+     excludes this OS call; it does not verify allocator reclamation.
    - `shrink_result` owns a global-allocator byte vector and only reallocates
      to a nonzero size below its capacity; a null return preserves ownership.
      `shrinking_a_result_preserves_bytes_and_releases_capacity` checks empty,

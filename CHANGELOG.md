@@ -2,10 +2,17 @@
 
 ## 0.9.1 - 2026-10-11
 
+- Accelerate macOS ARM64 binary-tree matching with the SDK's negative-offset
+  traversal and bounded word comparisons. Stream ordered parallel blocks to
+  opt-in byte sinks to reduce peak memory, preserving whole-block delivery
+  for existing custom output sinks.
 - Preserve existing `SeqOutStream::write_vec` ownership overrides during
   parallel block delivery, while built-in copying sinks retain reusable storage.
 - Release surplus completed parallel encoder buffers after ordered delivery,
   retaining reusable buffers for active coders without reducing concurrency.
+- On macOS, reuse small output slots and use owned anonymous mappings for
+  large blocks delivered to opted-in byte sinks, avoiding resident freed-buffer
+  caches while preserving custom sinks' existing Vec ownership behavior.
 - Decode XZ filters into caller output with bounded carry storage, avoiding
   the private 64 KiB intermediate buffer while preserving filter tails and
   checksums. Offer contiguous LZMA2 dictionary output through borrowed reads,
@@ -33,6 +40,19 @@
   accounting for padding in memory limits.
 - Reuse XZ encoder input and output allocations, bound filtered-write scratch
   space, and avoid geometric excess when collecting parallel block output.
+- Deliver streamed XZ output directly through startup and finish, with bounded
+  encoder output queues and wakeups for input room or output availability.
+  Preserve short-write retries and the destination's original I/O errors.
+  Deliver finite and parallel XZ blocks without an aggregate output copy,
+  and reuse fixed packed buffers between batches as the SDK does.
+- Keep completed XZ decoder blocks within worker admission limits until
+  ordered delivery, and include waiting and partially delivered adaptive
+  output in input backpressure so slow earlier blocks cannot grow the queue
+  with archive length.
+- Bound packed-input storage to 256 KiB when the indexed XZ reader uses one
+  worker, while still verifying each complete block before exposing its bytes.
+  Reserve known packed-block sizes exactly in both indexed and adaptive
+  dispatch, avoiding doubled buffers when later blocks are slightly larger.
 - Let streamed LZMA2 block workers encode their owned input directly when
   using a single-threaded match finder, avoiding a second input window while
   preserving bit-exact output and returning the allocation after write errors.

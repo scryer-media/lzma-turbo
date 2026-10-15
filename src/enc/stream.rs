@@ -191,6 +191,17 @@ pub trait SeqOutStream {
     /// Whatever the sink reports; the encoder turns it into [`Error::Write`].
     fn write(&mut self, data: &[u8]) -> Result<(), Error>;
 
+    /// Allows an ordered block to arrive through multiple [`Self::write`]
+    /// calls while it is encoded, instead of one [`Self::write_buffer`].
+    ///
+    /// Byte-stream sinks may opt in to avoid a complete staging allocation.
+    /// The default preserves whole-block delivery and existing ownership
+    /// overrides. Opting in preserves byte order but permits partial output
+    /// before a later encoder error, as in single-block streaming encoding.
+    fn supports_streamed_blocks(&self) -> bool {
+        false
+    }
+
     /// Writes all of `data` and leaves it empty.
     ///
     /// A sink that queues what it is given can take the allocation
@@ -240,6 +251,10 @@ pub trait SeqOutStream {
 }
 
 impl SeqOutStream for alloc::vec::Vec<u8> {
+    fn supports_streamed_blocks(&self) -> bool {
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         self.try_reserve(data.len()).map_err(|_| Error::Alloc)?;
         self.extend_from_slice(data);

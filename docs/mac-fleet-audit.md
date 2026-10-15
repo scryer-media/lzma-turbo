@@ -1,8 +1,27 @@
 # Mac fleet optimization audit
 
-Work in progress. This records the complete path inventory and separates
-observations from proposed changes. No candidate performance claim is made
-until the same fleet scenarios have been measured again.
+Final local checkpoint: 2026-10-15. The performance arc is stopped at the
+operator's requested scope, with measured improvements retained and the
+bounded XZ output-buffer and tiny non-solid CPU tradeoffs explicitly accepted.
+The dated experiments below retain failed and superseded results; their
+pending-status statements describe those cohorts, not the final checkpoint.
+
+Local validation passes: both native workspace sweeps, all-features builds,
+portable/no-default feature sweeps, doctests, workspace Clippy, formatting,
+required pinned-SDK/XZ differential tests, all seven fuzz-target builds,
+three targeted Miri ownership checks, and six explicit large/sparse tests.
+Full cross-platform CI, the full sharded Miri selection and scheduled fuzz
+mutation runs remain CI gates; this local pass does not claim their results.
+See `mac-fleet-final-validation.json.zst` for commands, output, source hashes,
+original Nextest pipe warnings and clean targeted rechecks.
+
+The final normal-product decoder controls preserve timing: non-solid full
+thread direct decode is 4.64% faster than the frozen product with CPU +1.00%;
+streaming is 0.43% faster with CPU -0.52%. Direct RSS rises 753,664 bytes
+(+4.75%), bounded at the same requested thread count, within the existing
+large-wall-win RSS tradeoff for this workload. Streaming RSS falls 16,384
+bytes. Every run delivered all 8,192 members and 268,910,327 bytes with
+verification enabled. This control does not assert universal 3% RSS parity.
 
 The reference is 7-Zip 26.03 (tag commit
 `0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17`) and xz 5.8.3 (tag commit
@@ -12,7 +31,7 @@ correctness verification. Wall time, process CPU time, peak RSS and archive
 size are distinct gates. Mac measurements do not establish other-platform
 results.
 
-## Current closure inventory
+## Earlier closure inventory (retained history)
 
 Ordinary L5, encrypted L5 and zeros L5 T16 now pass on the three remote
 hosts tested with the shared-cursor build. Current-source Mac timing remains
@@ -30,7 +49,7 @@ rows retain their closure; unmeasured fleet rows remain unverified.
 | Full-thread encrypted encode timing | Current shared-cursor build passes AES T16 wall, CPU and memory limits on the tested Linux x86-64, Windows x86-64 and Graviton4 hosts. Earlier failures remain below. Retained Mac wall +3.43% / CPU +3.48%; current-source Mac timing and other fleet hosts remain unverified. AWS-LC is already using its bulk hardware path. |
 | Intermediate-width and fast-finder encode timing/RSS | Completed-output retention closes Linux x86 L5 T4: wall +0.54%, CPU +0.70%, RSS +0.24%. All six broader encoder cases pass wall/CPU/RSS against SDK and stay within 3% of the preceding product, including L5 T8/T16/AES T16 and zeros T4. Current L3 T2 RSS is -9.00%; its historical +7.88% tradeoff remains operator-accepted. Fast-finder zeros RSS tradeoffs are also accepted below. Retained Mac T8 RSS +5.20% remains unverified on current source. |
 | Non-solid T1 encode RSS | Operator accepted the reported tiny encrypted non-solid cases: x86 RSS +15.23%, wall -17.74% / CPU -18.15%; retained Mac RSS +6.57%. This accepts those measured tradeoffs, not arbitrary future regressions. Ordinary tree T1 passes on both hosts; unencrypted tiny files passed two x86 compact-folder cohorts. |
-| Non-solid T1 decode RSS | Borrowed delivery passes native correctness and improves timing, but the complete Linux cohort remains +13.14% RSS direct and +15.58% streaming versus SDK. Streaming also exceeds prior-product RSS by +3.35%. Exact allocation census identifies 2,537,666 bytes of retained metadata; a coordinated private-metadata reduction is in progress. Retained Mac approximately 7.27 versus 5.81 MiB remains unverified on current source. |
+| Non-solid T1 decode RSS | Closed with operator-accepted scoped RSS exceptions on Linux x86: direct 8.125 versus 7.705 MiB (+0.420 MiB, +5.45%); streaming 8.637 versus 7.773 MiB (+0.863 MiB, +11.11%). Wall/CPU remain within 0.2% of SDK. Compact coder records and all verification are retained; public API unchanged. This accepts the measured overhead, not leaks or future regressions. Current-source Mac remains unverified. |
 | x86 XZ filter RSS | Operator accepted the scoped whole-process RSS tradeoff after the complete allocation/mapping audit: about 13 MiB versus xz's 10.2 MiB (26–27% higher), with all ten pinned timing comparisons passing. Caller-output filtering removes private filter storage; unchanged caller buffers and executable mappings account for the main remaining excess. Symbol companion failed code/data identity and is not used for attribution. This is an accepted exception, not measured RSS parity or permission for future regressions. |
 | BCJ2 marginal final-verification cells | Operator accepted the reported single-folder T16 CPU +3.16% and multi-folder T2 wall +3.10% cells. T2 pairing, streaming T2, T4 and T8 already pass. No further BCJ2 optimization is required for these measured cells; other-platform coverage remains separate. The complete cursor port remains diagnostic. |
 | Near-incompressible encrypted decode | Latest ordinary-build x86 AES mx1 T16 wall +0.37%, CPU -1.91%, RSS -8.84%. The preceding product also passes this cohort, so this is not a new causal improvement. Current-source Mac and other fleet hosts remain unverified. |
@@ -57,23 +76,34 @@ also accepted the ten measured x86 XZ filter process-RSS cells, approximately
 26–27% above xz with passing wall/CPU. The caller-output port is retained;
 caller buffer sizes, features and benchmark behavior are unchanged.
 
+The operator also accepted the recorded XZ encoder RSS tradeoffs, conditional
+on bounded memory use rather than unbounded growth: single-thread presets
+1/5/9 add 7.28/23.75/99.66 MiB over xz; branch-filter cases add approximately
+6 MiB, and delta4/delta64 approximately 6.8/7.5 MiB. The associated measured
+wall/CPU gains remain part of this acceptance. This does not accept leaks,
+accumulation across encoder reuse, arbitrary future regressions, or establish
+current-build measurements. Allocation/lifetime bounds and any format-required
+metadata growth remain to be verified explicitly; the fixed-corpus timings
+alone do not establish boundedness.
+
 L5 T4 encoder RSS is closed on Linux x86 with the broader regression cohort
-passing. The remaining active implementation lane from this request is
-non-solid T1 decoder RSS. The Windows borrowed-delivery candidate passes all
-seven plain wall/working-set comparisons; complete trace CPU accounting
-continues before acceptance. Remaining Mac/fleet measurements, earlier
-product-regression reconciliation, unaccepted XZ/parallel-encoder tradeoffs,
+passing. Non-solid T1 decoder RSS is closed by the scoped operator acceptance
+above, with timing passing and compatible allocation reductions retained.
+The Windows borrowed-delivery candidate passes all seven wall, scheduled-CPU
+and working-set comparisons against SDK and the preceding product, with all
+147 traces accounted for. Remaining Mac/fleet measurements, earlier
+product-regression reconciliation, XZ encoder memory-boundedness verification,
 Weaver broad integration checks and the final Miri/format/lint capstone
 remain tracked. Accepted ring and parallel-extraction exceptions remain intact.
 
 Separate from these groups: the quiet LZMA/XZ encoder matrix completed all
-17 scenarios, with proposed RSS tradeoffs recorded below. The other three
+17 scenarios, with conditionally accepted RSS tradeoffs recorded below. The other three
 fleet architectures still need current-source verification. BCJ2's literal
 T1/T1 pipeline discrepancy is a known comparison
 contract, reconfirmed by the operator: compare our T2 with SDK T1 or use the
-serial reference control; do not reopen it as a kernel gap. Proposed
-parallel-encoder and filter tradeoffs remain recorded
-for operator review. Accepted parallel extraction is not reopened just to
+serial reference control; do not reopen it as a kernel gap. The recorded
+XZ encoder and filter RSS tradeoffs are accepted subject to boundedness
+verification above. Accepted parallel extraction is not reopened just to
 force aggregate CPU parity.
 
 Passing SDK ratios also do not waive regressions against the preceding
@@ -4064,7 +4094,7 @@ Sevenz evidence (decoded SHA-256):
 - `published-window-native-validation.report.json.zst`:
   `23d08c8f082e59fabceb199b6a499f51bfc8e363bda3bc924b6e1d4a03285d2f`.
 
-### Windows borrowed delivery: complete plain comparisons
+### Windows borrowed delivery: complete comparisons and CPU accounting
 
 All 294 operations completed correctly: seven cases, three arms, one warmup
 and six balanced repetitions, with separate plain and traced operations.
@@ -4072,8 +4102,31 @@ All seven plain wall-time and peak-working-set medians pass the 3% limits
 against both the preceding product and SDK. The candidate's wall changes
 versus the preceding product range from -1.11% to +0.02%; this is a small
 delivery improvement, not a large new throughput win. Full accounting of
-all 147 traces is still pending. Charged CPU is retained separately and does
-not substitute for owned scheduled CPU after ISR/DPC subtraction.
+all 147 traces now passes: complete paired owned-thread intervals, zero lost
+events/buffers, and union ISR/DPC overlap subtracted from scheduled CPU.
+Charged CPU remains separate and does not substitute for this measurement.
+
+| Case | Wall vs SDK | Scheduled CPU vs SDK | Peak working set vs SDK |
+|---|---:|---:|---:|
+| Tiny direct | -0.13% | -0.47% | -14.35% |
+| Tiny streaming | +0.25% | +0.09% | -8.23% |
+| Ordinary | -0.54% | -0.69% | -7.93% |
+| Parallel | +1.40% | -0.56% | -0.11% |
+| Filter | -6.99% | -5.99% | -8.99% |
+| COPY | -38.23% | -42.24% | -23.25% |
+| AES | -39.41% | -41.88% | -39.31% |
+
+All three metrics also pass against the preceding product; the largest
+increase is +0.17% working set. This closes this fixed Windows cohort only,
+not current-source fleet validation. The separate Linux RSS exceptions remain
+scoped operator acceptances. All 294 operations, warmups, six balanced orders,
+raw scheduled intervals and interrupt overlaps are retained. Earlier processing
+failures and their recovery lineage remain recorded; no measurement was rerun
+or discarded. All 147 original XML hashes match their lossless archive
+round trips. Absolute runtime paths are sanitized in the repository artifact.
+
+Sevenz `windows-nonsolid-t1-borrowed.accounting.json.zst`, decoded SHA-256:
+`c8a00ac748ad740cc9cedab9dbcb6c7cbe147e61b546dd94e584d7309a0770de`.
 
 Sevenz `windows-nonsolid-t1-borrowed.plain.json.zst`, decoded SHA-256:
 `bdd80c7c97fca232fdebf036055f005682faa7e67591931b1189f937dad56374`.
@@ -4515,3 +4568,467 @@ The lifecycle validation evidence now decodes to
 its original decoded hash is retained inside the evidence. Fresh checkpoint
 branches exclude earlier local commits containing unsanitized evidence and
 preserve the newer upstream benchmark documentation.
+
+
+### Non-solid T1 checkpoint follow-through, 2026-10-14
+
+The Git-pinned checkpoint cohort completed all 42 timed operations and six
+correctness checks with every sample retained. Direct delivery is -1.34%
+wall, -1.36% CPU and +6.25% RSS versus SDK; streaming is -0.43% wall,
+-0.43% CPU and +11.94% RSS. RSS is 1.25%/1.15% lower than the fixed
+preceding product. These are improvements, not closure of the 3% RSS gate.
+
+Exact original-image snapshots attribute the remaining excess principally
+to retained metadata. Direct product mappings hold 1,980 KiB heap plus
+824 KiB other anonymous memory; SDK holds 1,484 plus 124 KiB. Product
+file mappings are 5,996 versus SDK 5,872 KiB in that diagnostic. Streaming
+retains caller CRC tables and later creates a separate caller verification
+set. The unchanged benchmark retains all of those checks. Mapping diagnostics
+are not timing acceptance or proof that every resident code page executed.
+
+The next compatible representation follows the SDK compact-coder principle:
+a safe 24-byte inline record retains every 15-byte method ID, up to seven
+property bytes and common stream counts. Boxed exceptional records preserve
+full-width counts and longer properties. Native tests verify the layout,
+all ID lengths, property boundaries, clone independence and logical equality
+across representation transitions. No unchecked union or pointer tagging is
+introduced. The common one-coder allocation saves approximately 128 KiB across
+this fixture; exceptional/AES metadata may instead grow, so this is not a
+claim of uniform memory reduction across archive types.
+
+The all-feature native sweep passes 273 library tests and every existing
+integration target. Its new large-offset target exposed a genuine existing
+compatibility gap: SDK accepts a wholly omitted optional SubStreamsInfo
+section, while this reader rejected it. Explicit-section large-offset tests
+pass through both ordinary and positional readers; the original valid case
+is retained separately, and a faithful defaulting fix is pending validation.
+The inherited-CRC correction is validated by the full suite. Failed compiler
+integration attempts and the original valid-archive failure are retained.
+
+Sevenz evidence bundles, decoded SHA-256:
+
+- `nonsolid-metadata-checkpoint-v2.evidence.json.zst`:
+  `d0a1abc4e00fe8ba3ff15f087c68e8ab3e3e2880d110854b0443e345b8498534`.
+- `nonsolid-metadata-mapping-v2.evidence.json.zst`:
+  `5161a91b5eca63f208732b447c3cae40a76724f5b2380feb31fceaea6c691f72`.
+- `nonsolid-packed-coder-validation.json.zst`:
+  `428077e4e52aa0818cd8a914a6e29bdffd5a741a20d386db668daf773770517e`.
+
+
+The compact-coder cohort subsequently completed all 42 operations with six
+correctness checks and no interference-guard failures. The operator accepted
+the measured residuals and chose to preserve the public API:
+
+| Non-solid T1 mode | Product RSS | SDK RSS | Extra RSS | Wall delta | CPU delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct | 8.125 MiB | 7.705 MiB | 0.420 MiB / 5.45% | -0.192% | -0.193% |
+| Streaming | 8.637 MiB | 7.773 MiB | 0.863 MiB / 11.11% | +0.174% | +0.162% |
+
+Versus the fixed preceding product, direct RSS improves 3.14%; streaming
+RSS is +0.29%. Timing differences versus that product stay within 0.04%.
+The decision closes this measured lane as an exception, not as 3% RSS parity.
+It does not accept leaks, accumulating retention or future regressions.
+All raw samples, correctness checks and benchmark drivers are retained in
+sevenz `nonsolid-packed-coder-v3.evidence.json.zst`, decoded SHA-256
+`4a63e143c3aa269a84aca440d3fea79e740b93b270b70069aff2c139574320d3`.
+
+The separate wholly omitted SubStreamsInfo port then passes the library,
+container and security suites, both default large-offset tests and all four
+new omitted-section regressions, including independent snapshots after public
+mutation and exact explicit-malformed-section errors. That later correction
+is not part of the frozen performance binary above.
+
+The subsequent XZ writer audit covered startup, steady-state delivery, filter
+tails, EOF, destination errors and both directions of the encoder pipe.
+Following `Xz_CompressBlock`'s streamed delivery removes the accumulated output
+vector from the writer path. Bounded output channels share wakeups for input
+room, output availability and worker exit, so full queues cannot wait solely
+on each other. Buffered encoder APIs retain their output contract.
+
+Twenty-four interleaved operations (one warmup and three measured samples per
+arm and preset) completed on the Mac during normal use. All output sizes
+match the previous product build. Medians are:
+
+| Preset | Previous RSS | Candidate RSS | xz RSS | Candidate extra RSS | Tracked allocation saved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| P9 | 865.59 MiB | 744.30 MiB | 674.75 MiB | 69.55 MiB | 62.56 MiB |
+| P5 | 122.80 MiB | 108.05 MiB | 94.77 MiB | 13.28 MiB | 7.04 MiB |
+
+Both memory differences fit the previously accepted bounded allowances
+(P9 99.66 MiB; P5 23.75 MiB). Candidate wall/CPU are 58.22%/58.76% below xz
+at P9 and 62.74%/62.67% below xz at P5. Against the previous product build,
+however, medians are 9.53%/7.93% higher at P9 and 3.84%/3.83% higher at P5.
+Compiler load differed substantially between arms; every sample is retained.
+These results establish the memory reduction but do not establish absence
+of a baseline-relative timing regression. That investigation remains open.
+
+All four pipe tests and all 26 XZ/LZMA2 integration tests pass, including
+full-duplex progress, worker-panic wakeup, cancellation during blocked output,
+partial destination writes, original I/O errors and external decoder checks.
+The three new lifecycle tests were added after the frozen benchmark build;
+the evidence records both source identities. No new unsafe code or dependency
+is introduced by this writer change. The separate allocator pressure-relief
+prototype remains unaccepted. Tree/L9 timing and T4/T8 RSS remain open.
+
+Sanitized samples, background process roles, binary/source hashes and analysis
+are in `mac-fleet-xz-pipe-controls.json.zst`, decoded SHA-256
+`6b7695818d7f8bd59a2bb62784f27e5d757e5058f953c78a830ddd9e3b74e2ec`.
+
+
+A follow-up P9 comparison used four measured samples per product arm in
+ABBA order, without the much longer xz run separating the arms. All eight
+operations succeeded with identical output sizes. Candidate medians were
+44.968 s wall, 42.757 s CPU and 744.24 MiB RSS; the previous product measured
+46.702 s, 43.400 s and 865.52 MiB. This is -3.71% wall, -1.48% CPU and
+-14.01% RSS. The original noisy cohort remains above, including its failures
+to meet the baseline timing threshold. The follow-up supports the P9 change
+on this in-use Mac; P5 baseline timing still needs its own follow-up.
+
+A separately symbolized diagnostic build identifies the unchanged binary-tree
+match walk as the main sampled CPU leaf. Pipe functions did not reach five
+leaf samples. Waiting caller samples are not counted as CPU work. This is a
+hotspot diagnosis, not an acceptance timing result.
+
+Balanced P9 samples and observed background load are retained in
+`mac-fleet-xz-pipe-balanced.json.zst`, decoded SHA-256
+`e956a5f3ef2633ec76f39cc7aa6d988051c326dd184468accdb9c4396686188e`.
+
+
+The balanced P5 follow-up also passes: candidate medians are 19.474 s wall,
+19.468 s CPU and 108.05 MiB RSS, versus 19.975 s, 19.968 s and 122.90 MiB
+for the previous product. All eight operations succeeded with the same output
+size. Wall/CPU improve 2.51%/2.50%; RSS falls 12.08%. Evidence is
+`mac-fleet-xz-p5-balanced.json.zst`, decoded SHA-256
+`d91c8b2a53a40408f44414786a45902af5f67f870366dff1bfa8e67e76fec1b6`.
+
+Ranking the full resumed matrix by excess bytes identified larger unaccepted
+XZ parallel-encoder overages than the remaining sevenz T4/T8 rows. The audit
+found both an aggregate packed-batch copy and a fresh allocation/shrink cycle
+for every block. `XzEnc_MtCallback_Write` delivers blocks directly; its Code
+counterpart retains a fixed destination. The writer now follows both lifetime
+rules. Buffered APIs preserve their result contract. A transition to one
+streaming block releases the now-unusable batch coders and packed buffers.
+
+One warmup and three measured repetitions per arm, rotating the previous
+product, candidate and xz, give the following P5 medians:
+
+| Width | Previous RSS | Candidate RSS | xz RSS | RSS saved | Wall vs previous | CPU vs previous |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| T2 | 467.34 MiB | 257.28 MiB | 319.86 MiB | 210.06 MiB | -8.51% | -8.27% |
+| T4 | 716.67 MiB | 509.11 MiB | 616.95 MiB | 207.56 MiB | -0.34% | -0.35% |
+
+Both rows beat xz on wall, CPU and RSS, with identical product output sizes.
+All 233 library tests and 27 XZ/LZMA2 integration tests pass, including
+parallel short-write retry, block-size transitions, every filter/check chain,
+external decoding and exact buffered-versus-writer output. No new unsafe
+code or dependency is needed for the XZ changes. The separate macOS surplus
+page-release experiment is not accepted by this comparison.
+
+The earlier direct-delivery-only cohort is retained: it saved 42/84 MiB but
+its T4 wall/CPU medians were 3.70%/4.04% above the preceding product. The
+combined fixed-buffer reuse result above supersedes that candidate, not its
+evidence. Remaining presets, widths and filters are undergoing regression
+controls; these two rows do not establish all-architecture parity.
+
+All three MT cohorts and source/binary identities are in
+`mac-fleet-xz-mt-output-controls.json.zst`, decoded SHA-256
+`45b64c8e22e2ebebb912e6595062abf5e0814c7e269a5ad933f999cb7aeabae8`.
+
+The remaining encoder matrix completed 23 scenarios and 276 operations
+(one warmup plus three measured repetitions per arm). Every completed product
+output size matches. All additional MT rows beat xz on wall, CPU and RSS;
+their baseline timing deltas remain below 3%. Three baseline timing crossings
+remain unresolved: P3 +3.55% wall / +3.71% CPU, P9 +3.15% / +3.16%, and
+ARM64 filter encoding +3.35% / +3.21%. Earlier balanced P9 controls passed,
+but that does not erase this newer crossing. P3 samples show substantial
+variation and recorded background activity; adjacent balanced controls and
+paired profiles are queued before attributing the crossing to a code path.
+The complete matrix, including every sample and anonymized process-load
+values, is `mac-fleet-xz-encoder-regression-controls.json.zst`, decoded SHA-256
+`fafb49686ae46702484489e4d53842ada5b9e261b129e79d53608e334ec2508e`.
+
+The decoder ownership audit found a distinct memory-bound defect in both
+indexed and adaptive XZ scheduling: completed out-of-order blocks stopped
+occupying admission slots while retaining their buffers. Indexed scheduling
+now counts ready blocks with in-flight work. Adaptive scheduling also counts
+ready blocks and partially delivered output against slots and input
+backpressure. The latter retains the whole output block's cost until its last
+byte is delivered. This prevents backlog growth behind a slow earlier block;
+it does not claim a reduction in the one-worker packed-input allocation.
+All 236 library and 56 selected integration tests passed after both fixes,
+including three deterministic admission regressions and external XZ fixtures.
+All 18 indexed-reader performance scenarios then passed the baseline 3%
+wall/CPU/RSS limits in 216 operations, with matching decoded lengths and
+CRC-32 values. This validates the scheduling change against the previous
+product, not the unresolved T1 RSS gap against xz. The adaptive path has
+correctness coverage but no dedicated performance lane in this harness.
+Samples, source identities and validation counts are retained in
+`mac-fleet-xz-admission-controls.json.zst`, decoded SHA-256
+`9965ff8b11be0b669ce56bbd2660f6223592e5b9b7400e2127a8ab274bed5952`.
+
+P3 follow-up preserved the initial four-repetition balanced failure (+9.06%
+wall / +9.04% CPU) and collected paired native profiles. Both profiles are
+dominated by `MatchFinder::hc_get_matches_spec`; the compared hot instruction
+sequence is unchanged apart from relocated addresses, and the summaries show
+no substantial new pipe leaf hotspot. The profiled candidate finished slightly
+faster, but profiled runs are not acceptance measurements. An expanded,
+adjacent ABBA comparison of the same frozen binaries used one warmup and eight
+measured repetitions per arm. Its medians pass: wall 24.170917 versus 23.843244
+seconds (+1.37%), CPU 24.178283 versus 23.838290 seconds (+1.43%), and RSS
+43,335,680 versus 49,184,768 bytes (-11.89%). No further encoder source change
+was made between these cohorts. Earlier crossings and observed timing
+variability remain recorded rather than erased. P9 and ARM64-filter baseline
+crossings are still undergoing their own adjacent comparisons.
+
+Both P3 cohorts, the profile audit and profile hashes are retained in
+`mac-fleet-xz-p3-controls.json.zst`, decoded SHA-256
+`5d0ea0afa11a94d0849f74a173087893f2143587cc927e7f197eb33f7749cc1e`.
+
+The P9 and ARM64-filter follow-up completed with one warmup and six measured
+repetitions per arm, in adjacent alternating order. P9 passed against the
+previous product: wall +2.26%, CPU +2.24%, RSS -14.03% (127,328,256 bytes
+saved). ARM64 passed at wall -1.31%, CPU +0.13%, RSS -8.24%. Output lengths
+matched in every operation. These results concern the frozen encoder candidate;
+later decoder changes have a separate cohort. Background compiler activity
+and earlier failed cohorts remain recorded. All 28 operations and identities
+are retained in `mac-fleet-xz-remaining-controls.json.zst`.
+
+The indexed one-worker reader now uses the bounded-input structure of
+`XzDecMt_Decode_ST` in pinned `C/XzDec.c`: refill at most 256 KiB of packed
+input while retaining decoder state. It preserves whole-block verified output,
+shares header/size/end-marker/filter/check validation with the buffered worker,
+and validates padding before decoding. Memory-limit admission remains the
+existing conservative bound. All 293 selected native tests passed, including
+short and interrupted source reads across multiple input refills, bounded
+allocation assertions, and malformed-block error/delivery comparison against
+the buffered worker. The subsequent 18-row cohort retained all 216 operations
+with matching product lengths and CRC-32 values. T1 saved 43,859,968 bytes on
+the 1 GiB fixture, 29,196,288 bytes on the 16 MiB-block fixture, and 43,843,584
+bytes on the other 256 MiB fixture. Wall and CPU were no worse than baseline
+on all three. Compared with xz, remaining RSS excess is 10,108,928 to
+18,513,920 bytes while wall and CPU are roughly 39% lower. This remaining
+whole-block verified-output cost is recorded for operator consideration; it
+is not a newly accepted exception.
+
+Six multi-worker rows crossed at least one baseline threshold during this
+cohort, which includes recorded compiler/linker interference. They remain
+failed measurements. Samples are retained in
+`mac-fleet-xz-bounded-input-controls.json.zst`, decoded SHA-256
+`f2435339dc1794ddb182e39ccaa9ae51ecb4816c420bb94ddf532d876c9be131`.
+
+The allocation audit found geometric packed-input growth in both indexed
+and adaptive dispatch. The indexed fixture starts with a 14,666,760-byte
+packed block and later blocks are slightly larger; reusing that buffer could
+double its capacity, matching the approximately one-packed-block steps in
+measured peak allocation. Both paths now reserve the known size exactly.
+Deterministic tests seed a buffer one byte short of the required extent and
+assert that capacity does not double. All 294 selected native tests pass.
+The new 18-row cohort uses six repetitions for the prior crossings and three
+elsewhere. All 270 operations preserve product output length and CRC32;
+all 18 rows pass the 3% wall/CPU/RSS limits against the frozen previous
+product. The 1 GiB T8 row saves 126 MiB with wall and CPU within 0.01%.
+The T1 rows still retain 10–18 MiB more than xz for verified block delivery;
+that proposed exception is not accepted. Their wall and CPU are 37–38%
+lower than xz. Sanitized samples and identities are preserved in
+`mac-fleet-xz-exact-packed-controls.json.zst`, decoded SHA-256
+`2d67af9ff83fad852fd964c429eebbc82e8d2e40fc2bf6ea4da28cb5fba9be00`.
+
+### Ordered encoder output: focused Mac gates
+
+The broad ARM sequence was stopped after four completed rows to prioritize
+individual failures. Its remaining finished archive passed integrity checks;
+the partial sequence and earlier failed candidates remain preserved locally.
+The ARM kernel remains diagnostic: its solid-tree improvement does not justify
+its T2 regression against the shipping portable walk.
+
+Memory profiles showed resident empty allocator regions after surplus-output
+release. A first-block-only direct-output candidate failed T8 RSS and is
+retained in the evidence. The next candidate permits any block that already
+owns the next ordered write turn to use `Lzma2Enc_EncodeMt1`'s streaming-output
+mode. Other workers continue encoding to buffers. The write turn remains
+reserved through encoding and ordered draining; admission and output order
+are unchanged. This is a deliberate extension of the SDK dispatcher, using
+the existing SDK subblock encoder, not a claim of an identical dispatcher port.
+Each Rust coder owns its chunk scratch. There is no shared SDK temporary-buffer
+race and no new unsafe block or dependency.
+
+Byte comparisons cover borrowed and owned input, recycled output indices,
+and write errors. The four existing dispatcher tests also pass. The candidate
+is still behind `kernel-ab` and `LZMA_TURBO_ORDERED_DIRECT=1`; default delivery
+is unchanged pending checkpoint validation.
+
+Six measured repeats per arm pass both focused median gates. T8 saves
+37,298,176 bytes against the frozen product; versus 7zz, wall is 0.111% lower,
+CPU 0.478% higher, and RSS 0.266% lower. T4 saves 11,968,512 bytes against the
+frozen product; versus 7zz, wall is 3.023% lower, CPU 0.361% lower, and RSS
+0.159% higher (491,520 bytes). T4 CPU is 1.192% higher than the frozen product,
+within the 3% limit. All product archive hashes match. Compiler interference
+and variable RSS samples are retained, not filtered; these are cohort median
+results rather than promises about every individual run.
+
+Evidence is in `mac-fleet-ordered-output-t8-controls.json.zst` (including the
+failed first-block attempt and initial noisy cohort) and
+`mac-fleet-ordered-output-t4-controls.json.zst`. Zeros T2/T4/T8/full-thread
+controls also pass every baseline and reference wall/CPU/RSS threshold.
+The full-thread checkpoint passes all baseline regression limits, but absolute
+7zz timing gaps remain: solid-tree +3.39% wall / +4.66% CPU, L9 +4.26% / +4.63%,
+and AES +5.32% / +5.25%. AES is +2.17% wall / +2.35% CPU against the frozen
+product. Those are unresolved thresholds, not accepted exceptions. The complete
+checkpoint is retained in `mac-fleet-ordered-output-checkpoint-controls.json.zst`;
+zeros evidence is in `mac-fleet-ordered-output-zeros-controls.json.zst`.
+
+Full-lifetime AES profiles include ciphertext delivery and pass integrity.
+The BT walk and parser dominate both product profiles. AWS-LC CBC has 79
+baseline and 72 candidate top-of-stack samples; memory copying has 47 and 46.
+These perturbed samples are diagnostic counts, not elapsed-time comparisons.
+Source inspection confirms the AES encoder still accumulates 64 KiB batches
+independently of upstream write boundaries. There is no measured basis here
+for changing the cipher backend or batching policy. Preserve the output-memory
+gain while addressing the remaining encoder hotspot. At that checkpoint the
+candidate remained diagnostic; the follow-up below records its promotion.
+
+### ARM negative-offset traversal follow-up
+
+The complete pinned SDK C walk, hand-tuned x86 assembly walk, Rust wrapper,
+held-record consumer, `ReadMatchDistances` and `GetOptimum` were audited before
+the next kernel edit. Parser decisions already follow the SDK. The dominant
+BT path now has an ARM64 port of the hand-tuned negative-offset traversal:
+child-first mismatch handling, direct/cyclic addressing and repeated-node
+copying, with the existing bounded eight-byte match extension. There is no
+thread-count or core-topology dispatch. Earlier C-shaped ports and failed
+candidates remain available and their measurements are retained.
+
+Six native differential tests pass against the checked oracle. Focused
+three-repeat median controls, each after a warmup and with rotated arm order,
+give these differences against 7zz (negative means less resource/time):
+
+| Gate | Wall | CPU | RSS |
+| --- | ---: | ---: | ---: |
+| L5 T2 | -17.62% | -10.63% | +0.41% |
+| Solid tree L5 full threads | -8.54% | -4.36% | -1.63% |
+| L9 full threads | -16.34% | -11.14% | +0.03% |
+| AES L5 full threads | -8.21% | -3.14% | -2.51% |
+| L5 T4 | -9.46% | -4.24% | +0.12% |
+| L5 T8 | -9.60% | -3.50% | +0.07% |
+
+T4/T8 excess RSS is 376,832/409,600 bytes. All gates also pass against the
+same-binary portable walk with ordered output enabled. Zeros at T2/T4/T8/full
+threads pass every timing and RSS threshold; plaintext product archive hashes
+match, and encrypted outputs pass integrity with unchanged sizes. Tree and
+zeros had no detected compiler interference. T2, L9, AES and T4/T8 include
+recorded background builds; their full samples remain available, and the
+apparent speedups must not be presented as clean-machine estimates.
+
+Evidence: `mac-fleet-arm-negative-{t2,tree,l9,aes,rss,zeros}-controls.json.zst`.
+These files retain every sample, load observation, source hash and executable
+identity. The normal macOS ARM build now selects this kernel. Ordered output
+is enabled there only for `SeqOutStream::supports_streamed_blocks` sinks.
+That capability defaults to false: the first promotion attempt exposed a
+legacy `write_vec` ownership regression, fixed without weakening its test.
+Existing custom sinks still receive complete blocks; sevenz's byte bridges
+explicitly opt in. All 239 library tests and 17 sevenz bridge tests pass.
+The ordinary product binary (without `kernel-ab`) passes all five affected
+gates against both the frozen diagnostic candidate and 7zz. Three measured
+repeats follow one warmup; all 60 operations pass archive integrity, with
+identical plaintext product bytes and unchanged encrypted sizes.
+
+| Ordinary product gate | Wall vs 7zz | CPU vs 7zz | RSS vs 7zz |
+| --- | ---: | ---: | ---: |
+| Solid tree L5 full threads | -8.45% | -5.04% | -1.62% |
+| L5 T4 | -9.73% | -5.31% | +0.04% |
+| L5 T8 | -10.84% | -5.39% | +0.06% |
+| AES L5 full threads | -9.81% | -4.76% | -2.53% |
+| L9 full threads | -9.49% | -5.71% | +0.02% |
+
+The largest ordinary-product timing increase against the frozen diagnostic
+candidate is L9 wall +1.07%, within the 3% limit. This checkpoint also includes
+background compiler interference (826 recorded observations); it confirms
+the measured gates, not universal architecture parity or every-run bounds.
+`mac-fleet-arm-negative-product-controls.json.zst` preserves the complete
+checkpoint, failed/passing correctness-log hashes, source identities and
+normal-versus-diagnostic binary hashes. No prior failed cohort was removed.
+The final integration checks also pass: four encoder allocation-failure tests
+and 22 XZ encoder tests, including external xz acceptance and filter chains.
+Formatting/Clippy and end-of-arc Miri remain deferred; neither is claimed here.
+
+### L1 full-thread small output-slot reuse
+
+A focused ordinary-product control confirmed the remaining L1 RSS excess:
+301,826,048 bytes versus 288,292,864 for 7zz (+4.69%), despite 15.01% lower
+wall and 15.68% lower CPU. Paired live heap snapshots show identical major
+finder/input allocation sizes. The product has fewer live output allocations,
+but retains 17.8 MiB in empty resident allocator mappings. The SDK retains its
+per-slot output buffers until stream end rather than cycling them through free
+and calloc. A documented `MADV_ZERO` experiment passed the allocation test but
+saved no median RSS; it was removed and its full failed evidence preserved.
+
+The candidate preserves the SDK's output-slot reuse for Darwin allocations up
+to 8 MiB, retaining the existing reclamation of larger surplus buffers. L1 now
+uses 291,110,912 bytes versus 288,309,248 (+0.97%), saving 10,190,848 bytes from
+the frozen product. Wall is 15.49% lower and CPU 16.86% lower than 7zz, with
+identical product archive hashes. Eighteen output-related tests pass, including
+small-slot address reuse, pending-byte preservation and large-slot release.
+
+The first T4/T8 preservation cohort includes competing compilers and fails
+some baseline thresholds; T8 also exceeds reference RSS by 4.15%. These
+failures remain evidence, not waived results. A paired T8 heap audit shows
+matching live allocation sizes and another empty-mapping difference. Focused
+follow-up validation is required before claiming the large-gate gains remain
+closed. Evidence: `mac-fleet-l1-tall-product-controls.json.zst`,
+`mac-fleet-l1-zero-reclaim-controls.json.zst`, and
+`mac-fleet-l1-small-slot-reuse-controls.json.zst`.
+
+### Explicit ownership of large output mappings
+
+The T8 follow-up reproduced the excess in the frozen product as well as the
+small-slot candidate. A bounded one-spare transfer experiment preserved time
+but still exceeded reference RSS by 4.83%; it was removed and its evidence
+retained. The working fix uses exclusively owned anonymous Darwin mappings
+for large output buffers, only on the opted-in streamed-byte path. Retiring
+a surplus buffer unmaps its pages directly. The SDK's block contents, coder
+concurrency, ordered writer and admission bounds are unchanged. This storage
+policy is an explicitly measured extension, not an upstream allocator port.
+
+Mappings are never converted to Vecs. Legacy ownership-taking sinks retain
+their existing buffers and delivery path. Bounded writes prevent copying
+bridges from making a second whole-block allocation. Other platforms and
+Miri retain the allocator-backed path. Native tests cover zero initialization,
+page-edge sizes, rejected sizes, thread ownership, pending storage, reuse,
+write failure and encoder byte parity. All 242 library tests and 26 sevenz
+writer/bridge tests pass. End-of-arc Miri and capstone linting remain deferred.
+
+| Focused gate | Wall vs 7zz | CPU vs 7zz | RSS vs 7zz | RSS vs frozen product |
+| --- | ---: | ---: | ---: | ---: |
+| L5 T4 | -9.35% | -5.08% | +1.75% | +1.60% |
+| L5 T8 | -9.16% | -3.08% | -3.69% | +0.84% |
+
+Both gates pass all three thresholds against both controls. T8 candidate RSS
+is 619,724,800 bytes; the reference median in that cohort is 643,465,216,
+with a lower reference sample of 614,137,856 also retained. The candidate is
+still within 1% of that lower sample. T4 uses 314,245,120 versus 308,854,784
+bytes. All product archives remain byte-identical. Samples and interference
+observations are retained in `mac-fleet-mapped-output-{t4,t8}-controls.json.zst`;
+the failed large-slot, T8 follow-up and one-spare cohorts remain separate.
+
+
+### Final checkpoint scope
+
+The operator accepted the indexed one-worker XZ verified-output buffer:
+9.7–17.7 MiB above xz, with approximately 37–38% lower wall and CPU.
+It is bounded by the checked block size and memory limit, doubles as the
+dictionary, and preserves checksum validation before block delivery.
+This is a scoped acceptance, not an unbounded-memory allowance.
+
+The final L1 full-thread mapped-output control passes: RSS 291,127,296
+versus 288,342,016 bytes (+0.97%), wall -15.05%, CPU -15.93%.
+
+The operator accepted the tiny plain non-solid full-thread CPU tradeoff on
+2026-10-15 for its 4.62x wall-time improvement. Separate admission,
+consumer and capacity notifications avoid waking unrelated waiters; worker-local
+coders retain reuse without a shared pool lock. Final measured medians are
+0.075205 seconds wall and 0.501194 seconds CPU versus 7zz's 0.347526 and
+0.436541 seconds: 4.62x faster wall, but CPU +14.81%. RSS is 26,755,072
+versus 9,994,240 bytes. Against the frozen product, wall improves 12.56%
+and CPU 17.44%; RSS rises 1,474,560 bytes. The CPU overage is an explicit
+scoped acceptance, not a numeric threshold pass. RSS is bounded by the
+requested worker count and falls under the accepted large-wall-win policy.

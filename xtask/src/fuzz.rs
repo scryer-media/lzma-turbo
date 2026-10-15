@@ -3,8 +3,9 @@
 //! `<workdir>`.
 //!
 //! The budget is *split* between the targets rather than given to each: a
-//! caller asking for half an hour gets half an hour however many targets this
-//! file grows, so the workflow's timeout keeps meaning what it says.
+//! requested mutation time is shared however many targets this file grows.
+//! Compilation, corpus startup and a final in-flight case are additional
+//! wall time, bounded separately by the workflow and per-case timeout.
 //!
 //! Set `LZMA_SDK` (and on x86-64 Linux `LZMA_ORACLE_ASSEMBLER`) to put the
 //! LZMA SDK's own decoders into the comparison; see tools/sdk-oracle/build.rs.
@@ -31,11 +32,26 @@ const WHOLE: u8 = 0x0F;
 /// `encode_differential` the encoders; `encode_round_trip` asks the question
 /// the C cannot answer, which is that whatever this encoder produces, this
 /// crate's own decoders return.
-const TARGETS: &[&str] = &["differential", "encode_round_trip", "encode_differential"];
+const TARGETS: &[&str] = &[
+    "differential",
+    "encode_round_trip",
+    "encode_differential",
+    "decode_lzma",
+    "decode_lzma2",
+    "decode_lzma2_mt",
+    "decode_xz",
+];
 
-/// The shortest slot worth starting: below this libFuzzer spends it loading
-/// the corpus.
-const MIN_SECONDS: u64 = 30;
+fn budgets(seconds: u64) -> Option<Vec<u64>> {
+    let count = TARGETS.len() as u64;
+    // A zero libFuzzer duration means unlimited, not zero work. Refuse a
+    // budget too short to give every target a nonzero finite duration.
+    (seconds >= count).then(|| {
+        (0..count)
+            .map(|i| seconds / count + u64::from(i < seconds % count))
+            .collect()
+    })
+}
 
 pub fn fuzz(mut args: impl Iterator<Item = String>) -> ExitCode {
     let (Some(seconds), Some(work)) = (args.next(), args.next()) else {
@@ -46,6 +62,13 @@ pub fn fuzz(mut args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("xtask fuzz: <seconds> must be a number");
         return ExitCode::from(2);
     };
+    let Some(budgets) = budgets(seconds) else {
+        eprintln!(
+            "xtask fuzz: need at least {} seconds for all targets",
+            TARGETS.len()
+        );
+        return ExitCode::from(2);
+    };
     let root = repo_root();
     let work = Path::new(&work);
     let artifacts = work.join("artifacts");
@@ -54,8 +77,8 @@ pub fn fuzz(mut args: impl Iterator<Item = String>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let each = (seconds / TARGETS.len() as u64).max(MIN_SECONDS);
-    for target in TARGETS {
+    let mut failures = Vec::new();
+    for (target, each) in TARGETS.iter().zip(budgets) {
         let corpus = work.join(target);
         if let Err(e) = fs::create_dir_all(&corpus) {
             eprintln!("xtask fuzz: create {}: {e}", corpus.display());
@@ -68,14 +91,19 @@ pub fn fuzz(mut args: impl Iterator<Item = String>) -> ExitCode {
         println!("== {target}: {each}s");
         match run(&root, target, &corpus, &artifacts, each) {
             Ok(true) => {}
-            Ok(false) => return ExitCode::FAILURE,
+            Ok(false) => failures.push(*target),
             Err(e) => {
                 eprintln!("xtask fuzz: {e}");
-                return ExitCode::FAILURE;
+                failures.push(*target);
             }
         }
     }
-    ExitCode::SUCCESS
+    if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("xtask fuzz: failing targets: {}", failures.join(", "));
+        ExitCode::FAILURE
+    }
 }
 
 /// `cargo xtask fuzz-check`: every target compiled, none run.
@@ -112,8 +140,53 @@ fn seed(root: &Path, target: &str, corpus: &Path) -> Result<(), String> {
         // The two encode targets read a settings prefix of their own length.
         "encode_round_trip" => seed_encode(root, corpus, 4),
         "encode_differential" => seed_encode(root, corpus, 6),
+        "decode_lzma" => seed_container(root, corpus, "lzma", &[0, 3]),
+        "decode_xz" => seed_container(root, corpus, "xz", &[0, 18]),
+        "decode_lzma2" => seed_lzma2(root, corpus, false),
+        "decode_lzma2_mt" => seed_lzma2(root, corpus, true),
         other => Err(format!("no seeds defined for {other}")),
     }
+}
+
+fn seed_container(
+    root: &Path,
+    corpus: &Path,
+    extension: &str,
+    shapes: &[u8],
+) -> Result<(), String> {
+    for path in entries(&root.join("tests/data"))? {
+        if !path.extension().is_some_and(|e| e == extension) {
+            continue;
+        }
+        let data = fs::read(&path).map_err(|e| e.to_string())?;
+        for &shape in shapes {
+            let mut seed = vec![shape];
+            seed.extend_from_slice(&data);
+            write_seed(corpus, &format!("shape-{shape}-{}", name_of(&path)), &seed)?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_lzma2(root: &Path, corpus: &Path, threaded: bool) -> Result<(), String> {
+    for path in entries(&root.join("fuzz/corpus/decode_lzma2"))? {
+        let data = fs::read(&path).map_err(|e| e.to_string())?;
+        if data.len() < 2 {
+            return Err(format!("malformed LZMA2 seed {}", name_of(&path)));
+        }
+        if threaded {
+            // Unlike decode_lzma2's two-byte <shape,dict> prefix, the MT
+            // target reads <threads/chase,dict,feed>. Preserve raw framing.
+            for (mode, feed) in [(3, 3), (0x83, 1)] {
+                let mut seed = vec![mode, data[1], feed];
+                seed.extend_from_slice(&data[2..]);
+                write_seed(corpus, &format!("mode-{mode}-{}", name_of(&path)), &seed)?;
+            }
+        } else {
+            write_seed(corpus, &name_of(&path), &data)?;
+        }
+    }
+    Ok(())
 }
 
 fn seed_differential(root: &Path, corpus: &Path) -> Result<(), String> {
@@ -216,9 +289,101 @@ fn run(
         .arg("--")
         .arg(format!("-max_total_time={seconds}"))
         .arg("-max_len=65536")
+        .arg("-timeout=30")
+        .arg("-rss_limit_mb=1024")
         .arg(format!("-artifact_prefix={artifact_prefix}"))
         .current_dir(root.join("fuzz"))
         .status()
         .map_err(|e| format!("cannot run cargo fuzz: {e}"))?;
     Ok(status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_registered_fuzz_binary_gets_a_finite_budget() {
+        let manifest = include_str!("../../fuzz/Cargo.toml");
+        let mut registered: Vec<_> = manifest
+            .split("[[bin]]")
+            .skip(1)
+            .map(|section| {
+                section
+                    .lines()
+                    .find_map(|line| {
+                        line.trim()
+                            .strip_prefix("name = ")
+                            .map(|name| name.trim_matches('"'))
+                    })
+                    .expect("every fuzz binary has a name")
+            })
+            .collect();
+        registered.sort_unstable();
+        let mut scheduled = TARGETS.to_vec();
+        scheduled.sort_unstable();
+        assert_eq!(
+            registered, scheduled,
+            "a fuzz binary was omitted or scheduled twice"
+        );
+        for seconds in 0..=240 {
+            match budgets(seconds) {
+                None => assert!(seconds < registered.len() as u64),
+                Some(slots) => {
+                    assert_eq!(slots.len(), registered.len());
+                    assert!(slots.iter().all(|&seconds| seconds > 0));
+                    assert_eq!(slots.iter().sum::<u64>(), seconds);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_scheduled_target_has_seeds_with_the_right_framing() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("fuzz-seed-contract-{}-{nonce}", std::process::id());
+        let scratch = Scratch(env::temp_dir().join(name));
+        fs::create_dir(&scratch.0).unwrap();
+        let root = repo_root();
+        for target in TARGETS {
+            let corpus = scratch.0.join(target);
+            fs::create_dir(&corpus).unwrap();
+            seed(&root, target, &corpus).unwrap();
+            assert!(
+                !entries(&corpus).unwrap().is_empty(),
+                "{target} has no seeds"
+            );
+        }
+        let original = fs::read(root.join("fuzz/corpus/decode_lzma2/mixed.lzma2.seed")).unwrap();
+        for mode in [3, 0x83] {
+            let changed = fs::read(
+                scratch
+                    .0
+                    .join("decode_lzma2_mt")
+                    .join(format!("mode-{mode}-mixed.lzma2.seed")),
+            )
+            .unwrap();
+            assert_eq!(changed[0], mode);
+            assert_eq!(changed[1], original[1]);
+            assert_eq!(changed[2], if mode == 3 { 3 } else { 1 });
+            assert_eq!(&changed[3..], &original[2..]);
+        }
+        for (target, extension, shape) in [("decode_lzma", "lzma", 3), ("decode_xz", "xz", 18)] {
+            let name = format!("tiny.p1.{extension}");
+            let original = fs::read(root.join("tests/data").join(&name)).unwrap();
+            let seed =
+                fs::read(scratch.0.join(target).join(format!("shape-{shape}-{name}"))).unwrap();
+            assert_eq!(seed[0], shape);
+            assert_eq!(&seed[1..], &original);
+        }
+    }
 }

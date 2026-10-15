@@ -135,7 +135,11 @@ struct SolidStream {
 }
 
 impl SolidStream {
-    fn push(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    fn push(
+        &mut self,
+        data: &[u8],
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<(), Error> {
         // §3.4: the check covers what came in, before the filters.
         self.check.update(data);
         self.uncompressed += data.len() as u64;
@@ -151,6 +155,22 @@ impl SolidStream {
                 Ok(())
             }
             None => self.pipe.write(data, out),
+        }
+    }
+}
+
+impl SolidStream {
+    fn push_owned(
+        &mut self,
+        held: Vec<u8>,
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<(), Error> {
+        if self.convs.is_some() {
+            self.push(&held, out)
+        } else {
+            self.check.update(&held);
+            self.uncompressed += held.len() as u64;
+            self.pipe.write_owned(held, out)
         }
     }
 }
@@ -213,7 +233,7 @@ pub struct XzEncoder {
     /// One LZMA2 encoder per block thread, built on first use and reused
     /// across batches — the dictionary and hash tables are the expensive part.
     #[cfg(feature = "std")]
-    pool: Vec<Lzma2Encoder>,
+    pool: Vec<(Lzma2Encoder, Vec<u8>)>,
 }
 
 impl XzEncoder {
@@ -456,6 +476,86 @@ impl XzEncoder {
         Ok(())
     }
 
+    /// The Write adapter drains a solid stream as it is produced, including
+    /// while handing off the initial dictionary. Buffered callers keep push.
+    pub(crate) fn push_to(
+        &mut self,
+        mut data: &[u8],
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<(), Error> {
+        if self.finished {
+            return Err(Error::Param);
+        }
+        out.write(&self.out)?;
+        self.out.clear();
+        if let Some(stream) = &mut self.stream {
+            return stream.push(data, out);
+        }
+        if self.block_size == DEFAULT_BLOCK_SIZE && self.may_stream {
+            let room = self
+                .solid_threshold
+                .saturating_sub(self.pending.len() as u64);
+            let take = core::cmp::min(room, data.len() as u64) as usize;
+            self.reserve_pending(take, self.solid_threshold)?;
+            self.pending.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if data.is_empty() {
+                return Ok(());
+            }
+            #[cfg(feature = "std")]
+            self.flush_queue_to(out)?;
+            self.start_stream_with(|stream, held, pending| {
+                out.write(pending)?;
+                pending.clear();
+                stream.push_owned(held, out)
+            })?;
+            if let Some(stream) = &mut self.stream {
+                return stream.push(data, out);
+            }
+        }
+        while !data.is_empty() {
+            let room = self.block_size.saturating_sub(self.pending.len() as u64);
+            let take = core::cmp::min(room, data.len() as u64) as usize;
+            self.reserve_pending(take, self.block_size)?;
+            self.pending.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.pending.len() as u64 >= self.block_size {
+                self.block_ready_to(out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// C: XzEnc_MtCallback_Write delivers completed blocks directly, without
+    /// copying a batch into an aggregate output allocation.
+    fn block_ready_to(&mut self, out: &mut impl super::stream::SeqOutStream) -> Result<(), Error> {
+        #[cfg(feature = "std")]
+        if self.threads > 1 {
+            self.queue.try_reserve(1).map_err(|_| Error::Alloc)?;
+            self.queue.push(core::mem::take(&mut self.pending));
+            if self.queue.len() >= self.threads {
+                self.flush_queue_to(out)?;
+            }
+            self.pending = self.spares.pop().unwrap_or_default();
+            self.pending.clear();
+            return Ok(());
+        }
+        let data = core::mem::take(&mut self.pending);
+        let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
+        let block = compress_block(
+            lzma2,
+            self.check,
+            &self.filters,
+            self.dict_prop,
+            data,
+            Vec::new(),
+        )?;
+        self.append_block_to(block, out)?;
+        self.pending = core::mem::take(&mut self.spare);
+        self.pending.clear();
+        Ok(())
+    }
+
     /// [`XzEncoder::pending`] holds a whole block: compress it now, or queue
     /// it for the next parallel batch.
     fn block_ready(&mut self) -> Result<(), Error> {
@@ -480,16 +580,16 @@ impl XzEncoder {
     /// exactly as [`XzEncoder::emit_block`] builds them, so a block's bytes do
     /// not depend on which thread produced it or on what came before.
     #[cfg(feature = "std")]
-    fn flush_queue(&mut self) -> Result<(), Error> {
+    fn compress_queue(&mut self) -> Result<Vec<Result<Block, Error>>, Error> {
         if self.queue.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let dict_prop = self.dict_prop;
         let want = self.queue.len();
         while self.pool.len() < want {
             self.pool.try_reserve(1).map_err(|_| Error::Alloc)?;
             let enc = Lzma2Encoder::new(&self.props)?;
-            self.pool.push(enc);
+            self.pool.push((enc, Vec::new()));
         }
 
         let (check, filters) = (self.check, &self.filters);
@@ -499,9 +599,12 @@ impl XzEncoder {
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(want);
-            for (enc, data) in self.pool.iter_mut().zip(queue) {
+            for ((enc, packed), data) in self.pool.iter_mut().zip(queue) {
+                let packed = core::mem::take(packed);
                 handles.push(
-                    scope.spawn(move || compress_block(enc, check, filters, dict_prop, data)),
+                    scope.spawn(move || {
+                        compress_block(enc, check, filters, dict_prop, data, packed)
+                    }),
                 );
             }
             for h in handles {
@@ -509,6 +612,13 @@ impl XzEncoder {
             }
         });
 
+        Ok(done)
+    }
+
+    #[cfg(feature = "std")]
+    fn flush_queue(&mut self) -> Result<(), Error> {
+        let done = self.compress_queue()?;
+        let want = done.len();
         let total = done
             .iter()
             .filter_map(|block| block.as_ref().ok())
@@ -520,8 +630,21 @@ impl XzEncoder {
             .try_reserve_exact(total)
             .map_err(|_| Error::Alloc)?;
         self.spares.try_reserve(want).map_err(|_| Error::Alloc)?;
-        for block in done {
-            self.append_block(block?)?;
+        for (index, block) in done.into_iter().enumerate() {
+            self.pool[index].1 = self.append_block(block?)?;
+            self.spares.push(core::mem::take(&mut self.spare));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    fn flush_queue_to(&mut self, out: &mut impl super::stream::SeqOutStream) -> Result<(), Error> {
+        let done = self.compress_queue()?;
+        self.spares
+            .try_reserve(done.len())
+            .map_err(|_| Error::Alloc)?;
+        for (index, block) in done.into_iter().enumerate() {
+            self.pool[index].1 = self.append_block_to(block?, out)?;
             self.spares.push(core::mem::take(&mut self.spare));
         }
         Ok(())
@@ -554,6 +677,34 @@ impl XzEncoder {
         Ok(())
     }
 
+    /// C: Xz_CompressBlock streams its packed bytes to ISeqOutStream before
+    /// emitting the check and index. The Write adapter must do the same at
+    /// EOF instead of accumulating the remaining dictionary in a Vec.
+    pub(crate) fn finish_to(
+        &mut self,
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<(), Error> {
+        if self.finished {
+            return Err(Error::Param);
+        }
+        out.write(&self.out)?;
+        self.out.clear();
+        if let Some(stream) = self.stream.take() {
+            let record = Self::finish_stream_output(self.check, stream, out)?;
+            self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
+            self.records.push(record);
+        }
+        if !self.pending.is_empty() {
+            self.block_ready_to(out)?;
+        }
+        #[cfg(feature = "std")]
+        self.flush_queue_to(out)?;
+        self.finish()?;
+        out.write(&self.out)?;
+        self.out.clear();
+        Ok(())
+    }
+
     /// Spec §2.1.1: the magic, the stream flags, and a CRC-32 over the flags.
     fn write_stream_header(&mut self) {
         self.out.extend_from_slice(&XZ_MAGIC);
@@ -575,7 +726,14 @@ impl XzEncoder {
     fn emit_block(&mut self) -> Result<(), Error> {
         let data = core::mem::take(&mut self.pending);
         let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
-        let block = compress_block(lzma2, self.check, &self.filters, self.dict_prop, data)?;
+        let block = compress_block(
+            lzma2,
+            self.check,
+            &self.filters,
+            self.dict_prop,
+            data,
+            Vec::new(),
+        )?;
         // Keep the block's buffer for the next one; the filters worked in
         // place, so it is the right size already.
         self.append_block(block)?;
@@ -591,6 +749,13 @@ impl XzEncoder {
     /// If no thread can be started the encoder comes back, nothing is
     /// written, and the block is held and compressed at the end as before.
     fn start_stream(&mut self) -> Result<(), Error> {
+        self.start_stream_with(|stream, held, out| stream.push_owned(held, out))
+    }
+
+    fn start_stream_with(
+        &mut self,
+        deliver: impl FnOnce(&mut SolidStream, Vec<u8>, &mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         // Whole blocks queued under an earlier block size come first: the
         // streaming block writes straight into the output from here on.
         #[cfg(feature = "std")]
@@ -626,52 +791,83 @@ impl XzEncoder {
         let held = core::mem::take(&mut self.pending);
         self.spare = Vec::new();
         #[cfg(feature = "std")]
-        self.spares.clear();
-        if stream.convs.is_some() {
-            stream.push(&held, &mut self.out)?;
-        } else {
-            stream.check.update(&held);
-            stream.uncompressed = held.len() as u64;
-            stream.pipe.write_owned(held, &mut self.out)?;
+        {
+            self.spares.clear();
+            // The streaming block owns the rest of the input even if the
+            // caller changes block size again. All batch workers have joined,
+            // so their coders and packed buffers cannot be reused afterward.
+            self.pool.clear();
         }
+        deliver(&mut stream, held, &mut self.out)?;
         self.stream = Some(stream);
         Ok(())
     }
 
     /// Ends the streaming solid block: flushes the filters, waits for the
     /// encoder, then pads, appends the check, and records the block.
-    fn finish_stream(&mut self, mut stream: SolidStream) -> Result<(), Error> {
-        if let Some(convs) = &mut stream.convs {
-            stream.converted.clear();
-            convs.encode_finish(&[], &mut stream.converted);
-            stream.pipe.write(&stream.converted, &mut self.out)?;
-        }
-        let compressed = stream.pipe.finish(&mut self.out)?;
-        // §3.2 Block Padding, over the compressed size.
-        pad_to_four(&mut self.out, (compressed % 4) as usize);
-        stream.check.finish(&mut self.out);
-        let unpadded = stream.header_len as u64 + compressed + check_size(self.check) as u64;
+    fn finish_stream(&mut self, stream: SolidStream) -> Result<(), Error> {
+        let record = Self::finish_stream_output(self.check, stream, &mut self.out)?;
         self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
-        self.records.push((unpadded, stream.uncompressed));
+        self.records.push(record);
         Ok(())
     }
 
+    fn finish_stream_output(
+        check: CheckType,
+        mut stream: SolidStream,
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<(u64, u64), Error> {
+        if let Some(convs) = &mut stream.convs {
+            stream.converted.clear();
+            convs.encode_finish(&[], &mut stream.converted);
+            stream.pipe.write(&stream.converted, out)?;
+        }
+        let compressed = stream.pipe.finish(out)?;
+        // §3.2 Block Padding, over the compressed size.
+        let mut trailer = Vec::new();
+        pad_to_four(&mut trailer, (compressed % 4) as usize);
+        stream.check.finish(&mut trailer);
+        out.write(&trailer)?;
+        let unpadded = stream.header_len as u64 + compressed + check_size(check) as u64;
+        Ok((unpadded, stream.uncompressed))
+    }
+
     /// Appends one already-compressed block and records it for the index.
-    fn append_block(&mut self, block: Block) -> Result<(), Error> {
+    fn append_block(&mut self, block: Block) -> Result<Vec<u8>, Error> {
         self.out
             .try_reserve(block.unpadded + 3)
             .map_err(|_| Error::Alloc)?;
         self.out.extend_from_slice(&block.header);
-        self.out.extend_from_slice(&block.compressed);
+        self.out
+            .extend_from_slice(&block.compressed[..block.packed_size]);
         // §3.2 Block Padding: null bytes up to a multiple of four.
-        pad_to_four(&mut self.out, block.compressed.len());
+        pad_to_four(&mut self.out, block.packed_size);
         self.out.extend_from_slice(&block.check_bytes);
 
         self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
         self.records
             .push((block.unpadded as u64, block.uncompressed));
         self.spare = block.data;
-        Ok(())
+        Ok(block.compressed)
+    }
+
+    /// C: XzEnc_MtCallback_Write. Header, payload, padding and check retain
+    /// the buffered encoding's exact byte order and index record.
+    fn append_block_to(
+        &mut self,
+        block: Block,
+        out: &mut impl super::stream::SeqOutStream,
+    ) -> Result<Vec<u8>, Error> {
+        self.records.try_reserve(1).map_err(|_| Error::Alloc)?;
+        out.write(&block.header)?;
+        out.write(&block.compressed[..block.packed_size])?;
+        let padding = (4 - block.packed_size % 4) % 4;
+        out.write(&[0; 3][..padding])?;
+        out.write(&block.check_bytes)?;
+        self.records
+            .push((block.unpadded as u64, block.uncompressed));
+        self.spare = block.data;
+        Ok(block.compressed)
     }
 
     /// Spec §4: the index, and the size it will make the footer declare.
@@ -719,6 +915,7 @@ impl XzEncoder {
 struct Block {
     header: Vec<u8>,
     compressed: Vec<u8>,
+    packed_size: usize,
     check_bytes: Vec<u8>,
     unpadded: usize,
     uncompressed: u64,
@@ -756,6 +953,7 @@ fn compress_block(
     filters: &[FilterFlags],
     dict_prop: u8,
     mut data: Vec<u8>,
+    packed: Vec<u8>,
 ) -> Result<Block, Error> {
     let uncompressed = data.len() as u64;
 
@@ -775,17 +973,22 @@ fn compress_block(
     }
 
     lzma2.set_data_size(uncompressed);
-    let compressed = lzma2.encode_to_vec(&data)?;
+    #[cfg(feature = "std")]
+    let (compressed, packed_size) = lzma2.encode_solid_reusing(&data, packed)?;
+    #[cfg(not(feature = "std"))]
+    let (compressed, packed_size) = {
+        drop(packed);
+        let compressed = lzma2.encode_to_vec(&data)?;
+        let packed_size = compressed.len();
+        (compressed, packed_size)
+    };
 
-    let header = block_header(
-        filters,
-        dict_prop,
-        Some((compressed.len() as u64, uncompressed)),
-    )?;
-    let unpadded = header.len() + compressed.len() + check_size(check);
+    let header = block_header(filters, dict_prop, Some((packed_size as u64, uncompressed)))?;
+    let unpadded = header.len() + packed_size + check_size(check);
     Ok(Block {
         header,
         compressed,
+        packed_size,
         check_bytes,
         unpadded,
         uncompressed,

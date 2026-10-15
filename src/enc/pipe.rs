@@ -21,6 +21,7 @@
 //! the input and encoding it at the end.
 
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use alloc::boxed::Box;
@@ -38,9 +39,35 @@ const CHUNK: usize = 256 << 10;
 /// Full chunks the input channel holds before a write blocks.
 const INPUT_DEPTH: usize = 2;
 
+/// Bound output even while the caller is trying to feed a full input queue.
+const OUTPUT_DEPTH: usize = 2;
+
 /// The encoder's output is batched to about this much per message, so a run
 /// of small range-coder flushes is not one message each.
 const OUT_BATCH: usize = 64 << 10;
+
+/// A common wakeup for input room, output availability and worker exit.
+/// Queue checks and sleeping share this lock so notifications cannot be lost.
+#[derive(Default)]
+struct Activity {
+    gate: Mutex<()>,
+    changed: Condvar,
+}
+
+impl Activity {
+    fn notify(&self) {
+        let _guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_one();
+    }
+}
+
+struct WorkerEnd(Arc<Activity>);
+
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
 
 /// The encoder's view of the input channel.
 ///
@@ -49,6 +76,7 @@ const OUT_BATCH: usize = 64 << 10;
 /// than left to finish a stream nobody will read.
 struct Source {
     rx: Receiver<Vec<u8>>,
+    activity: Arc<Activity>,
     /// Spent chunks go back to the writer to be refilled.
     spent: Sender<Vec<u8>>,
     cur: Vec<u8>,
@@ -75,7 +103,9 @@ impl SeqInStream for Source {
                 let _ = self.spent.send(done);
             }
             self.pos = 0;
-            match self.rx.recv() {
+            let received = self.rx.recv();
+            self.activity.notify();
+            match received {
                 Ok(chunk) if chunk.is_empty() => {
                     self.ended = true;
                     return Ok(0);
@@ -89,7 +119,8 @@ impl SeqInStream for Source {
 
 /// The encoder's view of the output channel.
 struct Sink {
-    tx: Sender<Vec<u8>>,
+    tx: SyncSender<Vec<u8>>,
+    activity: Arc<Activity>,
     spare: Receiver<Vec<u8>>,
     buf: Vec<u8>,
 }
@@ -101,7 +132,9 @@ impl Sink {
         }
         let full = core::mem::take(&mut self.buf);
         // The receiver is gone only if the writer was dropped mid-stream.
-        self.tx.send(full).map_err(|_| Error::Write)
+        self.tx.send(full).map_err(|_| Error::Write)?;
+        self.activity.notify();
+        Ok(())
     }
 }
 
@@ -126,6 +159,7 @@ impl SeqOutStream for Sink {
 
 /// One LZMA2 stream being encoded on its own thread from pushed input.
 pub(crate) struct Lzma2Pipe {
+    activity: Arc<Activity>,
     /// `None` once [`Lzma2Pipe::finish`] has sent the end of the input.
     input: Option<SyncSender<Vec<u8>>>,
     spent: Receiver<Vec<u8>>,
@@ -148,17 +182,23 @@ impl Lzma2Pipe {
     pub(crate) fn start(enc: Lzma2Encoder) -> Result<Self, Box<Lzma2Encoder>> {
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH);
         let (spent_tx, spent_rx) = mpsc::channel::<Vec<u8>>();
-        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+        let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_DEPTH);
         let (recycled_tx, recycled_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH + 1);
         // The encoder goes over only once the thread exists, so that a failed
         // spawn - whose closure is dropped - does not take it down with it.
         let (enc_tx, enc_rx) = mpsc::sync_channel::<Lzma2Encoder>(1);
+        let activity = Arc::new(Activity::default());
+        let worker_activity = Arc::clone(&activity);
         let spawned = std::thread::Builder::new()
             .name("lzma-turbo lzma2 encoder".into())
             .spawn(move || {
+                // Declared first, dropped after source and sink close their
+                // channels, including on a panic.
+                let _end = WorkerEnd(Arc::clone(&worker_activity));
                 let mut enc = enc_rx.recv().map_err(|_| Error::InternalFailure)?;
                 let mut source = Source {
                     rx: input_rx,
+                    activity: Arc::clone(&worker_activity),
                     spent: spent_tx,
                     cur: Vec::new(),
                     pos: 0,
@@ -166,6 +206,7 @@ impl Lzma2Pipe {
                 };
                 let mut sink = Sink {
                     tx: output_tx,
+                    activity: worker_activity,
                     spare: recycled_rx,
                     buf: Vec::new(),
                 };
@@ -184,6 +225,7 @@ impl Lzma2Pipe {
             return Err(Box::new(enc));
         }
         Ok(Lzma2Pipe {
+            activity,
             input: Some(input_tx),
             spent: spent_rx,
             output: output_rx,
@@ -200,7 +242,11 @@ impl Lzma2Pipe {
     /// # Errors
     ///
     /// The encoder's error if it has stopped, or [`Error::Alloc`].
-    pub(crate) fn write(&mut self, mut data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    pub(crate) fn write(
+        &mut self,
+        mut data: &[u8],
+        out: &mut impl SeqOutStream,
+    ) -> Result<(), Error> {
         while !data.is_empty() {
             if self.fill.capacity() == 0 {
                 self.fill = match self.spent.try_recv() {
@@ -232,7 +278,11 @@ impl Lzma2Pipe {
     /// # Errors
     ///
     /// As [`Lzma2Pipe::write`].
-    pub(crate) fn write_owned(&mut self, data: Vec<u8>, out: &mut Vec<u8>) -> Result<(), Error> {
+    pub(crate) fn write_owned(
+        &mut self,
+        data: Vec<u8>,
+        out: &mut impl SeqOutStream,
+    ) -> Result<(), Error> {
         self.send_fill(out)?;
         if !data.is_empty() {
             self.send(data, out)?;
@@ -248,7 +298,7 @@ impl Lzma2Pipe {
     ///
     /// Whatever the encoder returned, or [`Error::InternalFailure`] if its
     /// thread panicked.
-    pub(crate) fn finish(mut self, out: &mut Vec<u8>) -> Result<u64, Error> {
+    pub(crate) fn finish(mut self, out: &mut impl SeqOutStream) -> Result<u64, Error> {
         self.send_fill(out)?;
         // An empty chunk is the end of the input.
         self.send(Vec::new(), out)?;
@@ -264,7 +314,7 @@ impl Lzma2Pipe {
     }
 
     /// Sends the chunk being filled, if there is anything in it.
-    fn send_fill(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
+    fn send_fill(&mut self, out: &mut impl SeqOutStream) -> Result<(), Error> {
         if self.fill.is_empty() {
             return Ok(());
         }
@@ -272,28 +322,59 @@ impl Lzma2Pipe {
         self.send(part, out)
     }
 
-    fn send(&mut self, chunk: Vec<u8>, out: &mut Vec<u8>) -> Result<(), Error> {
-        let sent = match &self.input {
-            Some(input) => input.send(chunk).is_ok(),
-            None => false,
-        };
-        if !sent {
-            return Err(self.stopped());
+    fn send(&mut self, mut chunk: Vec<u8>, out: &mut impl SeqOutStream) -> Result<(), Error> {
+        let activity = Arc::clone(&self.activity);
+        loop {
+            let guard = activity.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(input) = &self.input else {
+                drop(guard);
+                return Err(self.stopped());
+            };
+            match input.try_send(chunk) {
+                Ok(()) => {
+                    drop(guard);
+                    return self.drain(out);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    drop(guard);
+                    return Err(self.stopped());
+                }
+                Err(mpsc::TrySendError::Full(pending)) => chunk = pending,
+            }
+            // Both channels can be full: waiting only for input room would
+            // deadlock a producer waiting to deliver output. Wake on either
+            // queue changing, without polling delays on compressible input.
+            match self.output.try_recv() {
+                Ok(produced) => {
+                    drop(guard);
+                    self.append(produced, out)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    drop(
+                        activity
+                            .changed
+                            .wait(guard)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    drop(guard);
+                    return Err(self.stopped());
+                }
+            }
         }
-        self.drain(out)
     }
 
     /// Appends whatever output is ready without waiting for more.
-    fn drain(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
+    fn drain(&mut self, out: &mut impl SeqOutStream) -> Result<(), Error> {
         while let Ok(chunk) = self.output.try_recv() {
             self.append(chunk, out)?;
         }
         Ok(())
     }
 
-    fn append(&mut self, chunk: Vec<u8>, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.try_reserve(chunk.len()).map_err(|_| Error::Alloc)?;
-        out.extend_from_slice(&chunk);
+    fn append(&mut self, chunk: Vec<u8>, out: &mut impl SeqOutStream) -> Result<(), Error> {
+        out.write(&chunk)?;
         self.produced += chunk.len() as u64;
         // Recycling never waits for the producer, including during shutdown.
         // The bounded return queue releases surplus allocations after a burst.
@@ -316,12 +397,110 @@ impl Lzma2Pipe {
 mod tests {
     use super::*;
 
+    // Start with both queues full. The worker must deliver another output
+    // before consuming input: waiting only for input room would deadlock.
+    fn full_duplex_pipe(panic_after_output: bool) -> Lzma2Pipe {
+        let activity = Arc::new(Activity::default());
+        let (input, rx) = mpsc::sync_channel(1);
+        input.send(vec![1]).unwrap();
+        let (tx, output) = mpsc::sync_channel(1);
+        tx.send(vec![11]).unwrap();
+        let (spent_tx, spent) = mpsc::channel();
+        let (recycled_output, spare) = mpsc::sync_channel(1);
+        let worker_activity = Arc::clone(&activity);
+        let worker = std::thread::spawn(move || {
+            let _end = WorkerEnd(Arc::clone(&worker_activity));
+            let mut source = Source {
+                rx,
+                activity: Arc::clone(&worker_activity),
+                spent: spent_tx,
+                cur: Vec::new(),
+                pos: 0,
+                ended: false,
+            };
+            let mut sink = Sink {
+                tx,
+                activity: worker_activity,
+                spare,
+                buf: vec![22],
+            };
+            sink.flush()?;
+            assert!(!panic_after_output, "injected worker panic");
+            let mut byte = [0];
+            assert_eq!(source.read(&mut byte)?, 1);
+            assert_eq!(byte, [1]);
+            assert_eq!(source.read(&mut byte)?, 1);
+            assert_eq!(byte, [2]);
+            assert_eq!(source.read(&mut byte)?, 0);
+            Ok(())
+        });
+        Lzma2Pipe {
+            activity,
+            input: Some(input),
+            spent,
+            output,
+            recycled_output,
+            worker: Some(worker),
+            fill: Vec::new(),
+            produced: 0,
+        }
+    }
+
+    #[test]
+    fn full_duplex_queues_deliver_and_finish_without_input_only_waits() {
+        let (done, completed) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let mut pipe = full_duplex_pipe(false);
+            let mut output = Vec::new();
+            pipe.send(vec![2], &mut output).unwrap();
+            assert_eq!(pipe.finish(&mut output).unwrap(), 2);
+            assert_eq!(output, [11, 22]);
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("duplex delivery deadlocked");
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn worker_panic_wakes_a_sender_with_full_input() {
+        let (done, completed) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let mut pipe = full_duplex_pipe(true);
+            let mut output = Vec::new();
+            assert_eq!(pipe.send(vec![2], &mut output), Err(Error::InternalFailure));
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker exit did not wake the sender");
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_a_pipe_releases_a_worker_blocked_on_output() {
+        let (done, completed) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let mut pipe = full_duplex_pipe(false);
+            let worker = pipe.worker.take().unwrap();
+            drop(pipe);
+            assert_eq!(worker.join().unwrap(), Err(Error::Write));
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("cancelled worker remained blocked on output");
+        driver.join().unwrap();
+    }
+
     #[test]
     fn block_delivery_preserves_initialized_storage_even_on_error() {
-        let (tx, output) = mpsc::channel();
+        let (tx, output) = mpsc::sync_channel(OUTPUT_DEPTH);
         let (_return_tx, spare) = mpsc::channel();
         let mut sink = Sink {
             tx,
+            activity: Arc::new(Activity::default()),
             spare,
             buf: Vec::new(),
         };

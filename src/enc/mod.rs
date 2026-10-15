@@ -24,6 +24,8 @@ mod lz_find;
 mod lz_find_mt;
 mod lzma2_enc;
 mod lzma_enc;
+#[cfg(all(feature = "std", target_os = "macos", not(miri)))]
+mod mapped_output;
 mod match_run;
 #[cfg(feature = "std")]
 mod mt_coder;

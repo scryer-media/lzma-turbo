@@ -325,9 +325,28 @@ impl<W: Write> XzWriter<W> {
     ///
     /// Whatever the encoder or the wrapped writer returns.
     pub fn finish(mut self) -> io::Result<W> {
-        self.enc.finish().map_err(io)?;
         self.drain()?;
         let mut inner = self.inner.take().expect("finish once");
+        // Keep the caller's original I/O error, including its kind and payload.
+        struct Output<'a, W> {
+            inner: &'a mut W,
+            error: Option<io::Error>,
+        }
+        impl<W: Write> super::stream::SeqOutStream for Output<'_, W> {
+            fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+                self.inner.write_all(data).map_err(|error| {
+                    self.error = Some(error);
+                    Error::Write
+                })
+            }
+        }
+        let mut output = Output {
+            inner: &mut inner,
+            error: None,
+        };
+        if let Err(error) = self.enc.finish_to(&mut output) {
+            return Err(output.error.unwrap_or_else(|| io(error)));
+        }
         inner.flush()?;
         Ok(inner)
     }
@@ -356,7 +375,41 @@ impl<W: Write> Write for XzWriter<W> {
     /// before any of `buf` is taken.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.drain()?;
-        self.enc.push(buf).map_err(io)?;
+        struct Output<'a, W> {
+            inner: &'a mut W,
+            pending: &'a mut Vec<u8>,
+        }
+        impl<W: Write> super::stream::SeqOutStream for Output<'_, W> {
+            fn write(&mut self, mut data: &[u8]) -> Result<(), Error> {
+                if self.pending.is_empty() {
+                    while !data.is_empty() {
+                        match self.inner.write(data) {
+                            Ok(0) => break,
+                            Ok(n) => data = &data[n..],
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                // Input was already accepted. Retain exactly the unwritten
+                // suffix for drain's next attempt, as the buffered adapter
+                // does, without duplicating bytes after a partial write.
+                self.pending
+                    .try_reserve(data.len())
+                    .map_err(|_| Error::Alloc)?;
+                self.pending.extend_from_slice(data);
+                Ok(())
+            }
+        }
+        self.enc
+            .push_to(
+                buf,
+                &mut Output {
+                    inner: self.inner.as_mut().expect("open"),
+                    pending: &mut self.out,
+                },
+            )
+            .map_err(io)?;
         // `buf` is taken; what `inner` refuses now stays held, and the next
         // `write`, `flush` or `finish` returns the error.
         let _ = self.drain();

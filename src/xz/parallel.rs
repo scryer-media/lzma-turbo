@@ -227,7 +227,9 @@ impl<R: Read + Seek> XzParallelReader<R> {
         })?;
         let mut bytes = self.spare_in.pop().unwrap_or_default();
         bytes.clear();
-        bytes.try_reserve(want).map_err(|_| {
+        // The index gives the exact bound. Geometric growth here can retain
+        // a second packed block when the next block is only a few bytes larger.
+        bytes.try_reserve_exact(want).map_err(|_| {
             io::Error::from(XzError::at(
                 XzErrorKind::MemoryLimit {
                     needed: plan.padded_size,
@@ -269,11 +271,62 @@ impl<R: Read + Seek> XzParallelReader<R> {
 
     /// Makes sure the next block in output order is in hand.
     fn advance(&mut self) -> io::Result<bool> {
+        if self.threads == 1 && self.next_dispatch < self.blocks.len() {
+            // C: XzDecMt_Decode_ST uses bounded input on the caller thread.
+            // Preserve indexed, whole-block verification before adoption.
+            let plan = self.blocks[self.next_dispatch];
+            if self.pos != plan.file_offset {
+                self.src.seek(SeekFrom::Start(plan.file_offset))?;
+            }
+            self.pos = u64::MAX;
+            let mut job = XzJob {
+                index: self.next_dispatch as u64,
+                stream: plan.stream,
+                block_in_stream: plan.block_in_stream,
+                file_offset: plan.file_offset,
+                unpacked_offset: plan.unpacked_offset,
+                unpacked_len: plan.unpacked_len,
+                unpadded_size: plan.unpadded_size,
+                bytes: self.spare_in.pop().unwrap_or_default(),
+                check: plan.check,
+                verify: self.opts.verify_checks,
+                plan: self.opts.plan.clone(),
+                out: self.spare_out.pop().unwrap_or_default(),
+            };
+            let checks = match super::pool::decode_block_reader(&mut job, &mut self.src) {
+                Ok(checks) => checks,
+                Err(error) => {
+                    // As in the worker path, malformed blocks stop delivery.
+                    // A source I/O error remains retryable with a fresh seek.
+                    self.failed = error.get_ref().is_some_and(|e| e.is::<XzError>());
+                    return Err(error);
+                }
+            };
+            self.pos = plan.file_offset + plan.padded_size;
+            self.next_dispatch += 1;
+            self.adopt(XzDone {
+                index: job.index,
+                stream: job.stream,
+                block_in_stream: job.block_in_stream,
+                file_offset: job.file_offset,
+                unpacked_len: job.unpacked_len,
+                res: Ok(()),
+                out: job.out,
+                bytes: job.bytes,
+                checks,
+            })?;
+            return Ok(true);
+        }
         loop {
             if let Some(done) = self.ready.remove(&self.next_emit) {
                 return self.adopt(done).map(|()| true);
             }
-            while self.in_flight < self.threads && self.next_dispatch < self.blocks.len() {
+            // Completed blocks waiting for order still own both buffers.
+            // Release their admission slot only when adopted, not collected;
+            // otherwise a slow earlier block permits an archive-sized backlog.
+            while self.in_flight + self.ready.len() < self.threads
+                && self.next_dispatch < self.blocks.len()
+            {
                 self.dispatch_one()?;
             }
             if self.in_flight == 0 {
@@ -428,4 +481,179 @@ fn plan_blocks(streams: &[XzStreamIndex], opts: &XzOptions) -> XzResult<Vec<Plan
     // file this reader cannot map. C: `XzDecMt_Decode`, whose block loop runs
     // zero times and still returns `SZ_OK`.
     Ok(blocks)
+}
+
+#[cfg(all(test, feature = "enc"))]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn bounded_single_worker_input_preserves_verified_delivery() {
+        struct ShortReads {
+            source: Cursor<Vec<u8>>,
+            calls: usize,
+            largest: usize,
+        }
+        impl Read for ShortReads {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.largest = self.largest.max(bytes.len());
+                if self.calls.is_multiple_of(7) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let n = bytes.len().min(997);
+                self.source.read(&mut bytes[..n])
+            }
+        }
+        impl Seek for ShortReads {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.source.seek(position)
+            }
+        }
+        let mut state = 0x12345678u32;
+        let plain: Vec<u8> = (0..1_100_003)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        let archive = crate::encode_xz(&plain, &props, CheckType::Crc64, 400_001).unwrap();
+        let source = ShortReads {
+            source: Cursor::new(archive.clone()),
+            calls: 0,
+            largest: 0,
+        };
+        let mut reader =
+            XzParallelReader::with_options(source, XzOptions::default().with_threads(1)).unwrap();
+        let first = reader.blocks[0];
+        reader.src.largest = 0;
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, plain);
+        assert!(reader.src.largest <= 256 << 10);
+        assert!(reader.spare_in.iter().all(|b| b.capacity() <= 256 << 10));
+        assert_eq!(reader.pool.spawned(), 0);
+        // A slightly larger packed block must not double reusable storage.
+        let mut queued = XzParallelReader::with_options(
+            Cursor::new(&archive),
+            XzOptions::default().with_threads(2),
+        )
+        .unwrap();
+        let packed = first.padded_size as usize;
+        queued.spare_in.push(Vec::with_capacity(packed - 1));
+        queued.dispatch_one().unwrap();
+        let done = queued.pool.collect().unwrap();
+        done.res.unwrap();
+        assert_eq!(done.bytes.capacity(), packed);
+        let start = first.file_offset as usize;
+        let header_size = super::super::block::header_size_from_first_byte(archive[start]).unwrap();
+        // Both an early end marker and a corrupt check must expose no bytes
+        // of the failed block, exactly as the buffered worker does.
+        for at in [start + header_size, start + first.padded_size as usize - 1] {
+            let mut bad = archive.clone();
+            if at == start + header_size {
+                bad[at] = 0;
+            } else {
+                bad[at] ^= 0x80;
+            }
+            let mut errors = Vec::new();
+            for threads in [1, 2] {
+                let mut r = XzParallelReader::with_options(
+                    Cursor::new(&bad),
+                    XzOptions::default().with_threads(threads),
+                )
+                .unwrap();
+                let mut output = Vec::new();
+                let error = r.read_to_end(&mut output).unwrap_err();
+                assert!(output.is_empty());
+                errors.push(
+                    error
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<XzError>()
+                        .unwrap()
+                        .kind,
+                );
+                assert_eq!(r.read(&mut [0; 1]).unwrap(), 0);
+            }
+            assert_eq!(errors[0], errors[1]);
+        }
+    }
+
+    #[test]
+    fn completed_out_of_order_blocks_keep_their_memory_admission_slots() {
+        struct ReadProbe {
+            source: Cursor<Vec<u8>>,
+            armed: bool,
+            reads: usize,
+        }
+        impl Read for ReadProbe {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.armed {
+                    self.reads += 1;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unexpected read-ahead",
+                    ));
+                }
+                self.source.read(bytes)
+            }
+        }
+        impl Seek for ReadProbe {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.source.seek(position)
+            }
+        }
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        let archive = crate::encode_xz(&[7; 256], &props, CheckType::Crc64, 64).unwrap();
+        let source = ReadProbe {
+            source: Cursor::new(archive),
+            armed: false,
+            reads: 0,
+        };
+        let mut reader =
+            XzParallelReader::with_options(source, XzOptions::default().with_threads(3)).unwrap();
+        assert_eq!(reader.blocks.len(), 4);
+        // Reproduce the scheduler state deterministically: block zero remains
+        // in flight while one and two have completed. All three buffer slots
+        // are occupied, so block three must not even read its packed input.
+        reader.in_flight = 1;
+        reader.next_dispatch = 3;
+        for index in [1, 2] {
+            let plan = reader.blocks[index];
+            reader.ready.insert(
+                index as u64,
+                XzDone {
+                    index: index as u64,
+                    stream: plan.stream,
+                    block_in_stream: plan.block_in_stream,
+                    file_offset: plan.file_offset,
+                    unpacked_len: plan.unpacked_len,
+                    res: Ok(()),
+                    out: Vec::new(),
+                    bytes: Vec::new(),
+                    checks: None,
+                },
+            );
+        }
+        reader.src.armed = true;
+        // This scheduler fixture intentionally has no real worker. After
+        // refusing read-ahead it reports that no worker can supply block zero.
+        let error = reader.advance().unwrap_err();
+        assert_eq!(
+            reader.src.reads, 0,
+            "completed output lost its admission slot"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reader.next_dispatch, 3);
+        assert_eq!(reader.ready.len(), 2);
+    }
 }

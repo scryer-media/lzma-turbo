@@ -78,7 +78,14 @@ pub(crate) fn get_matches_spec_n_2_reg(
     cyclic_buffer_pos: u32,
     cyclic_buffer_size: u32,
 ) -> Option<(usize, u32)> {
-    #[cfg(all(feature = "kernel-ab", target_arch = "x86_64", not(miri)))]
+    #[cfg(all(
+        feature = "kernel-ab",
+        not(miri),
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "macos")
+        )
+    ))]
     match crate::kernel_ab::bt_variant() {
         1 => {
             return get_matches_spec_n_2_reg_variant::<1>(
@@ -118,9 +125,59 @@ pub(crate) fn get_matches_spec_n_2_reg(
                 cyclic_buffer_size,
             );
         }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        3 => {
+            return get_matches_spec_n_2_reg_variant::<3>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        4 => {
+            return get_matches_spec_n_2_reg_variant::<4>(
+                win,
+                len_limit_0,
+                pos,
+                cur,
+                son,
+                cut_value,
+                d,
+                di,
+                max_len_0,
+                heads,
+                hi,
+                limit,
+                hsize,
+                cyclic_buffer_pos,
+                cyclic_buffer_size,
+            );
+        }
         _ => {}
     }
-    get_matches_spec_n_2_reg_variant::<{ if cfg!(feature = "kernel-ab") { 0 } else { 1 } }>(
+    get_matches_spec_n_2_reg_variant::<
+        {
+            if cfg!(feature = "kernel-ab") {
+                0
+            } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+                4
+            } else {
+                1
+            }
+        },
+    >(
         win,
         len_limit_0,
         pos,
@@ -229,6 +286,50 @@ pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
             cyclic_buffer_pos,
             cyclic_buffer_size,
         );
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+    if (VARIANT == 2 || VARIANT == 3 || VARIANT == 4)
+        && lim <= u32::MAX as usize
+        && (!cfg!(debug_assertions) || cut_value != 0)
+        && (pos as usize)
+            .checked_add(n)
+            .is_some_and(|end| end <= u32::MAX as usize)
+        && (pos >= cyclic_buffer_size || pos == cyclic_buffer_pos)
+    {
+        let stop = d.as_ptr().addr().saturating_add(limit.saturating_mul(4));
+        let mut pos_res = pos;
+        // SAFETY: A/B bound tree nodes; C/D bound lookahead; E and the
+        // descending-child checks bound backward reads; F reserves output.
+        // The guards preserve 32-bit positions and debug cut-count overflow.
+        // The assembly borrows these slices only for this call, preserves all
+        // callee-saved registers, and writes only the exclusive son/d/pos_res.
+        let walk = match VARIANT {
+            4 => sdk_walk_arm64_negative,
+            3 => sdk_walk_arm64_wide,
+            _ => sdk_walk_arm64,
+        };
+        let end = unsafe {
+            walk(
+                win.as_ptr().add(len_limit_0),
+                pos as usize,
+                win.as_ptr().add(cur),
+                son.as_mut_ptr(),
+                cut_value,
+                d.as_mut_ptr().add(di),
+                max_len_0,
+                heads.as_ptr().add(hi),
+                stop,
+                heads.as_ptr().add(hsize),
+                cyclic_buffer_pos as usize,
+                cyclic_buffer_size,
+                &raw mut pos_res,
+            )
+        };
+        if end.is_null() {
+            return None;
+        }
+        // SAFETY: F confines the returned cursor to d or its one-past end.
+        return Some((unsafe { end.offset_from(d.as_ptr()) } as usize, pos_res));
     }
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if lim <= u32::MAX as usize
@@ -546,6 +647,84 @@ pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
     }
     // SAFETY: F kept both pointers in the output allocation.
     Some((unsafe { dist.offset_from(output) } as usize, pos))
+}
+
+/// C: GetMatchesSpecN_2 in SDK 26.03's C/LzFindOpt.c, ARM64 register map.
+///
+/// # Safety
+/// Requires the A-F margins and integer guards established by the wrapper.
+/// Native differential tests cover mutations and refusals; Miri uses Rust.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_sdk.S"), options(raw))
+}
+
+/// SDK ARM64 flow retaining the portable walk's bounded word scan and early
+/// child fetch. Diagnostic only; the unmodified SDK variant remains available.
+///
+/// # Safety
+/// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64_wide(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_sdk_wide.S"), options(raw))
+}
+
+/// SDK GetMatchesSpecN_2 negative-offset control flow ported to ARM64.
+///
+/// # Safety
+/// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
+/// The native register-walk differential suite checks this diagnostic port.
+#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn sdk_walk_arm64_negative(
+    len_limit: *const u8,
+    pos: usize,
+    cur: *const u8,
+    son: *mut u32,
+    cut: u32,
+    d: *mut u32,
+    max_len: usize,
+    heads: *const u32,
+    stop: usize,
+    heads_end: *const u32,
+    cyclic_pos: usize,
+    cyclic_size: u32,
+    pos_res: *mut u32,
+) -> *mut u32 {
+    core::arch::naked_asm!(include_str!("bt_kernel_aarch64_negative.S"), options(raw))
 }
 
 /// C: GetMatchesSpecN_2 in SDK 26.03's LzFindOpt.asm, System V register map.
