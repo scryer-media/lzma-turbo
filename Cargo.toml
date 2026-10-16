@@ -142,6 +142,18 @@ debug = 1
 # feature lanes did not fit a forty-minute budget. Only the optimizer is
 # raised - `debug-assertions` and `overflow-checks` stay on, which is the part
 # a debug build is run for. `test` inherits this, so both unit and integration
-# tests get it.
+# tests get it. Raising this crate to 3 was measured and left out: the cold
+# build was no faster and the run was not measurably faster on this suite.
+# Overrides for the hot dependencies (crc-fast, sha2, AWS-LC) were measured and
+# left out too: they saved nothing measurable in the run and cost 10+ s of
+# cold compile.
 [profile.dev]
 opt-level = 2
+
+# Tests need no debuginfo. Without it, and without incremental state, a cold
+# `cargo test --all-features --no-run` is about 19 s instead of 21 s; the test
+# run itself is unchanged.
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
