@@ -105,7 +105,15 @@ impl<R: Read> LzmaReader<R> {
     /// Returns an error for an invalid header, an exceeded budget or allocation failure.
     pub fn with_memory_limit(mut inner: R, memory_limit: u64) -> io::Result<Self> {
         let mut header = [0u8; LZMA_ALONE_HEADER_SIZE];
-        inner.read_exact(&mut header)?;
+        // The source ending inside the header is a truncated stream; any
+        // other failure, or an error the source raised itself, is its own.
+        inner.read_exact(&mut header).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof && e.get_ref().is_none() {
+                to_io(Error::Truncated)
+            } else {
+                e
+            }
+        })?;
         let header = LzmaAloneHeader::parse(&header).map_err(to_io)?;
         Self::check_memory(header.props, memory_limit)?;
         let src = Source::new(inner);

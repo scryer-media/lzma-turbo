@@ -490,6 +490,13 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert_eq!(err.downcast::<Error>().ok(), Some(Error::Truncated));
 
+        // A `.lzma` header the source ends inside.
+        let err = crate::LzmaReader::new(&[0x5D, 0, 0, 1][..])
+            .err()
+            .expect("a short header");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(err.downcast::<Error>().ok(), Some(Error::Truncated));
+
         let err = crate::Lzma2Reader::new(&[][..], 41)
             .err()
             .expect("dict_prop 41");

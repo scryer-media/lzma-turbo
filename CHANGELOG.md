@@ -9,7 +9,12 @@
     `UnexpectedEof`) and `MemoryLimit { needed, limit }` (a reader's
     memory budget, `OutOfMemory`). The readers, `run_boundaries` and the
     parallel reader return them where they returned text errors or
-    `CorruptData`.
+    `CorruptData`. A stream that ends early is `Truncated` at every thread
+    count: `LzmaReader` on a short header, and `Lzma2ParallelDecoder` and
+    `Lzma2AdaptiveDecoder` on input that ends at a run boundary or before
+    the end marker, used to say `CorruptData` or `UnexpectedEof` with no
+    payload. A coordinator thread the system refuses to start is `Alloc`
+    instead of a text error.
   - `Error::OutputEof` is removed; nothing produced it.
   - `Error::CorruptRun` and `Error::MemoryLimit`, and
     `XzErrorKind::MemoryLimit` and `XzErrorKind::TooMuchOutput`, are

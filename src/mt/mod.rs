@@ -322,8 +322,9 @@ impl Lzma2ParallelDecoder {
         if replay.is_empty() && read_was_finished {
             if !finished.load(std::sync::atomic::Ordering::Relaxed) {
                 // The threaded pass consumed the whole stream without reaching
-                // an end marker, so there was no end marker.
-                return Err(to_io(Error::CorruptData));
+                // an end marker: the stream ended early, as the single-threaded
+                // tail reports it.
+                return Err(to_io(Error::Truncated));
             }
             return Ok(written);
         }
@@ -707,7 +708,8 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
                     },
                     ok => ok,
                 }
-            })?;
+            })
+            .map_err(|_| to_io(Error::Alloc))?;
         Ok(Lzma2ParallelReader {
             rx,
             #[cfg(feature = "crc")]

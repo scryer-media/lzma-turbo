@@ -1558,8 +1558,9 @@ impl Lzma2AdaptiveDecoder {
                 }
                 return Err(Error::InternalFailure);
             }
+            // The input ended without an end marker.
             if self.input_done && !self.complete {
-                return Err(Error::CorruptData);
+                return Err(Error::Truncated);
             }
             return Ok(if progress {
                 DrainStatus::Progress
@@ -2181,8 +2182,9 @@ impl Lzma2AdaptiveDecoder {
             self.stream_end = Some(self.cursor_in);
         }
         if used == 0 && produced == 0 {
+            // The input ended without an end marker.
             if self.input_done && !self.complete {
-                return Err(Error::CorruptData);
+                return Err(Error::Truncated);
             }
             return Ok(false);
         }
