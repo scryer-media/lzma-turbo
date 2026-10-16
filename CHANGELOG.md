@@ -32,6 +32,8 @@
   decoder, against the system `xz`; hygiene rejects binaries under `docs/`
   other than small figures. `tests/upstream_xz_generated.rs` is renamed
   `xz_generated_corpus_round_trip.rs`, since it never runs `xz`.
+- CI: the `dtolnay/rust-toolchain` pins name the commit its `v1` tag points
+  to, which resolves zizmor's `ref-version-mismatch` findings.
 
 ## 0.9.1 - 2026-10-11
 
