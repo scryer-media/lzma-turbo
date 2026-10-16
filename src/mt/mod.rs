@@ -211,9 +211,10 @@ impl Lzma2ParallelDecoder {
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from either stream, and returns
-    /// [`std::io::ErrorKind::InvalidData`] wrapping an [`Error`] for a stream
-    /// that does not decode.
+    /// Propagates I/O errors from either stream, and returns an [`Error`] as
+    /// the `io::Error` of its class for a stream that does not decode:
+    /// [`std::io::ErrorKind::InvalidData`] for corrupt data,
+    /// [`std::io::ErrorKind::UnexpectedEof`] for a truncated stream.
     pub fn decode<R: Read + Send, W: Write + Send>(&self, input: R, out: W) -> io::Result<u64> {
         let mut input = input;
         let mut out = out;
@@ -321,8 +322,9 @@ impl Lzma2ParallelDecoder {
         if replay.is_empty() && read_was_finished {
             if !finished.load(std::sync::atomic::Ordering::Relaxed) {
                 // The threaded pass consumed the whole stream without reaching
-                // an end marker, so there was no end marker.
-                return Err(to_io(Error::CorruptData));
+                // an end marker: the stream ended early, as the single-threaded
+                // tail reports it.
+                return Err(to_io(Error::Truncated));
             }
             return Ok(written);
         }
@@ -409,7 +411,7 @@ impl StSource<'_> {
         if self.buf.is_empty() {
             let mut v = Vec::new();
             v.try_reserve_exact(IN_BUF_SIZE_ST)
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                .map_err(|_| to_io(Error::Alloc))?;
             v.resize(IN_BUF_SIZE_ST, 0u8);
             self.buf = v;
         }
@@ -526,10 +528,7 @@ fn decode_st(
                     return Ok(*written);
                 }
                 if status == Status::NeedsMoreInput {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated LZMA2 stream",
-                    ));
+                    return Err(to_io(Error::Truncated));
                 }
                 return Err(to_io(Error::CorruptData));
             }
@@ -538,7 +537,7 @@ fn decode_st(
 }
 
 fn to_io(e: Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
+    e.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -700,11 +699,17 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
                 };
                 #[cfg(not(feature = "crc"))]
                 let r = dec.decode(inner, &mut sink);
-                if let Err(e) = &r {
-                    let _ = err_tx.try_send(Err(io::Error::new(e.kind(), e.to_string())));
+                // The error itself goes to the reader, so that it can be
+                // downcast; only one that cannot be queued is left for `finish`.
+                match r {
+                    Err(e) => match err_tx.try_send(Err(e)) {
+                        Ok(()) => Ok(0),
+                        Err(TrySendError::Full(r) | TrySendError::Disconnected(r)) => r.map(|_| 0),
+                    },
+                    ok => ok,
                 }
-                r
-            })?;
+            })
+            .map_err(|_| to_io(Error::Alloc))?;
         Ok(Lzma2ParallelReader {
             rx,
             #[cfg(feature = "crc")]
@@ -762,7 +767,7 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
             Some(h) => match h.join() {
                 Ok(Ok(_)) => Ok(()),
                 Ok(Err(e)) => Err(e),
-                Err(_) => Err(io::Error::other("LZMA2 decoding thread panicked")),
+                Err(_) => Err(to_io(Error::InternalFailure)),
             },
             None => Ok(()),
         }

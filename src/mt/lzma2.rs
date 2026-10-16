@@ -281,9 +281,10 @@ impl Coder for Lzma2Coder {
 
     /// C: `Lzma2DecMt_MtCallback_PreCode`.
     fn pre_code(&mut self) -> Result<(), MtError> {
+        // A block that parsed no input at all began where the input ended.
         if self.in_pre_size == 0 {
-            self.code_res = Some(Error::CorruptData);
-            return Err(MtError::Lzma(Error::CorruptData));
+            self.code_res = Some(Error::Truncated);
+            return Err(MtError::Lzma(Error::Truncated));
         }
 
         // The block's buffer lives in one of two places: here between blocks,

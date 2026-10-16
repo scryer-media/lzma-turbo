@@ -120,13 +120,7 @@ fn ring_runs_refuse_extra_early_eos_truncation_and_false_output_bounds() {
         });
         let completion = decoder.finish(&cancel);
         assert!(decoded.is_err() || completion.is_err(), "case {case}");
-        assert!(matches!(
-            completion,
-            Err(Error::CorruptRun {
-                index: 9,
-                out_offset: 0
-            })
-        ));
+        assert_eq!(completion.err(), Some(Error::corrupt_run(9, 0)));
     }
 }
 
@@ -154,14 +148,12 @@ fn failed_or_cancelled_ring_writes_never_complete() {
             })
             .unwrap_err();
         assert_eq!(accepted, 17);
-        assert_eq!(
-            error.kind(),
-            if cancel_write {
-                io::ErrorKind::Interrupted
-            } else {
-                io::ErrorKind::PermissionDenied
-            }
-        );
+        if cancel_write {
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.downcast::<Error>().ok(), Some(Error::Cancelled));
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
         cancel.store(false, Ordering::Release);
         assert!(
             decoder

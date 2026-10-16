@@ -55,6 +55,7 @@ pub enum XzErrorKind {
     TrailingGarbage,
     /// Honouring the stream would need more memory than the caller allowed.
     /// Carries what was needed.
+    #[non_exhaustive]
     MemoryLimit {
         /// Bytes the stream asks for.
         needed: u64,
@@ -62,12 +63,66 @@ pub enum XzErrorKind {
         limit: u64,
     },
     /// The stream decodes to more than the caller's `max_unpack_bytes`.
+    #[non_exhaustive]
     TooMuchOutput {
         /// The cap that was exceeded.
         limit: u64,
     },
-    /// The LZMA2 layer refused the compressed data.
+    /// The LZMA2 layer failed: corrupt or truncated data, an allocation, a
+    /// cancellation. The [`Error`] is this kind's `source()`.
     Lzma(Error),
+}
+
+impl XzErrorKind {
+    /// [`XzErrorKind::MemoryLimit`]: `needed` bytes asked for, `limit` allowed.
+    #[must_use]
+    pub const fn memory_limit(needed: u64, limit: u64) -> Self {
+        XzErrorKind::MemoryLimit { needed, limit }
+    }
+
+    /// [`XzErrorKind::TooMuchOutput`] over a cap of `limit` bytes.
+    #[must_use]
+    pub const fn too_much_output(limit: u64) -> Self {
+        XzErrorKind::TooMuchOutput { limit }
+    }
+
+    /// The LZMA2 layer's error, if that is where the failure came from.
+    #[must_use]
+    pub const fn lzma(&self) -> Option<Error> {
+        match self {
+            XzErrorKind::Lzma(e) => Some(*e),
+            _ => None,
+        }
+    }
+
+    /// The `io::ErrorKind` of this failure's class. An LZMA2 failure keeps the
+    /// class of its [`Error`]; a cap on the output is a refusal of the data.
+    #[cfg(feature = "xz")]
+    pub(crate) const fn io_kind(&self) -> std::io::ErrorKind {
+        use std::io::ErrorKind;
+        match self {
+            XzErrorKind::TruncatedInput | XzErrorKind::TruncatedVli => ErrorKind::UnexpectedEof,
+            XzErrorKind::MemoryLimit { .. } => ErrorKind::OutOfMemory,
+            XzErrorKind::UnsupportedCheck | XzErrorKind::UnsupportedFilter => {
+                ErrorKind::Unsupported
+            }
+            XzErrorKind::Lzma(e) => e.io_kind(),
+            XzErrorKind::BadMagic
+            | XzErrorKind::BadFooterMagic
+            | XzErrorKind::BadStreamFlags
+            | XzErrorKind::StreamFlagsMismatch
+            | XzErrorKind::HeaderCrc
+            | XzErrorKind::CheckMismatch
+            | XzErrorKind::BadFilterChain
+            | XzErrorKind::BadVli
+            | XzErrorKind::BadPadding
+            | XzErrorKind::BadBlockHeader
+            | XzErrorKind::SizeMismatch
+            | XzErrorKind::IndexMismatch
+            | XzErrorKind::TrailingGarbage
+            | XzErrorKind::TooMuchOutput { .. } => ErrorKind::InvalidData,
+        }
+    }
 }
 
 impl fmt::Display for XzErrorKind {
@@ -101,12 +156,19 @@ impl fmt::Display for XzErrorKind {
             XzErrorKind::TooMuchOutput { limit } => {
                 write!(f, "xz stream decodes to more than the {limit}-byte cap")
             }
-            XzErrorKind::Lzma(e) => write!(f, "{e}"),
+            XzErrorKind::Lzma(_) => f.write_str("xz LZMA2 layer failed"),
         }
     }
 }
 
-impl core::error::Error for XzErrorKind {}
+impl core::error::Error for XzErrorKind {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            XzErrorKind::Lzma(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<Error> for XzErrorKind {
     fn from(e: Error) -> Self {
@@ -114,30 +176,33 @@ impl From<Error> for XzErrorKind {
     }
 }
 
-/// Reasons a decode call can fail.
+/// Reasons a decode or encode call can fail.
 ///
-/// C: the `SZ_ERROR_*` subset that `LzmaDec.c` and `Lzma2Dec.c` can return.
+/// C: the `SZ_ERROR_*` subset that `LzmaDec.c`, `Lzma2Dec.c`, `LzmaEnc.c` and
+/// `Lzma2Enc.c` can return, plus the failures the reference leaves to its
+/// caller: truncated input, a memory budget, cancellation.
+///
+/// With `std`, `io::Error::from` maps each variant to the [`std::io::ErrorKind`]
+/// of its class and keeps the value as the payload, so
+/// `io::Error::downcast::<Error>()` gives it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// C: `SZ_ERROR_UNSUPPORTED`. The property byte(s) do not describe a
-    /// stream this decoder can handle.
+    /// stream this decoder can handle. `io::ErrorKind::Unsupported`.
     UnsupportedProps,
     /// C: `SZ_ERROR_DATA`. The compressed stream is malformed: a match refers
     /// outside the dictionary, a range coder check failed, the end marker was
     /// absent where one was required, or an LZMA2 chunk header is invalid.
+    /// `io::ErrorKind::InvalidData`.
     CorruptData,
-    /// C: `SZ_ERROR_FAIL`. Reached only if the decoder's own invariants are
-    /// violated; it is never produced by malformed input alone.
-    InternalFailure,
-    /// The decoder could not allocate its dictionary or probability table.
-    Alloc,
-    /// [`Error::CorruptData`], located.
+    /// [`Error::CorruptData`], located. `io::ErrorKind::InvalidData`.
     ///
     /// Only the multi-threaded decoder produces this: a worker decodes one
     /// independently decodable run and so can say which one failed and where
     /// its output would have gone, which a caller writing blocks by offset
     /// needs in order to know what it has and has not got.
+    #[non_exhaustive]
     CorruptRun {
         /// The run's index in the stream, counting from zero.
         index: u64,
@@ -145,17 +210,82 @@ pub enum Error {
         /// decoded stream.
         out_offset: u64,
     },
-    /// The decode was cancelled by the caller.
+    /// The input ended before the stream did. `io::ErrorKind::UnexpectedEof`.
+    Truncated,
+    /// C: `SZ_ERROR_FAIL`. Reached only if the coder's own invariants are
+    /// violated; it is never produced by malformed input alone.
+    /// `io::ErrorKind::Other`.
+    InternalFailure,
+    /// An allocation the coder needed failed, or a worker thread could not be
+    /// started. `io::ErrorKind::OutOfMemory`.
+    Alloc,
+    /// Decoding would need more memory than the caller allowed.
+    /// `io::ErrorKind::OutOfMemory`.
+    #[non_exhaustive]
+    MemoryLimit {
+        /// Bytes the stream asks for.
+        needed: u64,
+        /// Bytes the caller allowed.
+        limit: u64,
+    },
+    /// The caller cancelled the decode. `io::ErrorKind::Other`, never
+    /// `Interrupted`, which std's read and copy helpers retry: a cancelled
+    /// read would spin instead of stop.
     Cancelled,
-    /// C: `SZ_ERROR_PARAM`. An encoder setting is out of range.
+    /// C: `SZ_ERROR_PARAM`. An argument from the caller is out of range: an
+    /// encoder setting, a range outside its buffer, a call out of sequence,
+    /// a stream that broke the length it promised or a sink that reported
+    /// more than it was given. `io::ErrorKind::InvalidInput`.
     Param,
-    /// C: `SZ_ERROR_READ`. The encoder's input stream failed.
+    /// C: `SZ_ERROR_READ`. The encoder's input stream failed. The stream's
+    /// own error stays with the stream's owner, which is where a
+    /// `SeqInStream` keeps it. `io::ErrorKind::Other`.
     Read,
-    /// C: `SZ_ERROR_WRITE`. The encoder's output stream failed.
+    /// C: `SZ_ERROR_WRITE`. The encoder's output stream failed. The stream's
+    /// own error stays with the stream's owner, which is where a
+    /// `SeqOutStream` keeps it. `io::ErrorKind::Other`.
     Write,
-    /// C: `SZ_ERROR_OUTPUT_EOF`. The encoder's output buffer is too small for
-    /// the data it was asked to produce.
-    OutputEof,
+}
+
+impl Error {
+    /// [`Error::CorruptRun`] for run `index`, whose output starts at
+    /// `out_offset`.
+    #[must_use]
+    pub const fn corrupt_run(index: u64, out_offset: u64) -> Self {
+        Error::CorruptRun { index, out_offset }
+    }
+
+    /// [`Error::MemoryLimit`]: `needed` bytes asked for, `limit` allowed.
+    #[must_use]
+    pub const fn memory_limit(needed: u64, limit: u64) -> Self {
+        Error::MemoryLimit { needed, limit }
+    }
+
+    /// Whether the input is at fault: [`Error::CorruptData`],
+    /// [`Error::CorruptRun`] or [`Error::Truncated`].
+    #[must_use]
+    pub const fn is_corrupt(&self) -> bool {
+        matches!(
+            self,
+            Error::CorruptData | Error::CorruptRun { .. } | Error::Truncated
+        )
+    }
+
+    /// The `io::ErrorKind` of this error's class.
+    #[cfg(feature = "std")]
+    pub(crate) const fn io_kind(&self) -> std::io::ErrorKind {
+        use std::io::ErrorKind;
+        match self {
+            Error::UnsupportedProps => ErrorKind::Unsupported,
+            Error::CorruptData | Error::CorruptRun { .. } => ErrorKind::InvalidData,
+            Error::Truncated => ErrorKind::UnexpectedEof,
+            Error::Alloc | Error::MemoryLimit { .. } => ErrorKind::OutOfMemory,
+            Error::Param => ErrorKind::InvalidInput,
+            Error::Cancelled | Error::InternalFailure | Error::Read | Error::Write => {
+                ErrorKind::Other
+            }
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -163,26 +293,38 @@ impl fmt::Display for Error {
         let s = match self {
             Error::UnsupportedProps => "unsupported LZMA properties",
             Error::CorruptData => "corrupt LZMA data",
-            Error::InternalFailure => "internal LZMA decoder failure",
-            Error::Alloc => "LZMA decoder allocation failed",
             Error::CorruptRun { index, out_offset } => {
                 return write!(
                     f,
                     "corrupt LZMA2 data in run {index}, at output offset {out_offset}"
                 );
             }
+            Error::Truncated => "truncated LZMA stream",
+            Error::InternalFailure => "internal LZMA coder failure",
+            Error::Alloc => "LZMA coder allocation failed",
+            Error::MemoryLimit { needed, limit } => {
+                return write!(
+                    f,
+                    "LZMA decoder needs {needed} bytes, over the {limit}-byte limit"
+                );
+            }
             Error::Cancelled => "LZMA decode cancelled",
-            Error::Param => "invalid LZMA encoder parameter",
+            Error::Param => "invalid LZMA coder argument",
             Error::Read => "LZMA encoder input stream failed",
             Error::Write => "LZMA encoder output stream failed",
-            Error::OutputEof => "LZMA encoder output buffer too small",
         };
         f.write_str(s)
     }
 }
 
+impl core::error::Error for Error {}
+
 #[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::new(e.io_kind(), e)
+    }
+}
 
 /// Where a decode call stopped.
 ///
@@ -230,4 +372,183 @@ pub struct Progress {
     pub written: usize,
     /// Where the call stopped.
     pub status: Status,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    /// Every message in a `source()` chain, outermost first.
+    fn chain(e: &(dyn core::error::Error + 'static)) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut next = Some(e);
+        while let Some(e) = next {
+            out.push(e.to_string());
+            next = e.source();
+        }
+        out
+    }
+
+    #[test]
+    fn the_error_types_cross_threads_and_live_forever() {
+        fn assert_bounds<T: core::error::Error + Send + Sync + 'static>() {}
+        assert_bounds::<Error>();
+        assert_bounds::<XzErrorKind>();
+    }
+
+    #[test]
+    fn an_lzma_error_is_its_own_whole_chain() {
+        assert_eq!(chain(&Error::CorruptData), ["corrupt LZMA data"]);
+        assert_eq!(
+            chain(&Error::corrupt_run(3, 4096)),
+            ["corrupt LZMA2 data in run 3, at output offset 4096"]
+        );
+        assert_eq!(
+            chain(&Error::memory_limit(1 << 20, 4096)),
+            ["LZMA decoder needs 1048576 bytes, over the 4096-byte limit"]
+        );
+    }
+
+    #[test]
+    fn an_xz_kind_reports_its_lzma_cause_once() {
+        assert_eq!(
+            chain(&XzErrorKind::Lzma(Error::Truncated)),
+            ["xz LZMA2 layer failed", "truncated LZMA stream"]
+        );
+        assert_eq!(
+            chain(&XzErrorKind::HeaderCrc),
+            ["xz header CRC-32 mismatch"]
+        );
+        assert_eq!(XzErrorKind::Lzma(Error::Alloc).lzma(), Some(Error::Alloc));
+        assert_eq!(XzErrorKind::BadMagic.lzma(), None);
+    }
+
+    #[test]
+    fn only_the_input_is_corrupt() {
+        assert!(Error::CorruptData.is_corrupt());
+        assert!(Error::corrupt_run(0, 0).is_corrupt());
+        assert!(Error::Truncated.is_corrupt());
+        for e in [
+            Error::UnsupportedProps,
+            Error::InternalFailure,
+            Error::Alloc,
+            Error::memory_limit(2, 1),
+            Error::Cancelled,
+            Error::Param,
+            Error::Read,
+            Error::Write,
+        ] {
+            assert!(!e.is_corrupt(), "{e:?}");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_io_error_has_the_class_kind_and_gives_the_error_back() {
+        use std::io::ErrorKind;
+        for (e, kind) in [
+            (Error::UnsupportedProps, ErrorKind::Unsupported),
+            (Error::CorruptData, ErrorKind::InvalidData),
+            (Error::corrupt_run(1, 2), ErrorKind::InvalidData),
+            (Error::Truncated, ErrorKind::UnexpectedEof),
+            (Error::InternalFailure, ErrorKind::Other),
+            (Error::Alloc, ErrorKind::OutOfMemory),
+            (Error::memory_limit(2, 1), ErrorKind::OutOfMemory),
+            (Error::Cancelled, ErrorKind::Other),
+            (Error::Param, ErrorKind::InvalidInput),
+            (Error::Read, ErrorKind::Other),
+            (Error::Write, ErrorKind::Other),
+        ] {
+            let io = std::io::Error::from(e);
+            assert_eq!(io.kind(), kind, "{e:?}");
+            assert_eq!(chain(&io), [e.to_string()]);
+            assert_eq!(io.downcast::<Error>().ok(), Some(e));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_readers_fail_with_the_typed_error() {
+        use std::io::{ErrorKind, Read};
+
+        let err = crate::Lzma2Reader::with_memory_limit(&[][..], 16, 1)
+            .err()
+            .expect("over the limit");
+        assert_eq!(err.kind(), ErrorKind::OutOfMemory);
+        assert!(matches!(
+            err.downcast::<Error>(),
+            Ok(Error::MemoryLimit { limit: 1, .. })
+        ));
+
+        let mut out = Vec::new();
+        let err = crate::Lzma2Reader::new(&[][..], 16)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(err.downcast::<Error>().ok(), Some(Error::Truncated));
+
+        // A `.lzma` header the source ends inside.
+        let err = crate::LzmaReader::new(&[0x5D, 0, 0, 1][..])
+            .err()
+            .expect("a short header");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(err.downcast::<Error>().ok(), Some(Error::Truncated));
+
+        // A source's own end-of-file error, payload or none, passes through.
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(ErrorKind::UnexpectedEof.into())
+            }
+        }
+        let err = crate::LzmaReader::new(Failing)
+            .err()
+            .expect("a failing source");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(err.get_ref().is_none(), "{err:?}");
+
+        let err = crate::Lzma2Reader::new(&[][..], 41)
+            .err()
+            .expect("dict_prop 41");
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        assert_eq!(err.downcast::<Error>().ok(), Some(Error::UnsupportedProps));
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn an_xz_error_names_its_place_and_returns_its_cause() {
+        use crate::XzError;
+        use std::io::ErrorKind;
+
+        let located = XzError::in_block(Error::CorruptData, 0, 2, 64);
+        let want = [
+            "xz LZMA2 layer failed (stream 0, block 2, file offset 64)",
+            "corrupt LZMA data",
+        ];
+        assert_eq!(chain(&located), want);
+        let io = std::io::Error::from(located);
+        assert_eq!(io.kind(), ErrorKind::InvalidData);
+        assert_eq!(chain(&io), want);
+        assert_eq!(io.downcast::<XzError>().ok(), Some(located));
+
+        for (kind, io_kind) in [
+            (XzErrorKind::TruncatedInput, ErrorKind::UnexpectedEof),
+            (XzErrorKind::memory_limit(2, 1), ErrorKind::OutOfMemory),
+            (XzErrorKind::UnsupportedFilter, ErrorKind::Unsupported),
+            (XzErrorKind::too_much_output(9), ErrorKind::InvalidData),
+            (XzErrorKind::Lzma(Error::Cancelled), ErrorKind::Other),
+            (XzErrorKind::Lzma(Error::Alloc), ErrorKind::OutOfMemory),
+            (XzErrorKind::Lzma(Error::InternalFailure), ErrorKind::Other),
+        ] {
+            let io = std::io::Error::from(XzError::at(kind, 1, 12));
+            assert_eq!(io.kind(), io_kind, "{kind:?}");
+        }
+        assert_eq!(
+            chain(&XzError::at(XzErrorKind::BadMagic, 1, 0)),
+            ["not an xz stream (stream 1, file offset 0)"]
+        );
+    }
 }

@@ -68,7 +68,7 @@ impl From<MtError> for io::Error {
     fn from(e: MtError) -> Self {
         match e {
             MtError::Io(e) => e,
-            MtError::Lzma(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            MtError::Lzma(e) => e.into(),
         }
     }
 }
