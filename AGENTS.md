@@ -211,3 +211,10 @@ port rules and what was left out are in `docs/encoder.md`.
   must pass before a commit is proposed for review.
 - Any code change to the crate (`src/`) bumps its version, `Cargo.lock` and
   `CHANGELOG.md` in the same change.
+- Use `cargo nextest run --no-fail-fast` for native test sweeps. Install
+  `cargo-nextest` 0.9.143 as in CI. Run doctests separately with `cargo test --doc`;
+  keep `cargo miri test` for interpreter checks. Exclude `wasm-conformance`
+  from ordinary workspace sweeps; its dedicated CI job runs it.
+- Keep raw benchmark data, machine-readable reports and profiling bundles
+  outside the repository. Commit Markdown summaries and source identities.
+  Existing evidence is preserved as described in `docs/benchmark-data.md`.

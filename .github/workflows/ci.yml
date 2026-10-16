@@ -61,6 +61,12 @@ jobs:
             echo "$text" >&2
             exit 1
           fi
+      - name: Keep raw benchmark evidence outside Git
+        run: |
+          if git ls-files -- docs | grep -E '\.(json(\.zst)?|csv|tsv|tar\.gz|log)$'; then
+            echo "raw benchmark evidence belongs outside the repository; see docs/benchmark-data.md" >&2
+            exit 1
+          fi
 
   fmt:
     name: fmt
@@ -125,6 +131,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -140,26 +150,38 @@ jobs:
       # happened to be on PATH. That is why there is no setup-nasm step here
       # and why Windows no longer skips the default build.
       - name: Test with the assembly decode loop (default)
-        run: cargo test --locked --workspace --exclude wasm-conformance --no-fail-fast
+        run: cargo nextest run --locked --workspace --exclude wasm-conformance --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked --workspace --exclude wasm-conformance --no-fail-fast
       - name: Test with the portable decode loop
-        run: cargo test --locked -p lzma-turbo --no-default-features --features std --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --no-default-features --features std --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --no-default-features --features std --no-fail-fast
       - name: Test without std
-        run: cargo test --locked -p lzma-turbo --no-default-features --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --no-default-features --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --no-default-features --no-fail-fast
       # The pure-Rust crypto backend on its own: no C toolchain involved, and
       # the shape a consumer that wants none uses.
       - name: Test the RustCrypto backend alone
-        run: cargo test --locked -p lzma-turbo --no-default-features --features std,native-crypto --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --no-default-features --features std,native-crypto --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --no-default-features --features std,native-crypto --no-fail-fast
       # Both backends compiled at once, which is what runs the differential
       # test between them.
       - name: Test both crypto backends against each other
-        run: cargo test --locked -p lzma-turbo --features native-crypto --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --features native-crypto --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --features native-crypto --no-fail-fast
       # The encoder with nothing else turned on: no container, no crypto
       # backend, no assembly. `enc` implies `crc`, because the match finder's
       # byte table is the reflected CRC-32 table and is derived from
       # `crate::crc` rather than built again, and `crc` implies `std`; this is
       # the smallest build the encoder has.
       - name: Test the encoder alone
-        run: cargo test --locked -p lzma-turbo --no-default-features --features enc --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --no-default-features --features enc --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --no-default-features --features enc --no-fail-fast
       # The encoder behind the .xz writer, with no SHA-256 backend. It is a
       # `check` rather than a `test` because that feature set cannot decode
       # one of the committed vectors - `mixed.sha256.xz` carries check type 10
@@ -169,7 +191,9 @@ jobs:
       - name: Check the encoder with the .xz writer and no crypto backend
         run: cargo check --locked -p lzma-turbo --no-default-features --features enc,xz --all-targets
       - name: Test the encoder with the .xz writer
-        run: cargo test --locked -p lzma-turbo --no-default-features --features enc,xz,native-crypto --no-fail-fast
+        run: cargo nextest run --locked -p lzma-turbo --no-default-features --features enc,xz,native-crypto --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked -p lzma-turbo --no-default-features --features enc,xz,native-crypto --no-fail-fast
       # The one check that is not per platform: the parity tests compare this
       # crate with an SDK built on the same runner, and would go on passing if
       # both drifted together. These digests are written down once and compared
@@ -258,6 +282,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -272,7 +300,9 @@ jobs:
       - name: Lint the harness
         run: cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
       - name: Decode an .xz of each check type through host hooks
-        run: cargo test --locked -p wasm-conformance
+        run: cargo nextest run --no-fail-fast --locked -p wasm-conformance
+      - name: Run doctests
+        run: cargo test --doc --no-fail-fast --locked -p wasm-conformance
 
   msrv:
     name: msrv
@@ -420,6 +450,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -432,7 +466,12 @@ jobs:
         env:
           LZMA_ORACLE_REQUIRE: "1"
           LZMA_ORACLE_REQUIRE_ASM: ${{ matrix.require_asm }}
-        run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo test --locked -p sdk-oracle
+        run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo nextest run --no-fail-fast --locked -p sdk-oracle
+      - name: Run doctests
+        env:
+          LZMA_ORACLE_REQUIRE: "1"
+          LZMA_ORACLE_REQUIRE_ASM: ${{ matrix.require_asm }}
+        run: LZMA_SDK="$RUNNER_TEMP/lzma-sdk" cargo test --doc --no-fail-fast --locked -p sdk-oracle
 
   # What a sanitizer cannot give the assembly loop. `guard_pages` puts every
   # allocation and every input slice against a no-access page, on each OS -
@@ -464,11 +503,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Every buffer against a guard page
-        run: cargo test --locked -p lzma-turbo --test guard_pages -- --include-ignored
+        run: cargo nextest run --no-fail-fast --locked -p lzma-turbo --test guard_pages --run-ignored all
       - name: Install Valgrind
         if: runner.os == 'Linux'
         run: |
@@ -479,7 +522,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
-        run: cargo test --locked -p lzma-turbo --test asm_parity
+        run: cargo nextest run --no-fail-fast --locked -p lzma-turbo --test asm_parity
       # The encoder's oracles, so the lanes below are the real parity sweep
       # under memcheck rather than a round trip. The oracle binaries are
       # separate processes and run at full speed; Valgrind traces the test
@@ -505,14 +548,14 @@ jobs:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
           LZMA_TURBO_CORPUS_MAX: "16384"
         run: |
-          cargo test --locked --release -p lzma-turbo \
+          cargo nextest run --no-fail-fast --locked --release -p lzma-turbo \
             --test mt_match_finder --test lzma_parity --test lzma2_mt_parity
       - name: The encoder's unit tests under Valgrind
         if: runner.os == 'Linux'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind -q --error-exitcode=1
-        run: "cargo test --locked --release -p lzma-turbo --lib -- enc::"
+        run: "cargo nextest run --no-fail-fast --locked --release -p lzma-turbo --lib -- enc::"
 
   # The data races a guard page cannot see. `LzFindMt.c` is three threads over
   # one window and one pair of ring buffers, partitioned by nothing but the
@@ -532,6 +575,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: nightly-2026-09-01
@@ -549,7 +596,7 @@ jobs:
           # test, not the volume.
           LZMA_TURBO_CORPUS_MAX: "16384"
         run: |
-          cargo "+$TSAN_TOOLCHAIN" test -Zbuild-std \
+          cargo "+$TSAN_TOOLCHAIN" nextest run --no-fail-fast -Zbuild-std \
             --target x86_64-unknown-linux-gnu \
             --no-default-features --features std,crc,xz,enc,native-crypto \
             -p lzma-turbo --test mt_match_finder --test lzma2_mt_parity --test mt
@@ -606,6 +653,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: nightly-2026-09-01
@@ -641,7 +692,7 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a filters <<< "$MIRI_FILTERS"
-          cargo "+$RUST_TOOLCHAIN" test --locked --release --lib \
+          cargo "+$RUST_TOOLCHAIN" nextest run --no-fail-fast --locked --release --lib \
             --no-default-features --features std,enc,filters \
             -- "${filters[@]}"
 
@@ -728,6 +779,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -736,7 +791,7 @@ jobs:
       - name: Every verdict the README gives
         env:
           LZMA_TURBO_XZ_TESTS_REQUIRE: "1"
-        run: cargo test --locked -p lzma-turbo --test xz_utils
+        run: cargo nextest run --no-fail-fast --locked -p lzma-turbo --test xz_utils
 
   encoder-parity:
     name: encoder-parity-${{ matrix.platform }}
@@ -761,6 +816,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -788,23 +847,23 @@ jobs:
       - name: Bit-exact with the reference encoder
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test lzma_parity --test lzma2_encoder
+        run: cargo nextest run --no-fail-fast --locked --release -p lzma-turbo --test lzma_parity --test lzma2_encoder
       # The threaded encoder has to agree with the threaded reference, and
       # with itself at every thread count.
       - name: Bit-exact with the multi-threaded reference encoder
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test lzma2_mt_parity --test mt_match_finder
+        run: cargo nextest run --no-fail-fast --locked --release -p lzma-turbo --test lzma2_mt_parity --test mt_match_finder
       # Same rule for the BCJ, BCJ2 and delta converters, both directions.
       - name: Bit-exact with the reference filters
         env:
           LZMA_TURBO_LZMA_UTIL_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test filter_parity --test bcj2_parity
+        run: cargo nextest run --no-fail-fast --locked --release -p lzma-turbo --test filter_parity --test bcj2_parity
       - name: The .xz writer through every reader, and through xz and 7-Zip
         env:
           LZMA_TURBO_XZ_REQUIRE: "1"
           LZMA_TURBO_7ZZ_REQUIRE: "1"
-        run: cargo test --locked --release -p lzma-turbo --test xz_encoder
+        run: cargo nextest run --no-fail-fast --locked --release -p lzma-turbo --test xz_encoder
 
   # A fuzz target is in its own workspace under `fuzz/`, so `cargo test`,
   # `cargo clippy` and `cargo doc` never build one: an API change can leave a
