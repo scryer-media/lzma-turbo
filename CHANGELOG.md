@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Build: the `test` profile drops debuginfo, split debuginfo and incremental
+  compilation; a cold `cargo test --all-features --no-run` is about 19 s
+  instead of 21 s on an Apple M5 Max and the test run is unchanged. Raising
+  the crate or its hot dependencies to opt-level 3 was measured and left out.
+
 ## 0.9.2 - 2026-10-16
 
 - Fix the x86-64 binary-tree match finder crashing on Intel macOS release
