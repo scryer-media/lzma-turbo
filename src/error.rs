@@ -497,6 +497,19 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert_eq!(err.downcast::<Error>().ok(), Some(Error::Truncated));
 
+        // A source's own end-of-file error, payload or none, passes through.
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(ErrorKind::UnexpectedEof.into())
+            }
+        }
+        let err = crate::LzmaReader::new(Failing)
+            .err()
+            .expect("a failing source");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(err.get_ref().is_none(), "{err:?}");
+
         let err = crate::Lzma2Reader::new(&[][..], 41)
             .err()
             .expect("dict_prop 41");
