@@ -380,9 +380,8 @@ pub(crate) fn check(props: &LzmaEncProps) -> Result<(), Error> {
     {
         return Err(Error::Param);
     }
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-    if u64::from(props.dict_size) > (1u64 << K_DIC_LOG_SIZE_MAX_COMPRESS) {
-        return Err(Error::Param);
-    }
+    // The C also refuses `dictSize > 1 << kDicLogSizeMaxCompress` where it
+    // builds `g_FastPos`. That bound is 2^33 here, beyond any `u32`, so the
+    // check cannot fire and is not ported.
     Ok(())
 }

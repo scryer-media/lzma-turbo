@@ -69,11 +69,17 @@ crypto-host = ["std", "native-crypto"]
 # kernel that replaced a loop from the C, so that the A/B behind the change is
 # one binary with one branch - in the position a target-feature probe's cached
 # bool would sit - rather than two builds whose inlining and layout differ at
-# the couple of percent the comparison is written in. The toggles are
-# `LZMA_TURBO_MATCH_RUN`, `LZMA_TURBO_BCJ_SCAN` and `LZMA_TURBO_DELTA`, each
-# taking `scalar` for the loop the kernel replaced. Without the feature the
-# shipped build has neither the branch nor the environment lookup. See
-# `src/kernel_ab.rs` and `docs/simd-kernels-report.md`.
+# the couple of percent the comparison is written in. `LZMA_TURBO_MATCH_RUN`,
+# `LZMA_TURBO_BCJ_SCAN` and `LZMA_TURBO_DELTA` each take `scalar` for the loop
+# the kernel replaced. `LZMA_TURBO_BT_ASM` picks the bt thread's register walk:
+# on x86-64 `sdk` (what ships), `sdk-wide` or `earlier`; on macOS ARM64
+# `sdk-arm64-negative` (what ships), `sdk-arm64`, `sdk-arm64-wide` or
+# `portable`; unset selects what ships. `LZMA_TURBO_BCJ2`,
+# `LZMA_TURBO_TREE_KERNEL`, `LZMA_TURBO_MIXER`, `LZMA_TURBO_ENCODER`,
+# `LZMA_TURBO_FINDER` and `LZMA_TURBO_HC_HEADS` select the other diagnostic
+# arms. `src/kernel_ab.rs` documents every value. Without the feature the
+# shipped build has neither the branch nor the environment lookup, and the
+# diagnostic kernels are not compiled. See `docs/simd-kernels-report.md`.
 kernel-ab = ["std", "enc", "xz"]
 # Diagnostic counters inside the adaptive decoder, never default. It records
 # what the dispatcher did with each run - sent, refused, chased, and the peaks
