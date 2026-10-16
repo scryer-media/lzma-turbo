@@ -121,10 +121,12 @@ fn positional_ring_runs_match_the_sdk_vectors() {
                     )
                     .unwrap();
                 position += progress.read;
-                if progress.read == 0 && progress.written == 0 {
-                    assert_eq!(position, image.len());
+                // All input consumed and a call short of `max_output`: the
+                // run owes nothing more, so `finish` follows directly.
+                if position == image.len() && progress.written < 37019 {
                     break;
                 }
+                assert!(progress.read != 0 || progress.written != 0, "{name}");
             }
             decoder.finish(&cancel).unwrap();
         }
