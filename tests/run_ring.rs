@@ -148,14 +148,12 @@ fn failed_or_cancelled_ring_writes_never_complete() {
             })
             .unwrap_err();
         assert_eq!(accepted, 17);
-        assert_eq!(
-            error.kind(),
-            if cancel_write {
-                io::ErrorKind::Interrupted
-            } else {
-                io::ErrorKind::PermissionDenied
-            }
-        );
+        if cancel_write {
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.downcast::<Error>().ok(), Some(Error::Cancelled));
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
         cancel.store(false, Ordering::Release);
         assert!(
             decoder

@@ -19,9 +19,11 @@
     build it with `XzError::at` or `XzError::in_block`.
   - `From<Error> for io::Error`: `Unsupported` for `UnsupportedProps`,
     `InvalidData` for corrupt data, `UnexpectedEof` for truncation,
-    `OutOfMemory` for `Alloc` and `MemoryLimit`, `Interrupted` for
-    `Cancelled`, `InvalidInput` for `Param` and `Other` for
-    `InternalFailure`, `Read` and `Write`. The readers and decoders map
+    `OutOfMemory` for `Alloc` and `MemoryLimit`, `InvalidInput` for
+    `Param` and `Other` for `Cancelled`, `InternalFailure`, `Read` and
+    `Write`. A cancellation is not `Interrupted`, which std's read and copy
+    helpers retry; `RunDecoder::decode`, which reported it as
+    `Interrupted`, now reports it as `Other`. The readers and decoders map
     through it instead of calling everything `InvalidData`, the writers
     instead of calling everything `Other`, and `From<XzError>` keeps the
     class of an LZMA2 failure inside an xz block. A memory budget was

@@ -188,8 +188,8 @@ impl Lzma2RunDecoder {
     ///
     /// # Errors
     /// Corrupt data errors retain the run index and output offset. Sink errors pass
-    /// through unchanged; cancellation is `Error::Cancelled` in an
-    /// `Interrupted` I/O error. All errors poison the decoder.
+    /// through unchanged; cancellation is `Error::Cancelled` in an I/O error
+    /// of kind `Other`. All errors poison the decoder.
     pub fn decode<F>(
         &mut self,
         input: &[u8],

@@ -228,7 +228,9 @@ pub enum Error {
         /// Bytes the caller allowed.
         limit: u64,
     },
-    /// The caller cancelled the decode. `io::ErrorKind::Interrupted`.
+    /// The caller cancelled the decode. `io::ErrorKind::Other`, never
+    /// `Interrupted`, which std's read and copy helpers retry: a cancelled
+    /// read would spin instead of stop.
     Cancelled,
     /// C: `SZ_ERROR_PARAM`. An argument from the caller is out of range: an
     /// encoder setting, a range outside its buffer, a call out of sequence,
@@ -278,9 +280,10 @@ impl Error {
             Error::CorruptData | Error::CorruptRun { .. } => ErrorKind::InvalidData,
             Error::Truncated => ErrorKind::UnexpectedEof,
             Error::Alloc | Error::MemoryLimit { .. } => ErrorKind::OutOfMemory,
-            Error::Cancelled => ErrorKind::Interrupted,
             Error::Param => ErrorKind::InvalidInput,
-            Error::InternalFailure | Error::Read | Error::Write => ErrorKind::Other,
+            Error::Cancelled | Error::InternalFailure | Error::Read | Error::Write => {
+                ErrorKind::Other
+            }
         }
     }
 }
@@ -453,7 +456,7 @@ mod tests {
             (Error::InternalFailure, ErrorKind::Other),
             (Error::Alloc, ErrorKind::OutOfMemory),
             (Error::memory_limit(2, 1), ErrorKind::OutOfMemory),
-            (Error::Cancelled, ErrorKind::Interrupted),
+            (Error::Cancelled, ErrorKind::Other),
             (Error::Param, ErrorKind::InvalidInput),
             (Error::Read, ErrorKind::Other),
             (Error::Write, ErrorKind::Other),
@@ -516,7 +519,7 @@ mod tests {
             (XzErrorKind::memory_limit(2, 1), ErrorKind::OutOfMemory),
             (XzErrorKind::UnsupportedFilter, ErrorKind::Unsupported),
             (XzErrorKind::too_much_output(9), ErrorKind::InvalidData),
-            (XzErrorKind::Lzma(Error::Cancelled), ErrorKind::Interrupted),
+            (XzErrorKind::Lzma(Error::Cancelled), ErrorKind::Other),
             (XzErrorKind::Lzma(Error::Alloc), ErrorKind::OutOfMemory),
             (XzErrorKind::Lzma(Error::InternalFailure), ErrorKind::Other),
         ] {
