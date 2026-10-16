@@ -67,6 +67,25 @@ jobs:
             echo "raw benchmark evidence belongs outside the repository; see docs/benchmark-data.md" >&2
             exit 1
           fi
+      - name: No binaries under docs/ but small images
+        run: |
+          set -eu
+          # Whatever Git itself counts as binary, by content rather than by
+          # extension, so a renamed archive is caught too. Figures under
+          # docs/images/ are the one exception, and only while they stay small.
+          empty="$(git hash-object -t tree /dev/null)"
+          bad=""
+          for path in $(git diff --numstat "$empty" HEAD -- docs | awk '$1 == "-" { print $3 }'); do
+            if echo "$path" | grep -Eq '^docs/images/[^/]+\.(png|jpe?g|webp|gif)$' \
+              && [ "$(wc -c < "$path")" -le 524288 ]; then
+              continue
+            fi
+            bad="$bad $path"
+          done
+          if [ -n "$bad" ]; then
+            echo "binary files under docs/ (only images under docs/images/, at most 512 KiB):$bad" >&2
+            exit 1
+          fi
 
   fmt:
     name: fmt
@@ -76,21 +95,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # On every platform the test matrix covers: the assembly, the mapped
+  # output and the CRC dispatch are cfg'd per target, and a lint in code that
+  # only compiles on macOS or Windows is invisible to a Linux run.
   clippy:
-    name: clippy
-    runs-on: ubuntu-24.04
+    name: clippy-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: windows-x86_64
+            runner: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -106,7 +138,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo doc --locked --workspace --no-deps --all-features
@@ -135,7 +167,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install the xz the container tests are written against
@@ -201,6 +233,31 @@ jobs:
       - name: The encoder's bytes are the committed digests
         run: cargo xtask golden --check
 
+  # x86-64 macOS, under Rosetta on the arm64 runner. The x86-64 assembly is
+  # linked differently on Mach-O than on ELF or COFF - only an `L` label is
+  # assembler-local there, and the release build's `-dead_strip` removes code
+  # behind any other - so it has to be linked and run as a Mach-O release
+  # build: LTO and dead stripping are what broke it, and a debug build has
+  # neither. Rosetta 2 is part of the runner image.
+  rosetta:
+    name: rosetta-x86_64-macos
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-apple-darwin
+      - name: Rosetta can run x86-64 code
+        run: arch -x86_64 /usr/bin/true
+      - name: The shipped walks, released and dead-stripped, under Rosetta
+        run: cargo test --locked --release --target x86_64-apple-darwin -p lzma-turbo --lib --test mt_match_finder
+      - name: Every diagnostic walk, under Rosetta
+        run: cargo test --locked --release --target x86_64-apple-darwin -p lzma-turbo --features kernel-ab --lib --test mt_match_finder
+
   wasm:
     name: wasm-${{ matrix.lane }}
     runs-on: ubuntu-24.04
@@ -246,7 +303,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
@@ -286,7 +343,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -317,7 +374,7 @@ jobs:
         run: |
           version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo check --locked -p lzma-turbo --all-features
@@ -330,7 +387,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Verify the crates.io archive builds and carries no fixtures
@@ -382,7 +439,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Standard libraries for every target checked
@@ -454,7 +511,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Fetch the pinned LZMA SDK
@@ -507,7 +564,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Every buffer against a guard page
@@ -579,7 +636,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-09-01
           targets: x86_64-unknown-linux-gnu
@@ -615,7 +672,7 @@ jobs:
   # the build that ships: they must panic there too, not only under debug
   # assertions. Second, shared `zeroed_vec` in `src/buffer.rs`, which hands
   # decoder dictionaries and the match finder's window and tables over from
-  # `alloc_zeroed` through `Vec::from_raw_parts`; its encoder-wrapper test
+  # `alloc_zeroed` through `Vec::from_raw_parts`; its test there
   # allocates every `Zeroable` type at odd
   # lengths, reads, writes, grows and frees each, and Miri checks the layout,
   # the initialisation and the free. Third, the direct-input hand-off in
@@ -639,7 +696,7 @@ jobs:
       MIRI_TOOLCHAIN: nightly-2026-09-01
       MIRI_FILTERS: >-
         enc::lz_find_mt::tests::the_
-        enc::lz_find::tests::a_zeroed_vec_
+        buffer::tests::a_zeroed_vec_
         enc::lz_find_mt::tests::get_heads_
         enc::lz_find_mt::tests::held_records_preserve_short_output_and_synthetic_failure_state
         enc::lz_find_mt::tests::skip_spans_preserve_checked_
@@ -657,11 +714,11 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-09-01
           components: miri, rust-src
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Discover every selected Miri test
@@ -711,7 +768,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-09-01
           components: miri, rust-src
@@ -749,7 +806,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install the pinned xz
@@ -783,7 +840,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Fetch the XZ Utils test files
@@ -820,7 +877,7 @@ jobs:
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # The external-decode tests compare this crate's output with what `xz`
@@ -880,7 +937,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: nightly-2026-09-01
       - name: Install cargo-fuzz
@@ -907,7 +964,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, thread-sanitizer, unchecked-kernel-miri, vectors, xz-utils-suite, encoder-parity, fuzz-check, fuzz-differential]
+    needs: [hygiene, fmt, clippy, docs, test, rosetta, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, thread-sanitizer, unchecked-kernel-miri, vectors, xz-utils-suite, encoder-parity, fuzz-check, fuzz-differential]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

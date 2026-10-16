@@ -66,7 +66,7 @@ fn ring_runs_preserve_bytes_split_crc_and_partial_write_offsets() {
                 Ok(size)
             };
             let mut pos = 0;
-            while pos < packed.len() {
+            loop {
                 let end = (pos + input_step).min(packed.len());
                 let progress = decoder
                     .decode(&packed[pos..end], 37019, &cancel, &mut sink)
@@ -74,10 +74,9 @@ fn ring_runs_preserve_bytes_split_crc_and_partial_write_offsets() {
                 assert!(progress.read != 0 || progress.written != 0);
                 assert!(progress.written <= 37019);
                 pos += progress.read;
-            }
-            loop {
-                let progress = decoder.decode(&[], 37019, &cancel, &mut sink).unwrap();
-                if progress.written == 0 {
+                // The documented contract: once every input byte is consumed,
+                // a call that comes back short of `max_output` owes nothing.
+                if pos == packed.len() && progress.written < 37019 {
                     break;
                 }
             }
@@ -258,4 +257,108 @@ fn checksum_segments_are_reserved_before_a_run_can_write() {
             .len(),
         1000
     );
+}
+
+/// Incompressible bytes (stored chunks) followed by zeros (LZMA-coded).
+/// The coder takes the run's last input byte for its final symbol, a long
+/// match; a run ending `k` bytes past a step or ring edge, for `k` shorter
+/// than that match, has the match straddle the edge. The step that ends at
+/// the edge then consumes the last byte with up to `k` bytes still owed.
+fn tail_heavy(len: usize, zeros: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut bytes: Vec<u8> = (0..len - zeros)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    bytes.resize(len, 0);
+    bytes
+}
+
+fn single_run(original: &[u8], dict_size: u32) -> (u8, Vec<u8>, Lzma2Run) {
+    let (prop, mut packed) = encode_lzma2(
+        original,
+        &LzmaEncProps::new().with_level(1).with_dict_size(dict_size),
+    )
+    .unwrap();
+    let mut scanner = Lzma2RunScanner::new();
+    scanner.feed(&packed).unwrap();
+    let run = scanner.next_run().unwrap();
+    assert!(scanner.next_run().is_none());
+    assert_eq!(packed.pop(), Some(0));
+    (prop, packed, run)
+}
+
+/// One pass over the input, then `finish`: no empty-input drain call.
+fn one_pass(
+    prop: u8,
+    packed: &[u8],
+    run: Lzma2Run,
+    input_step: usize,
+    max_output: usize,
+) -> Result<Vec<u8>, Error> {
+    let cancel = AtomicBool::new(false);
+    let mut decoder = Lzma2RunDecoder::new(0, prop, run, u64::MAX).unwrap();
+    let mut actual = Vec::new();
+    let mut pos = 0;
+    loop {
+        let end = (pos + input_step).min(packed.len());
+        let progress = decoder
+            .decode(
+                &packed[pos..end],
+                max_output,
+                &cancel,
+                &mut |_, bytes: &[u8]| {
+                    actual.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                },
+            )
+            .unwrap();
+        pos += progress.read;
+        if pos == packed.len() && progress.written < max_output {
+            break;
+        }
+    }
+    decoder.finish(&cancel)?;
+    Ok(actual)
+}
+
+#[test]
+fn a_match_pending_at_a_ring_wrap_is_delivered_before_the_input_runs_out() {
+    // A 4 KiB dictionary caps the ring well below the run's length.
+    let probe = tail_heavy(300 << 10, 96 << 10);
+    let (prop, _, run) = single_run(&probe, 4096);
+    let ring =
+        (Lzma2RunDecoder::memory_required(prop, run.unpacked_len).unwrap() - (64 << 10)) as usize;
+    assert!(ring < 64 << 10, "the ring must be smaller than the run");
+    for k in 1..=48 {
+        let original = tail_heavy(75 * ring + k, 96 << 10);
+        let (prop, packed, run) = single_run(&original, 4096);
+        assert!(run.chunks.copy_chunks > 1 && run.chunks.lzma_chunks > 0);
+        for (input_step, max_output) in [(packed.len(), usize::MAX), (1, usize::MAX), (4093, 37019)]
+        {
+            let actual = one_pass(prop, &packed, run, input_step, max_output);
+            assert!(
+                actual.as_deref() == Ok(&original[..]),
+                "k {k} input step {input_step} max {max_output}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_match_pending_at_a_step_edge_is_delivered_before_the_input_runs_out() {
+    // The dictionary holds the whole run, so the ring never wraps, and with
+    // no stored chunk to cut a step short a one-call decode steps at 256 KiB
+    // multiples. Past 2 MiB the encoder starts a second LZMA chunk.
+    for k in 1..=48 {
+        let original = vec![0; (11 << 18) + k];
+        let (prop, packed, run) = single_run(&original, 4 << 20);
+        assert!(run.chunks.lzma_chunks > 1 && run.chunks.copy_chunks == 0);
+        let actual = one_pass(prop, &packed, run, packed.len(), usize::MAX);
+        assert!(actual.as_deref() == Ok(&original[..]), "k {k}");
+    }
 }

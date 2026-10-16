@@ -187,43 +187,6 @@ fn copy_main(src: &[u8], dest: &mut [u8], mut v: u32) -> (usize, u32, bool) {
     (copied, v, false)
 }
 
-// Preserve the previous grouped scan as an independent differential arm.
-// Its frozen archive-path binaries remain in the performance evidence.
-#[cfg(test)]
-fn copy_main_grouped(src: &[u8], dest: &mut [u8], mut v: u32) -> (usize, u32, bool) {
-    let n = src.len().min(dest.len());
-    let mut copied = 0;
-    while copied < n {
-        let mut end = n;
-        if n - copied >= 8 {
-            let word =
-                u64::from_le_bytes(src[copied..copied + 8].try_into().expect("eight-byte word"));
-            let branch = (word ^ 0xe8e8_e8e8_e8e8_e8e8) & 0xfefe_fefe_fefe_fefe;
-            let escape = word ^ 0x0f0f_0f0f_0f0f_0f0f;
-            let possible = ((branch.wrapping_sub(0x0101_0101_0101_0101) & !branch)
-                | (escape.wrapping_sub(0x0101_0101_0101_0101) & !escape))
-                & 0x8080_8080_8080_8080;
-            if possible == 0 && !is_long_jump((v << 24) | u32::from(word as u8)) {
-                v = (u32::from((word >> 48) as u8) << 24) | u32::from((word >> 56) as u8);
-                copied += 8;
-                continue;
-            }
-            end = copied + 8;
-        }
-        while copied < end {
-            let b = u32::from(src[copied]);
-            copied += 1;
-            v = (v << 24) | b;
-            if is_branch_byte(b) || is_long_jump(v) {
-                dest[..copied].copy_from_slice(&src[..copied]);
-                return (copied, v, true);
-            }
-        }
-    }
-    dest[..copied].copy_from_slice(&src[..copied]);
-    (copied, v, false)
-}
-
 /// C: the probability index, `((0 - c) & (Byte)(v >> 24)) + c + ((v >> 5) & 1)`
 /// — `0` and `1` for the two shapes of jump, `2 + prev` for a call.
 #[inline]
@@ -1184,12 +1147,6 @@ mod tests {
                         let mut actual = vec![0xcc; size];
                         assert_eq!(copy_main(source, &mut actual, context), (count, v, found));
                         assert_eq!(actual, expected);
-                        actual.fill(0xcc);
-                        assert_eq!(
-                            copy_main_grouped(source, &mut actual, context),
-                            (count, v, found)
-                        );
-                        assert_eq!(actual, expected);
                     }
                 }
             }
@@ -1319,6 +1276,59 @@ mod tests {
                 d += st.dest_pos;
             }
             assert_eq!(out, src, "chunk {chunk}");
+        }
+    }
+
+    /// `required_input` names the one stream a stalled decoder is waiting for,
+    /// so a threaded coder graph can refill only that one. Starting with every
+    /// stream empty and topping up only the named stream must decode it all.
+    #[test]
+    fn refilling_only_the_required_stream_decodes_everything() {
+        let src = code_like(0x5EED_1234, 20_011);
+        let s = encode_to_streams(&src);
+        let streams: [&[u8]; NUM_STREAMS] = [&s.main, &s.call, &s.jump, &s.rc];
+        let mut dec = Bcj2Dec::new();
+        let mut out = vec![0u8; src.len()];
+        let (mut offered, mut used) = ([0usize; NUM_STREAMS], [0usize; NUM_STREAMS]);
+        let mut d = 0;
+        for _ in 0..1_000_000 {
+            if d == src.len() {
+                break;
+            }
+            let window = (src.len() - d).min(97);
+            let mut st = Bcj2DecStreams::new(
+                &streams[STREAM_MAIN][used[STREAM_MAIN]..offered[STREAM_MAIN]],
+                &streams[STREAM_CALL][used[STREAM_CALL]..offered[STREAM_CALL]],
+                &streams[STREAM_JUMP][used[STREAM_JUMP]..offered[STREAM_JUMP]],
+                &streams[STREAM_RC][used[STREAM_RC]..offered[STREAM_RC]],
+                &mut out[d..d + window],
+            );
+            dec.decode(&mut st).expect("decode");
+            for (i, rest) in st.bufs.iter().enumerate() {
+                used[i] = offered[i] - rest.len();
+            }
+            let written = st.dest_pos;
+            d += written;
+            match dec.required_input() {
+                Some(i) => {
+                    assert_eq!(used[i], offered[i], "stream {i} was named with bytes left");
+                    if d < src.len() {
+                        assert!(offered[i] < streams[i].len(), "stream {i} has no more");
+                    }
+                    let step = if i == STREAM_CALL || i == STREAM_JUMP {
+                        4
+                    } else {
+                        1
+                    };
+                    offered[i] = (offered[i] + step).min(streams[i].len());
+                }
+                None => assert_eq!(written, window, "None must mean the output filled"),
+            }
+        }
+        assert_eq!(d, src.len(), "the decoder stalled");
+        assert_eq!(out, src);
+        for i in 0..NUM_STREAMS {
+            assert_eq!(used[i], streams[i].len(), "stream {i} was not consumed");
         }
     }
 

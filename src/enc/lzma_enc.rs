@@ -2458,9 +2458,7 @@ impl LzmaEnc {
         src_len: usize,
         keep_window_size: u32,
     ) -> Result<(), Error> {
-        // Larger custom blocks retain the streamed-window implementation.
-        // This bound keeps every direct position below normalization.
-        assert!(src_len <= 1 << 30);
+        assert!(src_len <= OWNED_BLOCK_MAX);
         self.set_data_size(src_len as u64);
         self.alloc_and_init(keep_window_size, true, true)
     }
@@ -2647,6 +2645,12 @@ fn pos_slot_clz(pos: u32) -> u32 {
     let zz = 30 - pos.leading_zeros();
     zz * 2 + (pos >> zz)
 }
+
+/// The largest block an owned or direct-input window takes. It keeps every
+/// position in the block below the match finder's normalization threshold;
+/// a larger custom block keeps the streamed-window implementation.
+#[cfg(feature = "std")]
+pub(crate) const OWNED_BLOCK_MAX: usize = 1 << 30;
 
 #[cfg(all(test, feature = "std"))]
 mod tests {

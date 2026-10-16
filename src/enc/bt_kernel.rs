@@ -86,98 +86,38 @@ pub(crate) fn get_matches_spec_n_2_reg(
             all(target_arch = "aarch64", target_os = "macos")
         )
     ))]
-    match crate::kernel_ab::bt_variant() {
-        1 => {
-            return get_matches_spec_n_2_reg_variant::<1>(
-                win,
-                len_limit_0,
-                pos,
-                cur,
-                son,
-                cut_value,
-                d,
-                di,
-                max_len_0,
-                heads,
-                hi,
-                limit,
-                hsize,
-                cyclic_buffer_pos,
-                cyclic_buffer_size,
-            );
+    {
+        macro_rules! variant {
+            ($v:literal) => {
+                return get_matches_spec_n_2_reg_variant::<$v>(
+                    win,
+                    len_limit_0,
+                    pos,
+                    cur,
+                    son,
+                    cut_value,
+                    d,
+                    di,
+                    max_len_0,
+                    heads,
+                    hi,
+                    limit,
+                    hsize,
+                    cyclic_buffer_pos,
+                    cyclic_buffer_size,
+                )
+            };
         }
-        2 => {
-            return get_matches_spec_n_2_reg_variant::<2>(
-                win,
-                len_limit_0,
-                pos,
-                cur,
-                son,
-                cut_value,
-                d,
-                di,
-                max_len_0,
-                heads,
-                hi,
-                limit,
-                hsize,
-                cyclic_buffer_pos,
-                cyclic_buffer_size,
-            );
+        // The production variant falls through to the call below.
+        match crate::kernel_ab::bt_variant() {
+            0 => variant!(0),
+            2 => variant!(2),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            3 => variant!(3),
+            _ => {}
         }
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        3 => {
-            return get_matches_spec_n_2_reg_variant::<3>(
-                win,
-                len_limit_0,
-                pos,
-                cur,
-                son,
-                cut_value,
-                d,
-                di,
-                max_len_0,
-                heads,
-                hi,
-                limit,
-                hsize,
-                cyclic_buffer_pos,
-                cyclic_buffer_size,
-            );
-        }
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        4 => {
-            return get_matches_spec_n_2_reg_variant::<4>(
-                win,
-                len_limit_0,
-                pos,
-                cur,
-                son,
-                cut_value,
-                d,
-                di,
-                max_len_0,
-                heads,
-                hi,
-                limit,
-                hsize,
-                cyclic_buffer_pos,
-                cyclic_buffer_size,
-            );
-        }
-        _ => {}
     }
-    get_matches_spec_n_2_reg_variant::<
-        {
-            if cfg!(feature = "kernel-ab") {
-                0
-            } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
-                4
-            } else {
-                1
-            }
-        },
-    >(
+    get_matches_spec_n_2_reg_variant::<PRODUCTION_VARIANT>(
         win,
         len_limit_0,
         pos,
@@ -195,6 +135,31 @@ pub(crate) fn get_matches_spec_n_2_reg(
         cyclic_buffer_size,
     )
 }
+
+/// The register-walk variant a build ships: `sdk_walk_arm64_negative` on
+/// macOS ARM64, `sdk_walk_faithful` on x86-64, and the portable pointer walk
+/// on every other ARM64 target (which every variant below 2 also selects on
+/// macOS ARM64).
+///
+/// Variant numbers, per target:
+///
+/// | `VARIANT` | x86-64                  | macOS ARM64              |
+/// |-----------|-------------------------|--------------------------|
+/// | 0         | `sdk_walk`              | portable walk            |
+/// | 1         | `sdk_walk_faithful`     | portable walk            |
+/// | 2         | `sdk_walk_faithful_wide`| `sdk_walk_arm64`         |
+/// | 3         | (as 1)                  | `sdk_walk_arm64_wide`    |
+/// | 4         | (as 1)                  | `sdk_walk_arm64_negative`|
+///
+/// Only the production variant is compiled into a build without `test` or
+/// `kernel-ab`; `crate::kernel_ab::bt_variant` maps `LZMA_TURBO_BT_ASM` onto
+/// the others.
+pub(crate) const PRODUCTION_VARIANT: u8 = if cfg!(all(target_arch = "aarch64", target_os = "macos"))
+{
+    4
+} else {
+    1
+};
 
 /// Shared margin proof for all assembly variants. Tests select each variant
 /// explicitly, without process-global environment changes or races.
@@ -303,11 +268,14 @@ pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
         // The guards preserve 32-bit positions and debug cut-count overflow.
         // The assembly borrows these slices only for this call, preserves all
         // callee-saved registers, and writes only the exclusive son/d/pos_res.
+        #[cfg(any(test, feature = "kernel-ab"))]
         let walk = match VARIANT {
-            4 => sdk_walk_arm64_negative,
+            2 => sdk_walk_arm64,
             3 => sdk_walk_arm64_wide,
-            _ => sdk_walk_arm64,
+            _ => sdk_walk_arm64_negative,
         };
+        #[cfg(not(any(test, feature = "kernel-ab")))]
+        let walk = sdk_walk_arm64_negative;
         let end = unsafe {
             walk(
                 win.as_ptr().add(len_limit_0),
@@ -345,16 +313,12 @@ pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
         let mut pos_res = pos;
         #[cfg(any(test, feature = "kernel-ab"))]
         let walk = match VARIANT {
-            1 => sdk_walk_faithful,
+            0 => sdk_walk,
             2 => sdk_walk_faithful_wide,
-            _ => sdk_walk,
+            _ => sdk_walk_faithful,
         };
         #[cfg(not(any(test, feature = "kernel-ab")))]
-        let walk = if VARIANT == 1 {
-            sdk_walk_faithful
-        } else {
-            sdk_walk
-        };
+        let walk = sdk_walk_faithful;
         // SAFETY: A/B bound every tree node; C/D bound the current and
         // lookahead bytes; E and the assembly's descending-child checks bound
         // backward reads. F reserves all output writes. The guards above
@@ -650,11 +614,17 @@ pub(crate) fn get_matches_spec_n_2_reg_variant<const VARIANT: u8>(
 }
 
 /// C: GetMatchesSpecN_2 in SDK 26.03's C/LzFindOpt.c, ARM64 register map.
+/// Diagnostic: compiled only for tests and the `kernel-ab` feature.
 ///
 /// # Safety
 /// Requires the A-F margins and integer guards established by the wrapper.
 /// Native differential tests cover mutations and refusals; Miri uses Rust.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "macos",
+    not(miri),
+    any(test, feature = "kernel-ab")
+))]
 #[allow(clippy::too_many_arguments)]
 #[unsafe(naked)]
 unsafe extern "C" fn sdk_walk_arm64(
@@ -676,11 +646,16 @@ unsafe extern "C" fn sdk_walk_arm64(
 }
 
 /// SDK ARM64 flow retaining the portable walk's bounded word scan and early
-/// child fetch. Diagnostic only; the unmodified SDK variant remains available.
+/// child fetch. Diagnostic: compiled only for tests and `kernel-ab`.
 ///
 /// # Safety
 /// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "macos",
+    not(miri),
+    any(test, feature = "kernel-ab")
+))]
 #[allow(clippy::too_many_arguments)]
 #[unsafe(naked)]
 unsafe extern "C" fn sdk_walk_arm64_wide(
@@ -701,11 +676,12 @@ unsafe extern "C" fn sdk_walk_arm64_wide(
     core::arch::naked_asm!(include_str!("bt_kernel_aarch64_sdk_wide.S"), options(raw))
 }
 
-/// SDK GetMatchesSpecN_2 negative-offset control flow ported to ARM64.
+/// SDK GetMatchesSpecN_2 negative-offset control flow ported to ARM64: the
+/// walk macOS ARM64 builds with `asm` ship.
 ///
 /// # Safety
 /// Requires the same A-F margins and integer guards as `sdk_walk_arm64`.
-/// The native register-walk differential suite checks this diagnostic port.
+/// The native register-walk differential suite checks this port.
 #[cfg(all(target_arch = "aarch64", target_os = "macos", not(miri)))]
 #[allow(clippy::too_many_arguments)]
 #[unsafe(naked)]
@@ -727,7 +703,17 @@ unsafe extern "C" fn sdk_walk_arm64_negative(
     core::arch::naked_asm!(include_str!("bt_kernel_aarch64_negative.S"), options(raw))
 }
 
+// Local labels in every included `.S` file use the bare `L` prefix, never
+// `.L`. The files go through no preprocessor, so one spelling serves all
+// three object formats: `L` is assembler-local on Mach-O, and on ELF and COFF
+// it is a file-local symbol, which is harmless. A `.L` label is an ordinary
+// symbol on Mach-O: it starts a new atom, and `-dead_strip` deletes the atoms
+// nothing names, which removed fall-through code from the x86-64 kernels on
+// x86_64-apple-darwin. The decoder kernels follow the same rule.
+
 /// C: GetMatchesSpecN_2 in SDK 26.03's LzFindOpt.asm, System V register map.
+/// The earlier x86-64 walk, superseded by `sdk_walk_faithful` and compiled
+/// only for tests and the `kernel-ab` feature.
 ///
 /// # Safety
 ///
@@ -735,7 +721,7 @@ unsafe extern "C" fn sdk_walk_arm64_negative(
 /// in get_matches_spec_n_2_reg. The routine saves all System V callee-saved
 /// registers and uses its own aligned stack frame. Miri uses the Rust walk;
 /// native differential tests exercise these same margins with this assembly.
-#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[cfg(all(target_arch = "x86_64", not(miri), any(test, feature = "kernel-ab")))]
 #[allow(clippy::too_many_arguments)]
 #[unsafe(naked)]
 unsafe extern "sysv64" fn sdk_walk(

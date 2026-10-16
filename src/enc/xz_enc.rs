@@ -531,28 +531,15 @@ impl XzEncoder {
     fn block_ready_to(&mut self, out: &mut impl super::stream::SeqOutStream) -> Result<(), Error> {
         #[cfg(feature = "std")]
         if self.threads > 1 {
-            self.queue.try_reserve(1).map_err(|_| Error::Alloc)?;
-            self.queue.push(core::mem::take(&mut self.pending));
-            if self.queue.len() >= self.threads {
+            if self.queue_pending()? {
                 self.flush_queue_to(out)?;
             }
-            self.pending = self.spares.pop().unwrap_or_default();
-            self.pending.clear();
+            self.take_spare_from_batch();
             return Ok(());
         }
-        let data = core::mem::take(&mut self.pending);
-        let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
-        let block = compress_block(
-            lzma2,
-            self.check,
-            &self.filters,
-            self.dict_prop,
-            data,
-            Vec::new(),
-        )?;
+        let block = self.compress_pending()?;
         self.append_block_to(block, out)?;
-        self.pending = core::mem::take(&mut self.spare);
-        self.pending.clear();
+        self.take_spare();
         Ok(())
     }
 
@@ -561,17 +548,50 @@ impl XzEncoder {
     fn block_ready(&mut self) -> Result<(), Error> {
         #[cfg(feature = "std")]
         if self.threads > 1 {
-            let block = core::mem::take(&mut self.pending);
-            self.queue.try_reserve(1).map_err(|_| Error::Alloc)?;
-            self.queue.push(block);
-            if self.queue.len() >= self.threads {
+            if self.queue_pending()? {
                 self.flush_queue()?;
             }
-            self.pending = self.spares.pop().unwrap_or_default();
-            self.pending.clear();
+            self.take_spare_from_batch();
             return Ok(());
         }
         self.emit_block()
+    }
+
+    /// Queues [`XzEncoder::pending`] for the next parallel batch; `true` once
+    /// the batch is full and should be compressed.
+    #[cfg(feature = "std")]
+    fn queue_pending(&mut self) -> Result<bool, Error> {
+        self.queue.try_reserve(1).map_err(|_| Error::Alloc)?;
+        self.queue.push(core::mem::take(&mut self.pending));
+        Ok(self.queue.len() >= self.threads)
+    }
+
+    /// Refills [`XzEncoder::pending`] with a buffer a batch handed back.
+    #[cfg(feature = "std")]
+    fn take_spare_from_batch(&mut self) {
+        self.pending = self.spares.pop().unwrap_or_default();
+        self.pending.clear();
+    }
+
+    /// Compresses [`XzEncoder::pending`] on this thread as one block.
+    fn compress_pending(&mut self) -> Result<Block, Error> {
+        let data = core::mem::take(&mut self.pending);
+        let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
+        compress_block(
+            lzma2,
+            self.check,
+            &self.filters,
+            self.dict_prop,
+            data,
+            Vec::new(),
+        )
+    }
+
+    /// Keeps the last block's buffer for the next one; the filters worked in
+    /// place, so it is the right size already.
+    fn take_spare(&mut self) {
+        self.pending = core::mem::take(&mut self.spare);
+        self.pending.clear();
     }
 
     /// Compresses every queued block at once and appends them in order.
@@ -724,21 +744,9 @@ impl XzEncoder {
     /// Spec §3: header, compressed data, padding to a multiple of four, then
     /// the check.
     fn emit_block(&mut self) -> Result<(), Error> {
-        let data = core::mem::take(&mut self.pending);
-        let lzma2 = self.lzma2.as_mut().ok_or(Error::InternalFailure)?;
-        let block = compress_block(
-            lzma2,
-            self.check,
-            &self.filters,
-            self.dict_prop,
-            data,
-            Vec::new(),
-        )?;
-        // Keep the block's buffer for the next one; the filters worked in
-        // place, so it is the right size already.
+        let block = self.compress_pending()?;
         self.append_block(block)?;
-        self.pending = core::mem::take(&mut self.spare);
-        self.pending.clear();
+        self.take_spare();
         Ok(())
     }
 

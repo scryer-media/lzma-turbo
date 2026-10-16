@@ -610,16 +610,9 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
 /// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-// On x86-64 and ARM64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
-// one is the tests' and other targets'.
-#[cfg_attr(
-    all(
-        feature = "asm",
-        any(target_arch = "x86_64", target_arch = "aarch64"),
-        not(feature = "kernel-ab")
-    ),
-    allow(dead_code)
-)]
+// On x86-64 and ARM64 with `asm` the bt thread runs `bt_kernel`'s walk, which
+// falls back to this one when the output does not have room for its unchecked
+// writes; other targets run this one throughout.
 pub(super) fn get_matches_spec_n_2(
     win: &[u8],
     len_limit_0: usize,
@@ -894,8 +887,8 @@ pub(super) fn get_matches_spec_n_2(
 }
 
 // The bt thread uses the register-shaped kernel with `asm`: SDK assembly on
-// x86-64, its portable pointer walk on ARM64. Other targets keep the slice
-// walk. The register-walk differential tests compare answers and mutations.
+// x86-64 and on macOS ARM64, the portable pointer walk on other ARM64 targets.
+// Other targets keep the slice walk. The register-walk differential tests compare answers and mutations.
 // With `kernel-ab`, LZMA_TURBO_TREE_KERNEL selects the benchmark variant.
 type TreeWalk = fn(
     &[u8],
@@ -1456,12 +1449,72 @@ struct BtState {
 
 /// Only real producer acquisition grants `Produced`: a header in range is
 /// insufficient for manually populated buffers. Never survives a handoff.
+///
+/// Production reads only `Produced`. Tests also tell an empty block and a
+/// parked failure apart; outside tests both are recorded as `Untrusted`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RecordOrigin {
     Untrusted,
     Produced,
+    #[cfg(test)]
     Empty,
+    #[cfg(test)]
     Parked,
+}
+
+impl RecordOrigin {
+    /// A block whose header holds no record.
+    #[cfg(test)]
+    const EMPTY: Self = Self::Empty;
+    #[cfg(not(test))]
+    const EMPTY: Self = Self::Untrusted;
+    /// The failure park, after a refused or failed block.
+    #[cfg(test)]
+    const PARKED: Self = Self::Parked;
+    #[cfg(not(test))]
+    const PARKED: Self = Self::Untrusted;
+}
+
+/// The record cursor a skip walks: the SDK's direct pointer over a certified
+/// block ([`HeldRecords`]) or the indexed walk over any held block.
+trait SkipRecords {
+    /// # Safety
+    /// The cursor is not at its end, and the record there is complete: its
+    /// count plus one lands on another record or exactly on the end.
+    unsafe fn step(&mut self);
+    fn at_end(&self) -> bool;
+}
+
+impl SkipRecords for HeldRecords<'_> {
+    #[inline(always)]
+    unsafe fn step(&mut self) {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.advance() };
+    }
+
+    #[inline(always)]
+    fn at_end(&self) -> bool {
+        HeldRecords::at_end(self)
+    }
+}
+
+/// Indexed records in one held block, bounds-checked by the slice.
+struct IndexedRecords<'a> {
+    bt: &'a [u32],
+    pos: usize,
+    limit: usize,
+}
+
+impl SkipRecords for IndexedRecords<'_> {
+    #[inline(always)]
+    unsafe fn step(&mut self) {
+        self.pos += self.bt[self.pos] as usize + 1;
+    }
+
+    #[inline(always)]
+    fn at_end(&self) -> bool {
+        self.pos == self.limit
+    }
 }
 
 /// A local SDK `btBufPos` cursor, confined to one acquired producer block.
@@ -2610,7 +2663,7 @@ impl MatchFinderMt {
             .checked_add(add_after)
             .ok_or(Error::Param)?;
         let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
-        Ok(base + super::lz_find::MatchTables::padded_words(hash_words + bt_words + 2)? as u64 * 4)
+        Ok(base + super::lz_find::MatchTables::padded_len(hash_words + bt_words + 2)? as u64 * 4)
     }
 
     /// What this finder has allocated, in bytes: the window, the tables, and
@@ -2856,7 +2909,7 @@ impl MatchFinderMt {
         l.record_origin = RecordOrigin::Untrusted;
         if l.failure_lz_bt {
             l.bt_buf_pos = BT_BUFFER_SIZE;
-            l.record_origin = RecordOrigin::Parked;
+            l.record_origin = RecordOrigin::PARKED;
         } else {
             let bi = if c.inline {
                 // SAFETY: inline, this thread is the bt thread too, and holds
@@ -2887,7 +2940,7 @@ impl MatchFinderMt {
                 l.bt_buf_pos = BT_BUFFER_SIZE;
                 l.bt_buf_pos_limit = BT_BUFFER_SIZE + 1;
                 l.failure_lz_bt = true;
-                l.record_origin = RecordOrigin::Parked;
+                l.record_origin = RecordOrigin::PARKED;
                 // C: "we don't want to decrease AvailBytes, that was load
                 // before".
             } else {
@@ -2897,7 +2950,7 @@ impl MatchFinderMt {
                 // can touch this block until we hand it back. Inline uses the
                 // same builder and must return normally to reach this point.
                 l.record_origin = if num_items == 2 {
-                    RecordOrigin::Empty
+                    RecordOrigin::EMPTY
                 } else {
                     RecordOrigin::Produced
                 };
@@ -3379,7 +3432,7 @@ unsafe fn consume_matches<const MIX: u8, const SDK: bool>(
 /// nonzero and within advertised input availability. Produced records form a
 /// complete partition, so each count advance reaches a record or exactly end.
 #[inline]
-unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num: u32) -> u32 {
+unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, num: u32) -> u32 {
     // SAFETY: the caller holds the certified block and both consumer domains.
     let (mut records, hash, win) = unsafe {
         (
@@ -3388,6 +3441,30 @@ unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num:
             c.win(l.pointer_to_cur_pos, l.bt_num_avail_bytes as usize),
         )
     };
+    // SAFETY: the first record was nonempty and the producer's partition
+    // bounds every later advance; see `skip_span`.
+    let num = unsafe { skip_span::<MIN_LEN, _>(c, l, hash, win, &mut records, num) };
+    l.bt_buf_pos = records.position();
+    num
+}
+
+/// The skip loop both cursors share: hash the skipped positions' low bytes
+/// and step one record per position, stopping at `num` or the block's end.
+/// Writes back the availability, window cursor and LZ position; the caller
+/// stores the record cursor. Returns the positions still to skip.
+///
+/// # Safety
+/// `records` is not at its end and satisfies [`SkipRecords::step`] for every
+/// record up to its end. `num` is nonzero.
+#[inline(always)]
+unsafe fn skip_span<const MIN_LEN: u32, R: SkipRecords>(
+    c: &Common,
+    l: &mut LzState,
+    hash: &mut [u32],
+    win: &[u8],
+    records: &mut R,
+    mut num: u32,
+) -> u32 {
     let hash_len = match MIN_LEN {
         3 => K_FIX4_HASH_SIZE,
         2 => K_HASH2_SIZE as usize,
@@ -3398,6 +3475,10 @@ unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num:
     let mut cur = l.pointer_to_cur_pos;
     let mut pos = l.lz_pos;
     if MIN_LEN != 0 && avail >= MIN_LEN {
+        // C: the same consecutive cur pointers, bounded once by the bytes
+        // this block published. A block handoff discards the iterator before
+        // the window can move or the low hash can normalize. Mix::Four also
+        // uses three bytes here, including the SDK's last-three-byte tail.
         let before = num;
         let count = num.min(avail - (MIN_LEN - 1));
         let span = count as usize + MIN_LEN as usize - 1;
@@ -3410,9 +3491,9 @@ unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num:
                 hash[K_FIX3_HASH_SIZE + h3] = pos;
             }
             pos += 1;
-            // SAFETY: the first record was nonempty; each preceding advance
-            // tested end before another iteration. Producer partition bounds it.
-            unsafe { records.advance() };
+            // SAFETY: the cursor started inside the block; each preceding
+            // step tested the end before another iteration.
+            unsafe { records.step() };
             num -= 1;
             if num == 0 || records.at_end() {
                 break;
@@ -3422,13 +3503,16 @@ unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num:
         avail = avail.wrapping_sub(skipped);
         cur += skipped as usize;
     }
+    // C: no low hash for Bt2, or fewer than MIN_LEN bytes left. Failure
+    // parking still advances one published position at a time and must not
+    // discard an earlier availability promise.
     if num != 0 && !records.at_end() {
         loop {
             avail = avail.wrapping_sub(1);
             pos += 1;
             cur += 1;
             // SAFETY: as above, only complete records inside the held block.
-            unsafe { records.advance() };
+            unsafe { records.step() };
             num -= 1;
             if num == 0 || records.at_end() {
                 break;
@@ -3438,7 +3522,6 @@ unsafe fn consume_skip<const MIN_LEN: u32>(c: &Common, l: &mut LzState, mut num:
     l.bt_num_avail_bytes = avail;
     l.pointer_to_cur_pos = cur;
     l.lz_pos = pos;
-    l.bt_buf_pos = records.position();
     num
 }
 
@@ -3657,27 +3740,23 @@ impl MatchFinderMt {
     /// read only inline.
     pub(crate) fn skip(&mut self, stream: &mut dyn SeqInStream, num: u32) {
         match self.shared().common().mix {
-            Mix::None => self.skip_kind::<0, false>(stream, num),
-            Mix::Two => self.skip_kind::<2, false>(stream, num),
+            Mix::None => self.skip_kind::<0>(stream, num),
+            Mix::Two => self.skip_kind::<2>(stream, num),
             // C: `MatchFinderMt3_Skip` is used for both 4 and 5 hash bytes;
             // "the difference is that MatchFinderMt3_Skip() updates hash for
             // last 3 bytes of stream".
-            Mix::Three | Mix::Four => self.skip_kind::<3, false>(stream, num),
+            Mix::Three | Mix::Four => self.skip_kind::<3>(stream, num),
         }
     }
 
     /// C: each specialized `MatchFinderMt*_Skip`, retaining the held block
     /// and window until `GET_NEXT_BLOCK_IF_REQUIRED` must hand them back.
-    fn skip_kind<const MIN_LEN: u32, const CHECKED: bool>(
-        &mut self,
-        stream: &mut dyn SeqInStream,
-        mut num: u32,
-    ) {
+    fn skip_kind<const MIN_LEN: u32>(&mut self, stream: &mut dyn SeqInStream, mut num: u32) {
         loop {
             self.next_block_if_required(stream);
-            if !CHECKED {
-                let sh = self.shared();
-                let c = sh.common();
+            let sh = self.shared();
+            let c = sh.common();
+            {
                 // SAFETY: only the consumer owns LZ state. Neither a held
                 // record view nor a window view survives this branch.
                 let l = unsafe { &mut *sh.lz_state.get() };
@@ -3691,8 +3770,6 @@ impl MatchFinderMt {
                     continue;
                 }
             }
-            let sh = self.shared();
-            let c = sh.common();
             // SAFETY: the LZ thread owns its state and low hash. The held
             // block publishes this prefix and prevents slides during use.
             let (l, hash, win) = unsafe {
@@ -3701,11 +3778,44 @@ impl MatchFinderMt {
                 (l, c.low_hash(), win)
             };
             // SAFETY: the lz thread holds the block `bt_buf_pos` is in.
-            // The inner loop stops before the next handoff, so these views
-            // never survive a block release or a window slide.
+            // The span stops before the next handoff, so these views never
+            // survive a block release or a window slide.
             let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
-            // C: the specialized SKIP loop's hash extent and cursor locals.
-            // Keep one checked table extent for the masked indices below.
+            let mut records = IndexedRecords {
+                bt,
+                pos: l.bt_buf_pos - base,
+                limit: l.bt_buf_pos_limit - base,
+            };
+            // SAFETY: `IndexedRecords::step` is bounds-checked by the slice,
+            // so a malformed block panics instead of reading outside it.
+            num = unsafe { skip_span::<MIN_LEN, _>(c, l, hash, win, &mut records, num) };
+            l.bt_buf_pos = base + records.pos;
+            if num == 0 {
+                return;
+            }
+        }
+    }
+
+    /// The original indexed SDK port of `skip_kind`, kept as the differential
+    /// reference for the entire held-block state transition.
+    #[cfg(test)]
+    fn skip_kind_checked<const MIN_LEN: u32>(
+        &mut self,
+        stream: &mut dyn SeqInStream,
+        mut num: u32,
+    ) {
+        loop {
+            self.next_block_if_required(stream);
+            let sh = self.shared();
+            let c = sh.common();
+            // SAFETY: as in `skip_kind`.
+            let (l, hash, win) = unsafe {
+                let l = &mut *sh.lz_state.get();
+                let win = c.win(l.pointer_to_cur_pos, l.bt_num_avail_bytes as usize);
+                (l, c.low_hash(), win)
+            };
+            // SAFETY: as in `skip_kind`.
+            let (base, bt) = unsafe { c.bt_held(l.bt_buf_pos) };
             let hash_len = match MIN_LEN {
                 3 => K_FIX4_HASH_SIZE,
                 2 => K_HASH2_SIZE as usize,
@@ -3717,74 +3827,25 @@ impl MatchFinderMt {
             let mut pos = l.lz_pos;
             let mut bt_pos = l.bt_buf_pos - base;
             let bt_limit = l.bt_buf_pos_limit - base;
-            if CHECKED {
-                // The original indexed SDK port remains the differential
-                // reference for the entire held-block state transition.
-                loop {
-                    if MIN_LEN != 0 && avail >= MIN_LEN {
-                        let bytes = &win[cur..cur + MIN_LEN as usize];
-                        let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
-                        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-                        hash[h2] = pos;
-                        if MIN_LEN == 3 {
-                            let h3 =
-                                ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-                            hash[K_FIX3_HASH_SIZE + h3] = pos;
-                        }
-                    }
-                    avail = avail.wrapping_sub(1);
-                    pos += 1;
-                    cur += 1;
-                    bt_pos += bt[bt_pos] as usize + 1;
-                    num -= 1;
-                    if num == 0 || bt_pos == bt_limit {
-                        break;
-                    }
-                }
-            } else {
+            loop {
                 if MIN_LEN != 0 && avail >= MIN_LEN {
-                    // C: the same consecutive cur pointers, bounded once
-                    // by the bytes this block published. A block handoff
-                    // discards the iterator before the window can move or
-                    // the low hash can normalize. Mix::Four also uses three
-                    // bytes here, including the SDK's last-three-byte tail.
-                    let before = num;
-                    let count = num.min(avail - (MIN_LEN - 1));
-                    let span = count as usize + MIN_LEN as usize - 1;
-                    for bytes in win[cur..][..span].windows(MIN_LEN as usize) {
-                        let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
-                        let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
-                        hash[h2] = pos;
-                        if MIN_LEN == 3 {
-                            let h3 =
-                                ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
-                            hash[K_FIX3_HASH_SIZE + h3] = pos;
-                        }
-                        pos += 1;
-                        bt_pos += bt[bt_pos] as usize + 1;
-                        num -= 1;
-                        if num == 0 || bt_pos == bt_limit {
-                            break;
-                        }
+                    let bytes = &win[cur..cur + MIN_LEN as usize];
+                    let temp = c.crc[usize::from(bytes[0])] ^ u32::from(bytes[1]);
+                    let h2 = (temp & (K_HASH2_SIZE - 1)) as usize;
+                    hash[h2] = pos;
+                    if MIN_LEN == 3 {
+                        let h3 =
+                            ((temp ^ (u32::from(bytes[2]) << 8)) & (K_HASH3_SIZE - 1)) as usize;
+                        hash[K_FIX3_HASH_SIZE + h3] = pos;
                     }
-                    let skipped = before - num;
-                    avail = avail.wrapping_sub(skipped);
-                    cur += skipped as usize;
                 }
-                // C: no low hash for Bt2, or fewer than MIN_LEN bytes left.
-                // Failure parking still advances one published position at
-                // a time and must not discard an earlier availability promise.
-                if num != 0 && bt_pos != bt_limit {
-                    loop {
-                        avail = avail.wrapping_sub(1);
-                        pos += 1;
-                        cur += 1;
-                        bt_pos += bt[bt_pos] as usize + 1;
-                        num -= 1;
-                        if num == 0 || bt_pos == bt_limit {
-                            break;
-                        }
-                    }
+                avail = avail.wrapping_sub(1);
+                pos += 1;
+                cur += 1;
+                bt_pos += bt[bt_pos] as usize + 1;
+                num -= 1;
+                if num == 0 || bt_pos == bt_limit {
+                    break;
                 }
             }
             l.bt_num_avail_bytes = avail;
@@ -4228,9 +4289,9 @@ mod tests {
 
     fn skip_reference(mt: &mut MatchFinderMt, stream: &mut dyn SeqInStream, num: u32) {
         match mt.shared().common().mix {
-            Mix::None => mt.skip_kind::<0, true>(stream, num),
-            Mix::Two => mt.skip_kind::<2, true>(stream, num),
-            Mix::Three | Mix::Four => mt.skip_kind::<3, true>(stream, num),
+            Mix::None => mt.skip_kind_checked::<0>(stream, num),
+            Mix::Two => mt.skip_kind_checked::<2>(stream, num),
+            Mix::Three | Mix::Four => mt.skip_kind_checked::<3>(stream, num),
         }
     }
 
@@ -5478,7 +5539,7 @@ mod tests {
     /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
     /// every access checked, on the same generated tables and under the same
     /// conditions: the same answer, the same tree, the same matches. It runs
-    /// natively against the x86 assembly where available. In the Miri job it
+    /// natively against the assembly walks where available. In the Miri job it
     /// exercises the same margin wrapper and the portable pointer walk.
     #[test]
     fn the_register_walk_is_the_checked_walk_on_any_tables() {

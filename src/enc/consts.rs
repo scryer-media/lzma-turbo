@@ -28,19 +28,17 @@ pub(crate) const K_NUM_BIT_PRICE_SHIFT_BITS: u32 = 4;
 pub(crate) const REP_LEN_COUNT: i32 = 64;
 
 /// C: `kNumLogBits`, for the 64-bit build (`11 + sizeof(size_t) / 8 * 3`).
-/// The crate is 64-bit-and-32-bit portable, but `g_FastPos` is sized from this
-/// constant and the slot it returns must not depend on the host, so the
-/// 64-bit value is used everywhere. That costs 2 KiB of table on a 32-bit
-/// target and makes the output identical on both.
+/// `g_FastPos` is sized from this constant and the slot it returns must not
+/// depend on the host, so the 64-bit value is used on every target that
+/// builds the table. That costs 2 KiB of table on a 32-bit target and makes
+/// the output identical on both. ARM and ARM64 do not build it: like the C
+/// there, they take the slot from a leading-zero count, and only the tests
+/// build the table on them, to check the two agree.
 #[cfg(any(
     all(test, feature = "std"),
     not(any(target_arch = "arm", target_arch = "aarch64"))
 ))]
 pub(crate) const K_NUM_LOG_BITS: usize = 11 + 3;
-
-/// C: `kDicLogSizeMaxCompress`.
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-pub(crate) const K_DIC_LOG_SIZE_MAX_COMPRESS: u32 = (K_NUM_LOG_BITS as u32 - 1) * 2 + 7;
 
 /// C: `LZMA_NUM_REPS`.
 pub(crate) const LZMA_NUM_REPS: usize = 4;

@@ -282,6 +282,12 @@ fn worker(
         })) {
             Ok(r) => r,
             Err(_) => {
+                // The buffer is in the old decoder or still in the job; it
+                // goes back either way.
+                let salvaged = dec.take_block_dic();
+                if job.out.capacity() == 0 {
+                    job.out = salvaged;
+                }
                 dec = match Lzma2Decoder::new_probs_only(dict_prop) {
                     Ok(d) => d,
                     Err(e) => {
@@ -291,7 +297,7 @@ fn worker(
                             out_offset: job.out_offset,
                             unpacked_len: job.unpacked_len,
                             res: Err(e),
-                            out: Vec::new(),
+                            out: job.out,
                             packed: job.packed,
                             held: job.held,
                             #[cfg(feature = "crc")]
@@ -314,7 +320,12 @@ fn worker(
             None
         };
 
-        let out = dec.take_block_dic();
+        // A run refused before its buffer reached the decoder left it in the
+        // job.
+        let mut out = dec.take_block_dic();
+        if out.capacity() == 0 {
+            out = core::mem::take(&mut job.out);
+        }
         decoding.fetch_sub(1, Ordering::Relaxed);
         if tx
             .send(Done {
@@ -346,13 +357,13 @@ fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
     // The buffer is grown, never shrunk and never re-zeroed: `dicBufSize` says
     // how much of it this run uses, so a stream of unequal runs does not pay
     // to clear the whole thing every time.
-    let mut out = core::mem::take(&mut job.out);
-    if out.len() < want {
-        let more = want - out.len();
-        out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
-        out.resize(want, 0u8);
+    // A refused reservation leaves the buffer in the job, to go back.
+    if job.out.len() < want {
+        let more = want - job.out.len();
+        job.out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
+        job.out.resize(want, 0u8);
     }
-    dec.set_block_dic(out, want);
+    dec.set_block_dic(core::mem::take(&mut job.out), want);
 
     // The run arrives as the pieces of input it spans, and it is decoded a
     // piece at a time. The block decoder keeps its state between calls, so
@@ -455,5 +466,30 @@ mod tests {
         })
         .expect("dispatch");
         assert_eq!(pool.decoding(), 0);
+    }
+
+    /// A run whose buffer cannot be grown is refused, and the buffer it
+    /// carried comes back with the refusal for the next run to use.
+    #[test]
+    fn a_refused_run_returns_its_recycled_buffer() {
+        let mut pool = Pool::new(16);
+        pool.grow();
+        let mut out = alloc::vec::Vec::new();
+        out.reserve_exact(1 << 16);
+        pool.dispatch(Job {
+            index: 0,
+            out_offset: 0,
+            unpacked_len: usize::MAX,
+            packed: alloc::vec::Vec::new(),
+            out,
+            held: 0,
+            #[cfg(feature = "crc")]
+            plan: crate::mt::checksum::ChecksumPlan::none(),
+        })
+        .expect("dispatch");
+        let done = pool.collect().expect("an answer");
+        assert!(matches!(done.res, Err(crate::Error::Alloc)));
+        assert!(done.out.capacity() >= 1 << 16, "the buffer was lost");
+        pool.shutdown();
     }
 }

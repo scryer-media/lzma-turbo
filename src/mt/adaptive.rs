@@ -838,6 +838,14 @@ impl Lzma2AdaptiveDecoder {
         // slot, its open run can already exceed the preceding run's size.
         // Grow with the scanned bytes and the current header's payload;
         // slack admits the next header. Stop growing once all slots are full.
+        //
+        // This term has no ceiling of its own: an open run is as long as its
+        // chunks say, so with `read_ahead > threads` the bound follows it up
+        // to the run's whole packed size. What stops it is the caller's
+        // memory limit, which every admission is checked against, and the
+        // run ending, after which it is counted at its real size above. With
+        // no memory limit a stream of one huge run is read ahead in full,
+        // which is what read-ahead past the threads asks for.
         if self.pending.len() >= idle
             && self.pending.len() - idle < ahead
             && let Some(start) = self.scanner.open_run_offset()
@@ -1183,9 +1191,10 @@ impl Lzma2AdaptiveDecoder {
             .min(self.memory_limit);
         let over = self.held_bytes().saturating_sub(retained_limit);
         if self.segs.spare_bytes() > 0 && over > 0 {
+            // Read only by the counters, which `adaptive-stats` compiles in.
+            #[cfg_attr(not(feature = "adaptive-stats"), allow(unused_variables))]
             let released = self.segs.shed_spare_down(over);
             stat!(self.stats.shed_input_bytes += released;);
-            let _ = released;
         }
     }
 
@@ -2065,9 +2074,9 @@ impl Lzma2AdaptiveDecoder {
         stat!(self.stats.shed_output_bytes += outputs;);
         // Parked input goes only as far as the run needs: the rest is what
         // the next pieces are read into.
+        #[cfg_attr(not(feature = "adaptive-stats"), allow(unused_variables))]
         let released = self.segs.shed_spare_down(over.saturating_sub(outputs));
         stat!(self.stats.shed_input_bytes += released;);
-        let _ = released;
         true
     }
 

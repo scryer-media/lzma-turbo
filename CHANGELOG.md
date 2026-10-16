@@ -7,6 +7,41 @@
   instead of 21 s on an Apple M5 Max and the test run is unchanged. Raising
   the crate or its hot dependencies to opt-level 3 was measured and left out.
 
+## 0.9.2 - 2026-10-16
+
+- Fix the x86-64 binary-tree match finder crashing on Intel macOS release
+  builds. Its assembly used `.L` labels, which are ordinary symbols on
+  Mach-O: each one began a separate atom, and the release build's dead
+  stripping removed the fall-through code behind the unreferenced ones. The
+  labels are now `L`, assembler-local on every object format. A CI lane runs
+  the walks as an x86-64 macOS release build under Rosetta.
+- Fix `Lzma2RunDecoder::decode` returning before it had delivered all the
+  output its input allowed when a pending match ended at a ring wrap or at an
+  output-step edge. A call that consumes all of its input and writes less
+  than `max_output` now owes nothing more, as its documentation states, and
+  callers need no empty-input drain calls before `finish`.
+- Return the recycled output and input buffers to the parallel LZMA2 and xz
+  block workers on every error path, instead of dropping them when a
+  reservation was refused, a block failed to decode or a worker recovered
+  from a panic.
+- `kernel-ab`: `LZMA_TURBO_BT_ASM` now selects a distinct walk for every
+  documented value on x86-64 and macOS ARM64, and the walk that ships when
+  unset or unrecognised. The diagnostic walks, the BCJ2 cursor port and the
+  match-finder origin markers used only by tests are no longer compiled into
+  ordinary builds, and dead code is removed.
+- Encoder and decoder tidying with no change to encoded bytes: the buffered
+  and streamed single-threaded LZMA2 paths and the threaded finder's two skip
+  loops are each one generic routine, `Lzma2Decoder::new` uses the shared
+  dictionary-size helper, platform constants are named, and stale comments
+  are corrected.
+- CI: clippy on macOS and Windows as well as Linux; a weekly job runs the
+  >4 GiB stream tests, now also through the parallel reader and the adaptive
+  decoder, against the system `xz`; hygiene rejects binaries under `docs/`
+  other than small figures. `tests/upstream_xz_generated.rs` is renamed
+  `xz_generated_corpus_round_trip.rs`, since it never runs `xz`.
+- CI: the `dtolnay/rust-toolchain` pins name the commit its `v1` tag points
+  to, which resolves zizmor's `ref-version-mismatch` findings.
+
 ## 0.9.1 - 2026-10-11
 
 - Accelerate macOS ARM64 binary-tree matching with the SDK's negative-offset

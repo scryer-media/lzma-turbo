@@ -1,7 +1,12 @@
-//! Real >4 GiB byte delivery with bounded fixture storage and fixed-size I/O.
+//! Real >4 GiB byte delivery with bounded fixture storage and fixed-size I/O,
+//! through the sequential reader, the parallel reader, the adaptive decoder
+//! and the system `xz`. Ignored by default; the weekly `large-streams` CI job
+//! runs them.
 #![cfg(all(feature = "enc", feature = "xz"))]
 
-use lzma_turbo::{LzmaEncProps, XzReader, XzWriter};
+use lzma_turbo::{
+    DrainStatus, LzmaEncProps, XzAdaptiveDecoder, XzOptions, XzParallelReader, XzReader, XzWriter,
+};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -49,6 +54,43 @@ fn digest_reader(mut input: impl Read) -> (u64, Vec<u8>) {
     (total, digest.finalize().to_vec())
 }
 
+/// The adaptive decoder, fed from `input` in fixed pieces; its output must
+/// arrive in order.
+fn digest_adaptive(mut input: impl Read) -> (u64, Vec<u8>) {
+    let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(2));
+    let mut piece = vec![0u8; 1 << 20];
+    let (mut filled, mut used) = (0usize, 0usize);
+    let mut ended = false;
+    let mut total = 0u64;
+    let mut digest = Sha256::new();
+    loop {
+        if used == filled && !ended {
+            filled = input.read(&mut piece).expect("fixture read");
+            used = 0;
+            if filled == 0 {
+                ended = true;
+                dec.end_of_input();
+            }
+        }
+        if used < filled {
+            used += dec.feed(&piece[used..filled]).expect("adaptive feed");
+        }
+        let status = dec
+            .drain(|offset, bytes| {
+                assert_eq!(offset, total, "adaptive output out of order");
+                digest.update(bytes);
+                total += bytes.len() as u64;
+            })
+            .expect("adaptive decode");
+        match status {
+            DrainStatus::Finished => break,
+            DrainStatus::NeedsMoreInput => assert!(!ended, "wanted input after the end"),
+            DrainStatus::Progress => {}
+        }
+    }
+    (total, digest.finalize().to_vec())
+}
+
 fn roundtrip(bytes: u64, block_size: u64) {
     // No entire-input Vec, sparse decompressed file, or read_to_end sink.
     // The pattern includes all byte values and is independent of read splits.
@@ -80,7 +122,14 @@ fn roundtrip(bytes: u64, block_size: u64) {
     let mut encoded = writer.finish().unwrap();
     encoded.file.rewind().unwrap();
     let expected = (bytes, expected.finalize().to_vec());
-    assert_eq!(digest_reader(XzReader::new(encoded.file)), expected);
+    assert_eq!(digest_reader(XzReader::new(&encoded.file)), expected);
+    encoded.file.rewind().unwrap();
+    let parallel =
+        XzParallelReader::with_options(&encoded.file, XzOptions::default().with_threads(2))
+            .expect("parallel reader");
+    assert_eq!(digest_reader(parallel), expected, "parallel reader");
+    encoded.file.rewind().unwrap();
+    assert_eq!(digest_adaptive(&encoded.file), expected, "adaptive decoder");
     // Explicit large-test runs require an independent decoder, never skip it.
     let mut oracle = Command::new("xz")
         .args(["-dc", "--threads=1"])
@@ -97,13 +146,13 @@ fn roundtrip(bytes: u64, block_size: u64) {
 }
 
 #[test]
-#[ignore = "streams >4 GiB through encoder and both decoders; <=16 MiB fixture storage"]
+#[ignore = "streams >4 GiB through the encoder, every decoder and xz; <=16 MiB fixture storage"]
 fn solid_xz_stream_crosses_four_gib_with_exact_digest() {
     roundtrip((1u64 << 32) + 65537, 0);
 }
 
 #[test]
-#[ignore = "streams >4 GiB through encoder and both decoders; <=16 MiB fixture storage"]
+#[ignore = "streams >4 GiB through the encoder, every decoder and xz; <=16 MiB fixture storage"]
 fn multiblock_xz_stream_crosses_four_gib_with_exact_digest() {
     roundtrip((1u64 << 32) + 65537, 16 * 1024 * 1024);
 }

@@ -1,7 +1,7 @@
-//! Arbitrary bytes as an `.xz` file, through both decoders that accept a
-//! non-seekable stream: the sequential reader and the adaptive one. Neither
-//! may panic, neither may allocate without bound, and neither may loop
-//! forever on input that has stopped arriving.
+//! Arbitrary bytes as an `.xz` file, through the sequential reader, the
+//! parallel reader and the adaptive decoder. None may panic, none may
+//! allocate without bound, and none may loop forever on input that has
+//! stopped arriving.
 #![no_main]
 
 use std::io::{Cursor, Read};
