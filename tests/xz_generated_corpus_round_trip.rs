@@ -1,5 +1,9 @@
-//! Generated corpus and filter matrix from XZ Utils 5.8.3 (0BSD):
-//! tests/create_compress_files.c and tests/test_compress.sh.
+//! This crate's encoder against its own decoders, over the corpus XZ Utils
+//! 5.8.3 generates in tests/create_compress_files.c and the preset and filter
+//! matrix of tests/test_compress.sh (0BSD). Only the inputs come from XZ
+//! Utils: no `xz` binary takes part, so this is a round trip, not a
+//! comparison. `tests/xz_encoder.rs` is where `xz` itself reads what this
+//! crate writes.
 #![cfg(all(feature = "enc", feature = "xz"))]
 
 use lzma_turbo::xz::{CheckType, FilterFlags, XzOptions, bcj::BcjKind};
@@ -39,7 +43,7 @@ fn generated() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 #[test]
-fn upstream_generated_corpus_presets_and_filter_matrix() {
+fn the_xz_utils_generated_corpus_round_trips_through_every_preset_and_filter() {
     let mut cases = Vec::new();
     for level in 1..=4 {
         cases.push((LzmaEncProps::xz_preset(level, false).unwrap(), Vec::new()));

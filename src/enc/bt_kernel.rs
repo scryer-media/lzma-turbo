@@ -138,7 +138,8 @@ pub(crate) fn get_matches_spec_n_2_reg(
 
 /// The register-walk variant a build ships: `sdk_walk_arm64_negative` on
 /// macOS ARM64, `sdk_walk_faithful` on x86-64, and the portable pointer walk
-/// everywhere else (which every variant below 2 selects on ARM64).
+/// on every other ARM64 target (which every variant below 2 also selects on
+/// macOS ARM64).
 ///
 /// Variant numbers, per target:
 ///

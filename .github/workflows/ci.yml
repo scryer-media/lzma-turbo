@@ -615,7 +615,7 @@ jobs:
   # the build that ships: they must panic there too, not only under debug
   # assertions. Second, shared `zeroed_vec` in `src/buffer.rs`, which hands
   # decoder dictionaries and the match finder's window and tables over from
-  # `alloc_zeroed` through `Vec::from_raw_parts`; its encoder-wrapper test
+  # `alloc_zeroed` through `Vec::from_raw_parts`; its test there
   # allocates every `Zeroable` type at odd
   # lengths, reads, writes, grows and frees each, and Miri checks the layout,
   # the initialisation and the free. Third, the direct-input hand-off in
@@ -639,7 +639,7 @@ jobs:
       MIRI_TOOLCHAIN: nightly-2026-09-01
       MIRI_FILTERS: >-
         enc::lz_find_mt::tests::the_
-        enc::lz_find::tests::a_zeroed_vec_
+        buffer::tests::a_zeroed_vec_
         enc::lz_find_mt::tests::get_heads_
         enc::lz_find_mt::tests::held_records_preserve_short_output_and_synthetic_failure_state
         enc::lz_find_mt::tests::skip_spans_preserve_checked_

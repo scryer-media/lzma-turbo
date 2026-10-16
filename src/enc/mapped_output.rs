@@ -21,6 +21,12 @@ unsafe extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
 }
 
+// Darwin's `<sys/mman.h>`.
+const PROT_READ: c_int = 0x1;
+const PROT_WRITE: c_int = 0x2;
+const MAP_PRIVATE: c_int = 0x0002;
+const MAP_ANON: c_int = 0x1000;
+
 pub(super) struct MappedOutput {
     address: NonNull<u8>,
     len: usize,
@@ -40,7 +46,16 @@ impl MappedOutput {
         // access; fd -1 and offset 0 select no file or special VM flags.
         // mmap rounds the mapping to pages; only the requested length is
         // exposed. The same address/length pair is passed to munmap on Drop.
-        let raw = unsafe { mmap(core::ptr::null_mut(), len, 3, 0x1002, -1, 0) };
+        let raw = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
         if raw.addr() == usize::MAX {
             return Err(Error::Alloc);
         }

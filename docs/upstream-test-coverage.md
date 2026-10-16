@@ -111,7 +111,7 @@ from fixed caller buffers: thread-start fallback and retained encoder state
 still need allocation-lifetime validation.
 
 ```sh
-cargo nextest run --locked -p lzma-turbo --test upstream_xz_boundaries --test upstream_xz_generated --no-fail-fast
+cargo nextest run --locked -p lzma-turbo --test upstream_xz_boundaries --test xz_generated_corpus_round_trip --no-fail-fast
 cargo nextest run --locked -p lzma-turbo --release --test large_streams --no-fail-fast --run-ignored ignored-only --test-threads=1
 ```
 

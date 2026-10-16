@@ -610,16 +610,9 @@ unsafe fn put<T: Copy>(s: &mut [T], i: usize, v: T) {
 /// producer never writes a byte this call reads.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
-// On x86-64 and ARM64 with `asm` the bt thread runs `bt_kernel`'s walk instead and this
-// one is the tests' and other targets'.
-#[cfg_attr(
-    all(
-        feature = "asm",
-        any(target_arch = "x86_64", target_arch = "aarch64"),
-        not(feature = "kernel-ab")
-    ),
-    allow(dead_code)
-)]
+// On x86-64 and ARM64 with `asm` the bt thread runs `bt_kernel`'s walk, which
+// falls back to this one when the output does not have room for its unchecked
+// writes; other targets run this one throughout.
 pub(super) fn get_matches_spec_n_2(
     win: &[u8],
     len_limit_0: usize,
@@ -894,8 +887,8 @@ pub(super) fn get_matches_spec_n_2(
 }
 
 // The bt thread uses the register-shaped kernel with `asm`: SDK assembly on
-// x86-64, its portable pointer walk on ARM64. Other targets keep the slice
-// walk. The register-walk differential tests compare answers and mutations.
+// x86-64 and on macOS ARM64, the portable pointer walk on other ARM64 targets.
+// Other targets keep the slice walk. The register-walk differential tests compare answers and mutations.
 // With `kernel-ab`, LZMA_TURBO_TREE_KERNEL selects the benchmark variant.
 type TreeWalk = fn(
     &[u8],
@@ -2670,7 +2663,7 @@ impl MatchFinderMt {
             .checked_add(add_after)
             .ok_or(Error::Param)?;
         let base = mfb.mem_usage(history_size, before, match_max_len, after, !direct)?;
-        Ok(base + super::lz_find::MatchTables::padded_words(hash_words + bt_words + 2)? as u64 * 4)
+        Ok(base + super::lz_find::MatchTables::padded_len(hash_words + bt_words + 2)? as u64 * 4)
     }
 
     /// What this finder has allocated, in bytes: the window, the tables, and
@@ -5546,7 +5539,7 @@ mod tests {
     /// The register-shaped walk (`enc::bt_kernel`) must be the walk with
     /// every access checked, on the same generated tables and under the same
     /// conditions: the same answer, the same tree, the same matches. It runs
-    /// natively against the x86 assembly where available. In the Miri job it
+    /// natively against the assembly walks where available. In the Miri job it
     /// exercises the same margin wrapper and the portable pointer walk.
     #[test]
     fn the_register_walk_is_the_checked_walk_on_any_tables() {
