@@ -727,6 +727,14 @@ unsafe extern "C" fn sdk_walk_arm64_negative(
     core::arch::naked_asm!(include_str!("bt_kernel_aarch64_negative.S"), options(raw))
 }
 
+// Local labels in every included `.S` file use the bare `L` prefix, never
+// `.L`. The files go through no preprocessor, so one spelling serves all
+// three object formats: `L` is assembler-local on Mach-O, and on ELF and COFF
+// it is a file-local symbol, which is harmless. A `.L` label is an ordinary
+// symbol on Mach-O: it starts a new atom, and `-dead_strip` deletes the atoms
+// nothing names, which removed fall-through code from the x86-64 kernels on
+// x86_64-apple-darwin. The decoder kernels follow the same rule.
+
 /// C: GetMatchesSpecN_2 in SDK 26.03's LzFindOpt.asm, System V register map.
 ///
 /// # Safety
