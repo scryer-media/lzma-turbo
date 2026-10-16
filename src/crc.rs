@@ -82,6 +82,13 @@ fn native_checksum(algorithm: CrcAlgorithm, data: &[u8]) -> u64 {
     crc_fast::checksum(algorithm, data)
 }
 
+/// CRC-32 of `data` through the same guarded dispatch the crate's own
+/// checksums take, for the reference host in [`crate::hooks`].
+#[cfg(all(test, not(target_family = "wasm")))]
+pub(crate) fn native_crc32_for_test(data: &[u8]) -> u32 {
+    native_checksum(CrcAlgorithm::Crc32IsoHdlc, data) as u32
+}
+
 /// Fold `data` into a running CRC-32 through the embedder-installed hook.
 ///
 /// Dead on a native target outside `#[cfg(test)]`: only a wasm build has a

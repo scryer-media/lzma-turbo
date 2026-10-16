@@ -243,10 +243,17 @@ fn worker(rx: &Mutex<Receiver<XzJob>>, tx: &Sender<XzDone>, cancel: &AtomicBool)
 /// C: `XzDecMt_Callback_Code` in `C/XzDecMt.c`, which is the same three steps
 /// in the same order: the block header, the coder chain, the check.
 fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
-    let check_size = job.check.size();
+    // The input buffer goes back to the job whatever happens, so that the
+    // dispatcher can read the next block into it.
     let bytes = core::mem::take(&mut job.bytes);
+    let result = decode_block_in(job, &bytes);
+    job.bytes = bytes;
+    result
+}
 
-    let (header, header_size, packed_len) = block_header(job, &bytes)?;
+fn decode_block_in(job: &mut XzJob, bytes: &[u8]) -> Result<Option<BlockCheck>, XzErrorKind> {
+    let check_size = job.check.size();
+    let (header, header_size, packed_len) = block_header(job, bytes)?;
     let data_end = header_size + packed_len;
     let padded_end = data_end + (4 - (packed_len % 4)) % 4;
     if padded_end + check_size > bytes.len() {
@@ -257,20 +264,24 @@ fn decode_block(job: &mut XzJob) -> Result<Option<BlockCheck>, XzErrorKind> {
         return Err(XzErrorKind::BadPadding);
     }
     let mut dec = block_decoder(job, &header)?;
-    let (used, status) = dec.decode_block(
+    let (used, status) = match dec.decode_block(
         job.unpacked_len,
         &bytes[header_size..data_end],
         FinishMode::End,
-    )?;
-    let result = finish_block(
+    ) {
+        Ok(progress) => progress,
+        Err(e) => {
+            job.out = dec.take_block_dic();
+            return Err(e.into());
+        }
+    };
+    finish_block(
         job,
         &header,
         dec,
         used == packed_len && status == Status::FinishedWithMark,
         &bytes[padded_end..padded_end + check_size],
-    );
-    job.bytes = bytes;
-    result
+    )
 }
 
 /// Shared index/header agreement checks for buffered workers and bounded input.
@@ -307,16 +318,17 @@ fn block_header(job: &XzJob, bytes: &[u8]) -> Result<(BlockHeader, usize, usize)
 fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, XzErrorKind> {
     // The LZMA2, decoded straight into the block's output buffer, which is
     // also its dictionary.
+    // The decoder first, so that a refusal leaves the job's buffer with it.
     let want = job.unpacked_len;
-    let mut out = core::mem::take(&mut job.out);
-    if out.len() < want {
-        let more = want - out.len();
-        out.try_reserve_exact(more)
-            .map_err(|_| XzErrorKind::Lzma(crate::Error::Alloc))?;
-        out.resize(want, 0u8);
-    }
     let mut dec = Lzma2Decoder::new_probs_only(header.chain.dict_prop)?;
-    dec.set_block_dic(out, want);
+    if job.out.len() < want {
+        let more = want - job.out.len();
+        job.out
+            .try_reserve_exact(more)
+            .map_err(|_| XzErrorKind::Lzma(crate::Error::Alloc))?;
+        job.out.resize(want, 0u8);
+    }
+    dec.set_block_dic(core::mem::take(&mut job.out), want);
     Ok(dec)
 }
 
@@ -359,6 +371,40 @@ fn finish_block(
     checks.map(Some)
 }
 
+/// The packed data of one block, read from `src` through `input` and decoded
+/// as it arrives. Returns how much the decoder took and where it stopped.
+fn feed_block<R: std::io::Read>(
+    dec: &mut Lzma2Decoder,
+    input: &mut Vec<u8>,
+    src: &mut R,
+    packed_len: usize,
+    unpacked_len: usize,
+    located: &impl Fn(XzErrorKind) -> std::io::Error,
+) -> std::io::Result<(usize, Status)> {
+    let capacity = packed_len.min(256 << 10);
+    if input.len() < capacity {
+        input
+            .try_reserve_exact(capacity - input.len())
+            .map_err(|_| located(XzErrorKind::Lzma(crate::Error::Alloc)))?;
+        input.resize(capacity, 0);
+    }
+    let mut used_total = 0;
+    let mut status = Status::NotSpecified;
+    while used_total < packed_len {
+        let size = (packed_len - used_total).min(capacity);
+        src.read_exact(&mut input[..size])?;
+        let (used, next_status) = dec
+            .decode_block(unpacked_len, &input[..size], FinishMode::End)
+            .map_err(|e| located(XzErrorKind::Lzma(e)))?;
+        used_total += used;
+        status = next_status;
+        if used != size || status == Status::FinishedWithMark {
+            break;
+        }
+    }
+    Ok((used_total, status))
+}
+
 /// C: `XzDecMt_Decode_ST` refills a bounded input buffer while retaining coder
 /// state. Keep this reader's stronger contract: no output before block checks.
 pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
@@ -397,29 +443,24 @@ pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
     }
     src.seek(SeekFrom::Start(data_start))?;
     let mut dec = block_decoder(job, &header).map_err(located)?;
+    // Both recycled buffers go back to the job whatever happens.
     let mut input = core::mem::take(&mut job.bytes);
-    let capacity = packed_len.min(256 << 10);
-    if input.len() < capacity {
-        input
-            .try_reserve_exact(capacity - input.len())
-            .map_err(|_| located(XzErrorKind::Lzma(crate::Error::Alloc)))?;
-        input.resize(capacity, 0);
-    }
-    let mut used_total = 0;
-    let mut status = Status::NotSpecified;
-    while used_total < packed_len {
-        let size = (packed_len - used_total).min(capacity);
-        src.read_exact(&mut input[..size])?;
-        let (used, next_status) = dec
-            .decode_block(job.unpacked_len, &input[..size], FinishMode::End)
-            .map_err(|e| located(XzErrorKind::Lzma(e)))?;
-        used_total += used;
-        status = next_status;
-        if used != size || status == Status::FinishedWithMark {
-            break;
-        }
-    }
+    let fed = feed_block(
+        &mut dec,
+        &mut input,
+        src,
+        packed_len,
+        job.unpacked_len,
+        &located,
+    );
     job.bytes = input;
+    let (used_total, status) = match fed {
+        Ok(progress) => progress,
+        Err(e) => {
+            job.out = dec.take_block_dic();
+            return Err(e);
+        }
+    };
     let checks = finish_block(
         job,
         &header,
@@ -431,4 +472,61 @@ pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
     // Match the buffered reader's cursor after the complete padded block.
     src.seek(SeekFrom::Start(data_end + trailer_len as u64))?;
     Ok(checks)
+}
+
+#[cfg(all(test, feature = "enc"))]
+mod tests {
+    use super::{XzJob, decode_block, decode_block_reader};
+    use crate::mt::checksum::ChecksumPlan;
+    use crate::xz::CheckType;
+    use alloc::vec::Vec;
+    use std::io::Cursor;
+
+    /// One block whose LZMA2 data fails to decode, as a job carrying recycled
+    /// buffers of a recognisable capacity, and the file it sits in.
+    fn corrupt_job() -> (XzJob, Vec<u8>) {
+        let source: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut file =
+            crate::encode_xz(&source, &crate::LzmaEncProps::new(), CheckType::Crc32, 0).unwrap();
+        let block = crate::xz::index::block_table(&mut Cursor::new(&file), u64::MAX).unwrap()[0];
+        let start = block.file_offset as usize;
+        let header_size = (usize::from(file[start]) + 1) * 4;
+        // An LZMA2 control byte of 3 is invalid: the decoder refuses it.
+        file[start + header_size] = 3;
+        let padded = (block.record.unpadded_size as usize).next_multiple_of(4);
+        let mut out = Vec::new();
+        out.reserve_exact(1 << 16);
+        let job = XzJob {
+            index: 0,
+            stream: 0,
+            block_in_stream: 0,
+            file_offset: block.file_offset,
+            unpacked_offset: 0,
+            unpacked_len: source.len(),
+            unpadded_size: block.record.unpadded_size,
+            bytes: file[start..start + padded].to_vec(),
+            check: CheckType::Crc32,
+            verify: true,
+            plan: ChecksumPlan::none(),
+            out,
+        };
+        (job, file)
+    }
+
+    #[test]
+    fn a_block_that_fails_to_decode_returns_both_recycled_buffers() {
+        let (mut job, _) = corrupt_job();
+        let input = job.bytes.capacity();
+        assert!(decode_block(&mut job).is_err());
+        assert!(job.out.capacity() >= 1 << 16, "the output buffer was lost");
+        assert_eq!(job.bytes.capacity(), input, "the input buffer was lost");
+
+        let (mut job, file) = corrupt_job();
+        let mut src = Cursor::new(&file);
+        src.set_position(job.file_offset);
+        job.bytes = Vec::with_capacity(1 << 12);
+        assert!(decode_block_reader(&mut job, &mut src).is_err());
+        assert!(job.out.capacity() >= 1 << 16, "the output buffer was lost");
+        assert!(job.bytes.capacity() >= 1 << 12, "the input buffer was lost");
+    }
 }
