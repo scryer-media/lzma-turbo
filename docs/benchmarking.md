@@ -141,7 +141,7 @@ decoder is configured for.
 
 ## Differential correctness
 
-`cargo test -p lzma-turbo` decodes every fixture it can find under
+`cargo nextest run -p lzma-turbo` decodes every fixture it can find under
 `bench/fixtures`, comparing length and CRC-32 with `xz -dc`, and the small
 vectors committed under `tests`. Fuzzing (`cargo fuzz`) targets the
 decoder with arbitrary bytes and must never panic or read out of bounds.

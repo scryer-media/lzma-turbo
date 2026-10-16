@@ -1,5 +1,8 @@
 # Encoder performance candidate
 
+Machine-readable evidence named below is stored outside the repository.
+See [Benchmark data archive](benchmark-data.md) for the archive layout and checksums.
+
 The implementation target is **0.9.0**. Provisional 0.9.1 build labels in
 historical samples describe the binaries that were measured; they are not
 release declarations. The samples, source hashes and rejected candidates
@@ -730,7 +733,7 @@ header. Raw output SHA-256
   two-thread finders, and checked rejection of writes past a region's end.
 
 Individual accepted measurements and source fingerprints are in
-[encoder-perf-0.9.0.json.zst](encoder-perf-0.9.0.json.zst). Read either compressed
+`encoder-perf-0.9.0.json.zst` in the [local evidence archive](benchmark-data.md). Read either compressed
 JSON with `zstd -dc <file.json.zst>`; compression preserves every evidence byte.
 Full logs, source experiments,
 symbol reports, and native object disassembly are under ignored `target/`.

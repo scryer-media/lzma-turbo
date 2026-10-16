@@ -22,7 +22,9 @@ pub fn golden(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let mut cmd = Command::new("cargo");
     cmd.args([
-        "test",
+        "nextest",
+        "run",
+        "--no-fail-fast",
         "--locked",
         "--release",
         "-p",
@@ -50,7 +52,7 @@ pub fn golden(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         Ok(_) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("xtask golden: cannot run cargo test: {e}");
+            eprintln!("xtask golden: cannot run cargo nextest run: {e}");
             ExitCode::FAILURE
         }
     }

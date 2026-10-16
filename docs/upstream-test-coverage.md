@@ -111,15 +111,15 @@ from fixed caller buffers: thread-start fallback and retained encoder state
 still need allocation-lifetime validation.
 
 ```sh
-cargo test --locked -p lzma-turbo --test upstream_xz_boundaries --test upstream_xz_generated --no-fail-fast
-cargo test --locked -p lzma-turbo --release --test large_streams --no-fail-fast -- --ignored --test-threads=1
+cargo nextest run --locked -p lzma-turbo --test upstream_xz_boundaries --test upstream_xz_generated --no-fail-fast
+cargo nextest run --locked -p lzma-turbo --release --test large_streams --no-fail-fast --run-ignored ignored-only --test-threads=1
 ```
 
 In sevenz-turbo:
 
 ```sh
-cargo test --locked --test large_archive_tests --no-fail-fast
-cargo test --locked --release --test large_archive_tests --no-fail-fast -- --ignored --test-threads=1
+cargo nextest run --locked --test large_archive_tests --no-fail-fast
+cargo nextest run --locked --release --test large_archive_tests --no-fail-fast --run-ignored ignored-only --test-threads=1
 ```
 
 Both slow compressed suites require the reference executable on PATH and fail

@@ -1,5 +1,8 @@
 # Mac fleet optimization audit
 
+Machine-readable evidence named below is stored outside the repository.
+See [Benchmark data archive](benchmark-data.md) for the archive layout and checksums.
+
 Final local checkpoint: 2026-10-15. The performance arc is stopped at the
 operator's requested scope, with measured improvements retained and the
 bounded XZ output-buffer and tiny non-solid CPU tradeoffs explicitly accepted.
