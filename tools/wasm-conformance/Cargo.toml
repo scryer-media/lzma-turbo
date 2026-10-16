@@ -14,8 +14,8 @@ publish = false
 # `cargo test` and `cargo clippy` of the workspace; the wasm-conformance CI job
 # is the one place it is built.
 [dev-dependencies]
-wasmtime = "~48.0.6"
-wasmtime-wasi = "~48.0.6"
+wasmtime = "48.0.6"
+wasmtime-wasi = "48.0.6"
 # The host side of the reference embedding checksums with the same libraries
 # the native build of lzma-turbo does: no hand-written CRC or SHA on either
 # side of the boundary.
