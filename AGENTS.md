@@ -47,7 +47,11 @@ port rules and what was left out are in `docs/encoder.md`.
      match extension, also only for tests and `kernel-ab`. All six tests
      explicitly run all three variants through the same margin wrapper; no
      environment mutation is needed to select a test variant. Miri never
-     executes assembly.
+     executes assembly. Branch targets inside these files are `L`-prefixed:
+     on Mach-O only `L` is assembler-local, and a `.L` label is a symbol that
+     starts its own atom, which `-dead_strip` removes when nothing references
+     it, so the fall-through code behind it vanishes from a release build.
+     The Rosetta CI lane runs these walks in an x86-64 macOS release build.
    - macOS ARM64 `sdk_walk_arm64` in `src/enc/bt_kernel_aarch64_sdk.S`:
      diagnostic-only complete SDK instruction flow. The six native
      `the_register_walk_*` tests explicitly run it through the same checked
@@ -70,9 +74,8 @@ port rules and what was left out are in `docs/encoder.md`.
      Only opted-in streamed byte sinks use mappings; custom ownership sinks
      retain their existing Vec delivery. Mappings never become public Vecs.
    - Shared decoder/encoder `zeroed_vec` in `src/buffer.rs`:
-     `a_zeroed_vec_is_zeroes_of_every_zeroable_type` in `src/enc/lz_find.rs`
-     exercises the common allocator through the encoder wrapper, native and
-     Miri. `decoder_dictionary_allocation_failure_is_recoverable` checks both
+     `a_zeroed_vec_is_zeroes_of_every_zeroable_type` beside it exercises the
+     common allocator in every feature set, native and Miri. `decoder_dictionary_allocation_failure_is_recoverable` checks both
      decoder constructors under allocation refusal natively. Huge-page advice
      remains encoder-only; the decoder allocation uses only `core` and `alloc`.
    - Shared finder storage and borrowed direct-input lifetime/ownership in
@@ -87,10 +90,9 @@ port rules and what was left out are in `docs/encoder.md`.
      real window accessor across a synchronized `read_block` short read and
      EOF. The other `the_published_window_*` tests cover physical clamping,
      history, stored chunks, reuse and parked fallback state. These new tests
-     are selected by the native and Miri kernel CI filters. Native validation
-     of the bounded-prefix correction passes; Miri remains pending and is
-     reserved for the final capstone. Native passes alone do not prove this
-     reference invariant.
+     are selected by the native and Miri kernel CI filters, and the
+     `unchecked-kernel-miri` job runs each one under Miri. Native passes alone
+     do not prove this reference invariant; the Miri run is what does.
      The safe owned-input transfer into the single-threaded finder is covered
      by `owned_blocks_match_copied_windows_and_return_their_allocation` in
      `src/enc/lzma2_enc.rs`, natively and under Miri, including write errors
@@ -140,10 +142,10 @@ port rules and what was left out are in `docs/encoder.md`.
      reuse. `the_sdk_fused_consumer_preserves_produced_threaded_tails`
      compares the fused positional BT4 consumer with the checked indexed
      consumer on actual producer records, including short tails, full output
-     sentinels and consumer state. It passes natively; Miri remains pending.
-     The register-walk tests also check successful record partitions
-     for every native backend. Portable cursor Miri validation is required
-     at the final capstone and remains pending; native tests do not establish
+     sentinels and consumer state, natively and under Miri. The
+     register-walk tests also check successful record partitions for every
+     native backend. `consume_skip` and the indexed path of `skip_kind` share
+     one loop, `skip_span`, over either cursor. Native tests do not establish
      Miri verification, and Miri never verifies the assembly producers.
    - High-hash table access in `get_heads` / `heads_loop`:
      `get_heads_matches_the_indexed_loop` compares heads and the entire

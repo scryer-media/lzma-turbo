@@ -114,11 +114,13 @@ pub(crate) type MatchTables = MatchBuffer<u32>;
 pub(crate) type MatchWindow = MatchBuffer<u8>;
 
 impl<T: Zeroable> MatchBuffer<T> {
-    const PAGE_WORDS: usize = (2 << 20) / core::mem::size_of::<T>();
+    /// Elements (bytes for the window, `u32`s for the tables) in a 2 MiB
+    /// huge page.
+    const PAGE_ELEMS: usize = (2 << 20) / core::mem::size_of::<T>();
 
-    pub(crate) fn padded_words(len: usize) -> Result<usize, Error> {
-        if cfg!(all(target_os = "linux", feature = "std")) && len > Self::PAGE_WORDS / 2 {
-            len.checked_add(Self::PAGE_WORDS - 1).ok_or(Error::Alloc)
+    pub(crate) fn padded_len(len: usize) -> Result<usize, Error> {
+        if cfg!(all(target_os = "linux", feature = "std")) && len > Self::PAGE_ELEMS / 2 {
+            len.checked_add(Self::PAGE_ELEMS - 1).ok_or(Error::Alloc)
         } else {
             Ok(len)
         }
@@ -132,26 +134,26 @@ impl<T: Zeroable> MatchBuffer<T> {
         len: usize,
         mut allocate: impl FnMut(usize) -> Result<Vec<T>, Error>,
     ) -> Result<Self, Error> {
-        let mut words = Self::padded_words(len)?;
-        let storage = match allocate(words) {
+        let mut padded = Self::padded_len(len)?;
+        let storage = match allocate(padded) {
             Ok(storage) => storage,
             // C: BigAlloc falls back to ordinary alignment on refusal. The
             // optional padding must not turn a usable allocation into OOM.
-            Err(_) if words != len => {
-                words = len;
-                allocate(words)?
+            Err(_) if padded != len => {
+                padded = len;
+                allocate(padded)?
             }
             Err(error) => return Err(error),
         };
-        let start = if words != len {
-            let address_words = storage.as_ptr().addr() / core::mem::size_of::<T>();
-            address_words.wrapping_neg() & (Self::PAGE_WORDS - 1)
+        let start = if padded != len {
+            let address_elems = storage.as_ptr().addr() / core::mem::size_of::<T>();
+            address_elems.wrapping_neg() & (Self::PAGE_ELEMS - 1)
         } else {
             0
         };
         // The padding covers every alignment offset. Advise only the logical
         // table before writes: padding must not add resident huge pages.
-        assert!(start <= words - len);
+        assert!(start <= padded - len);
         let tables = Self {
             storage,
             start,
@@ -684,7 +686,7 @@ impl MatchFinder {
             u64::MAX,
         )?;
         let window = if window {
-            MatchWindow::padded_words(plan.block_size as usize)? as u64
+            MatchWindow::padded_len(plan.block_size as usize)? as u64
         } else {
             0
         };
@@ -693,7 +695,7 @@ impl MatchFinder {
         } else {
             HC_HEADS as u64 * 4
         };
-        Ok(window + (MatchTables::padded_words(plan.num_refs)? as u64) * 4 + heads)
+        Ok(window + (MatchTables::padded_len(plan.num_refs)? as u64) * 4 + heads)
     }
 
     /// What this finder has allocated, in bytes: the window and the tables.
@@ -1810,19 +1812,19 @@ mod tests {
             0,
             1,
             4097,
-            MatchTables::PAGE_WORDS / 2,
-            MatchTables::PAGE_WORDS + 17,
+            MatchTables::PAGE_ELEMS / 2,
+            MatchTables::PAGE_ELEMS + 17,
         ] {
             let mut tables = MatchTables::new(len).unwrap();
             assert_eq!(tables.len(), len);
             assert_eq!(
                 tables.allocated_words(),
-                MatchTables::padded_words(len).unwrap()
+                MatchTables::padded_len(len).unwrap()
             );
             assert!(tables.iter().all(|&value| value == 0));
             if tables.allocated_words() != len {
                 assert_eq!(tables.as_ptr().addr() % (2 << 20), 0);
-                assert!(tables.start < MatchTables::PAGE_WORDS);
+                assert!(tables.start < MatchTables::PAGE_ELEMS);
             }
             if len != 0 {
                 tables[0] = 17;
@@ -1845,7 +1847,7 @@ mod tests {
     #[test]
     fn aligned_match_tables_fall_back_without_hiding_allocation_failure() {
         use super::MatchTables;
-        let len = MatchTables::PAGE_WORDS + 17;
+        let len = MatchTables::PAGE_ELEMS + 17;
         let mut requests = alloc::vec::Vec::new();
         let tables = MatchTables::new_with(len, |words| {
             requests.push(words);
@@ -1862,7 +1864,7 @@ mod tests {
         assert_eq!(requests.last(), Some(&len));
         assert_eq!(
             requests.len(),
-            if MatchTables::padded_words(len).unwrap() == len {
+            if MatchTables::padded_len(len).unwrap() == len {
                 1
             } else {
                 2
@@ -1872,34 +1874,6 @@ mod tests {
             MatchTables::new_with(len, |_| Err(crate::Error::Alloc)),
             Err(crate::Error::Alloc)
         ));
-    }
-
-    /// A zeroed allocation of every [`super::Zeroable`] type is the length
-    /// asked for, all zero and writable to its last element, at odd lengths
-    /// and across a page; an empty one is empty, and one the allocator
-    /// cannot describe is refused. CI runs this under Miri too, which checks
-    /// the allocation, the initialisation and the free against the layout.
-    #[test]
-    fn a_zeroed_vec_is_zeroes_of_every_zeroable_type() {
-        fn check<T: super::Zeroable + PartialEq + core::fmt::Debug>(one: T, zero: T) {
-            for len in [1usize, 3, 7, 61, 4_097, 70_001] {
-                let mut v = super::zeroed_vec::<T>(len).unwrap();
-                assert_eq!((v.len(), v.capacity()), (len, len));
-                assert!(v.iter().all(|&x| x == zero), "{len}");
-                v[len - 1] = one;
-                v[0] = one;
-                assert_eq!((v[0], v[len - 1]), (one, one));
-                v.push(one);
-                assert_eq!(v.len(), len + 1);
-            }
-            assert!(super::zeroed_vec::<T>(0).unwrap().is_empty());
-            assert!(matches!(
-                super::zeroed_vec::<T>(usize::MAX),
-                Err(crate::error::Error::Alloc)
-            ));
-        }
-        check::<u8>(0xA5, 0);
-        check::<u32>(0xDEAD_BEEF, 0);
     }
 
     /// The table [`crc_table`] derives is the one `MatchFinder_Construct`

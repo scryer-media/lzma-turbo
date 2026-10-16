@@ -15,7 +15,7 @@
         all(feature = "asm", any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
-mod bt_kernel;
+pub(crate) mod bt_kernel;
 mod consts;
 mod finder;
 mod huge_pages;

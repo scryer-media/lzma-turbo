@@ -31,8 +31,7 @@ use crate::lzma::consts::LZMA_DIC_MIN;
 use crate::lzma::{LzmaDec, LzmaProps, lzma_dec_decode_to_dic};
 
 use frame::{
-    LZMA2_CONTROL_COPY_RESET_DIC, LZMA2_LCLP_MAX, Lzma2Frame, Lzma2State, dic_size_from_prop,
-    is_uncompressed_state,
+    LZMA2_CONTROL_COPY_RESET_DIC, LZMA2_LCLP_MAX, Lzma2Frame, Lzma2State, is_uncompressed_state,
 };
 
 /// LZMA2 decoder.
@@ -58,11 +57,7 @@ impl Lzma2Decoder {
         if dict_prop > 40 {
             return Err(Error::UnsupportedProps);
         }
-        let dic_size = if dict_prop == 40 {
-            0xFFFF_FFFF
-        } else {
-            dic_size_from_prop(dict_prop)
-        };
+        let dic_size = frame::dic_size_from_prop_full(dict_prop);
         // C: props[0] = LZMA2_LCLP_MAX, i.e. lc = 4, lp = 0, pb = 0, which
         // sizes the probability table for the largest (lc + lp) LZMA2 allows.
         let prop = LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))?;

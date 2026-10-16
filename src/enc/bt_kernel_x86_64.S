@@ -45,25 +45,25 @@ mov     eax, [rax + 56]
 sub     rax, r8
 mov     qword ptr [rsp + 48], rax
 movq    xmm3, r8
-.Lbt_base_main:
+Lbt_base_main:
 mov     r8, rcx
 sub     r8, rdx
 inc     r8
-jmp     .Lbt_main_loop
+jmp     Lbt_main_loop
 .p2align 6
-.Lbt_fill_empty:
+Lbt_fill_empty:
 mov     QWORD PTR [r15], 0
 inc     edx
 inc     ebx
 mov     DWORD PTR [r13 - 4], 0
 cmp     r13, qword ptr [rsp + 24]
-jae     .Lbt_fin
+jae     Lbt_fin
 cmp     r14, r10
-je      .Lbt_fin
-.Lbt_main_loop:
+je      Lbt_fin
+Lbt_main_loop:
 mov     edi, [r14]
 test edi, edi
-je .Lbt_fin_error
+je Lbt_fin_error
 add     r14, 4
 inc     rcx
 add     r13, 4
@@ -71,22 +71,22 @@ mov     ebp, edx
 sub     ebp, edi
 lea     r15, [r9 + 8 * rbx]
 cmp     edx, esi
-jb      .Lbt_directMode
+jb      Lbt_directMode
 cmp     edi, esi
-jae     .Lbt_fill_empty
+jae     Lbt_fill_empty
 xor     eax, eax
 mov     dword ptr [rsp + 8], ebx
 sub     ebx, edi
 cmovb   eax, esi
 add     ebx, eax
-jmp     .Lbt_prepare_for_tree_loop
-.Lbt_directMode:
+jmp     Lbt_prepare_for_tree_loop
+Lbt_directMode:
 cmp     edi,  edx
-je      .Lbt_fill_empty
-jae     .Lbt_fin_error
+je      Lbt_fill_empty
+jae     Lbt_fin_error
 mov     dword ptr [rsp + 8], ebx
 mov     ebx, ebp
-.Lbt_prepare_for_tree_loop:
+Lbt_prepare_for_tree_loop:
 movq    r10, xmm3
 mov     qword ptr [rsp + 16], r14
 lea     r14, [r15 + 4]
@@ -97,7 +97,7 @@ mov     r12d, dword ptr [rsp + 0]
 mov     eax, dword ptr [rsp + 48]
 mov     dword ptr [rsp + 4], eax
 .p2align 5
-.Lbt_tree_loop:
+Lbt_tree_loop:
 lea     rdi, [r8 + rbp]
 mov     rsi, r10
 cmp     r11, r10
@@ -106,33 +106,33 @@ mov     eax, [r9 + rbx * 8]
 movzx   eax, BYTE PTR [rdi + 1 * rsi]
 lea     rbx, [r9 + rbx * 8]
 cmp     [rcx + 1 * rsi], al
-je      .Lbt_matched_1
-jb      .Lbt_left_0
+je      Lbt_matched_1
+jb      Lbt_left_0
 mov     [r15], ebp
 mov     eax, ebp
 mov        ebp, [rbx + 4]
 lea     r15, [rbx + 4]
-jmp     .Lbt_next_node
+jmp     Lbt_next_node
 .p2align 5
-.Lbt_left_0:
+Lbt_left_0:
 mov     [r14], ebp
 mov     eax, ebp
 mov        ebp, [rbx]
 mov     r14, rbx
-.Lbt_next_node:
+Lbt_next_node:
 mov     esi, dword ptr [rsp + 12]
 cmp     ebp, eax
-jae     .Lbt_fin_error
+jae     Lbt_fin_error
 dec     r12d
-je      .Lbt_finish_tree
+je      Lbt_finish_tree
 mov     edi, edx
 sub     edi, ebp
 cmp     edx, esi
-jae     .Lbt_cyc_mode_2
+jae     Lbt_cyc_mode_2
 mov     ebx, ebp
 test    ebp, ebp
-jne     .Lbt_tree_loop
-.Lbt_finish_tree:
+jne     Lbt_tree_loop
+Lbt_finish_tree:
 mov     DWORD PTR [r14], 0
 mov     DWORD PTR [r15], 0
 inc     edx
@@ -142,91 +142,91 @@ sub     rbx, rax
 shr     ebx, 2
 mov     [rax - 4], ebx
 cmp     r13, qword ptr [rsp + 24]
-jae     .Lbt_fin
+jae     Lbt_fin
 mov     ebx, dword ptr [rsp + 8]
 mov     r14, qword ptr [rsp + 16]
 mov     r10, qword ptr [rsp + 32]
 inc     ebx
 cmp     r14, r10
-jne     .Lbt_main_loop
-jmp     .Lbt_fin
+jne     Lbt_main_loop
+jmp     Lbt_fin
 .p2align 5
-.Lbt_cyc_mode_2:
+Lbt_cyc_mode_2:
 cmp     edi, esi
-jae     .Lbt_finish_tree
+jae     Lbt_finish_tree
 mov     ebx, dword ptr [rsp + 8]
 xor     eax, eax
 sub     ebx, edi
 cmovb   eax, esi
 add     ebx, eax
-jmp     .Lbt_tree_loop
+jmp     Lbt_tree_loop
 .p2align 5
-.Lbt_matched_1:
+Lbt_matched_1:
 inc     rsi
-je      .Lbt_lenLimit_reach
+je      Lbt_lenLimit_reach
 movzx   eax, BYTE PTR [rdi + 1 * rsi]
 cmp     [rcx + 1 * rsi], al
-jne     .Lbt_mismatch
+jne     Lbt_mismatch
 .p2align 5
-.Lbt_match_loop:
+Lbt_match_loop:
 inc     rsi
-je      .Lbt_lenLimit_reach
-.Lbt_word_scan:
+je      Lbt_lenLimit_reach
+Lbt_word_scan:
 // SAFETY: the same negative-offset margin covers complete 16-byte reads.
 cmp     rsi, -16
-ja      .Lbt_word8_scan
+ja      Lbt_word8_scan
 movdqu  xmm0, XMMWORD PTR [rdi + rsi]
 movdqu  xmm1, XMMWORD PTR [rcx + rsi]
 pcmpeqb xmm0, xmm1
 pmovmskb eax, xmm0
 xor     eax, 65535
-jnz     .Lbt_word16_mismatch
+jnz     Lbt_word16_mismatch
 add     rsi, 16
-je      .Lbt_lenLimit_reach
-jmp     .Lbt_word_scan
-.Lbt_word16_mismatch:
+je      Lbt_lenLimit_reach
+jmp     Lbt_word_scan
+Lbt_word16_mismatch:
 // The nonzero mask has one set bit per differing byte, in address order.
 bsf     eax, eax
 add     rsi, rax
-jmp     .Lbt_byte_scan
-.Lbt_word8_scan:
+jmp     Lbt_byte_scan
+Lbt_word8_scan:
 // SAFETY: rsi is a negative offset from the match limit. rsi <= -8
 // keeps both complete words inside the window/history margins C, D and E.
 cmp     rsi, -8
-ja      .Lbt_byte_scan
+ja      Lbt_byte_scan
 mov     rax, QWORD PTR [rdi + rsi]
 xor     rax, QWORD PTR [rcx + rsi]
-jnz     .Lbt_word_mismatch
+jnz     Lbt_word_mismatch
 add     rsi, 8
-je      .Lbt_lenLimit_reach
-jmp     .Lbt_word_scan
-.Lbt_word_mismatch:
+je      Lbt_lenLimit_reach
+jmp     Lbt_word_scan
+Lbt_word_mismatch:
 // The XOR is nonzero. Its first set byte is the first mismatch on x86-64.
 bsf     rax, rax
 shr     eax, 3
 add     rsi, rax
-.Lbt_byte_scan:
+Lbt_byte_scan:
 movzx   eax, BYTE PTR [rdi + rsi]
 cmp     BYTE PTR [rcx + rsi], al
-je      .Lbt_match_loop
-.Lbt_mismatch:
-jb      .Lbt_left_2
+je      Lbt_match_loop
+Lbt_mismatch:
+jb      Lbt_left_2
 mov     [r15], ebp
 mov     eax, ebp
 mov        ebp, [rbx + 4]
 lea     r15, [rbx + 4]
 mov     r11, rsi
-jmp     .Lbt_max_update
+jmp     Lbt_max_update
 .p2align 5
-.Lbt_left_2:
+Lbt_left_2:
 mov     [r14], ebp
 mov     eax, ebp
 mov        ebp, [rbx]
 mov     r14, rbx
 mov     r10, rsi
-.Lbt_max_update:
+Lbt_max_update:
 cmp     dword ptr [rsp + 4], esi
-jae     .Lbt_next_node
+jae     Lbt_next_node
 mov     dword ptr [rsp + 4], esi
 movq    rdi, xmm3
 add     rsi, rdi
@@ -236,9 +236,9 @@ sub     edi, eax
 dec     edi
 mov     [r13 + 4], edi
 add     r13, 8
-jmp     .Lbt_next_node
+jmp     Lbt_next_node
 .p2align 5
-.Lbt_lenLimit_reach:
+Lbt_lenLimit_reach:
 movq    r8, xmm3
 mov     r12, rcx
 sub     r12, rdi
@@ -263,14 +263,14 @@ inc     ebx
 mov     rbp, qword ptr [rsp + 24]
 mov     esi, dword ptr [rsp + 12]
 cmp     r14, r10
-je      .Lbt_fin
+je      Lbt_fin
 cmp     r13, rbp
-jae     .Lbt_fin
+jae     Lbt_fin
 cmp     r12d, [r14]
-jne     .Lbt_base_main
+jne     Lbt_base_main
 movzx   eax, BYTE PTR [rdi]
 cmp     [rcx], al
-jne     .Lbt_base_main
+jne     Lbt_base_main
 mov     dword ptr [rsp + 8], ebx
 shl     rsi, 3
 sub     rdi, rcx
@@ -282,7 +282,7 @@ cmovb   rax, rsi
 add     r15, rax
 add     rsi, r9
 .p2align 5
-.Lbt_long_loop:
+Lbt_long_loop:
 add     r14, 4
 mov     rax, [r15]
 add     r15, 8
@@ -296,28 +296,28 @@ mov     [r13 + 8], r11d
 add     r13, 12
 inc     rcx
 cmp     r14, r10
-je      .Lbt_long_footer
+je      Lbt_long_footer
 cmp     r12d, [r14]
-jne     .Lbt_long_footer
+jne     Lbt_long_footer
 movzx   eax, BYTE PTR [rdi + 1 * rcx]
 cmp     [rcx], al
-jne     .Lbt_long_footer
+jne     Lbt_long_footer
 cmp     r13, rbp
-jb      .Lbt_long_loop
-.Lbt_long_footer:
+jb      Lbt_long_loop
+Lbt_long_footer:
 sub     rbx, r9
 shr     rbx, 3
 add     edx, ebx
 sub     edx, dword ptr [rsp + 8]
 mov     esi, dword ptr [rsp + 12]
 cmp     r13, rbp
-jae     .Lbt_fin
+jae     Lbt_fin
 cmp     r14, r10
-jne     .Lbt_base_main
-jmp     .Lbt_fin
-.Lbt_fin_error:
+jne     Lbt_base_main
+jmp     Lbt_fin
+Lbt_fin_error:
 xor     r13, r13
-.Lbt_fin:
+Lbt_fin:
 mov     rsp, qword ptr [rsp + 56]
 mov     rax, [rsp + 104]
 mov     [rax], edx

@@ -293,19 +293,23 @@ pub(crate) fn install_reference_hooks_for_test() {
     #[cfg(all(feature = "crypto", not(feature = "native-crypto")))]
     type RefSha = crate::crypto::awslc::Sha256;
 
-    // Both CRCs are "init all ones, final xor all ones", so `crc-fast`'s
-    // running register is the bitwise complement of the finalized value in
-    // both directions: seeding the digest with `!seed` resumes exactly where a
-    // stream carrying the finalized `seed` left off.
+    // CRC-32 goes through the crate's guarded dispatch, which keeps an
+    // aarch64 core without the CRC instructions off `crc-fast`'s fused
+    // CRC-32 path, and is chained onto `seed` by combining: the CRC of the
+    // whole stream so far is the combine of the CRC before and the CRC of
+    // the new bytes, and the CRC of nothing is zero.
     fn crc32(seed: u32, data: &[u8]) -> u32 {
-        let mut digest = crc_fast::Digest::new_with_init_state(
-            crc_fast::CrcAlgorithm::Crc32IsoHdlc,
-            u64::from(!seed),
-        );
-        digest.update(data);
-        digest.finalize() as u32
+        crate::crc::crc32_combine(
+            seed,
+            crate::crc::native_crc32_for_test(data),
+            data.len() as u64,
+        )
     }
 
+    // CRC-64/XZ needs no guard. Both CRCs are "init all ones, final xor all
+    // ones", so `crc-fast`'s running register is the bitwise complement of
+    // the finalized value: seeding the digest with `!seed` resumes exactly
+    // where a stream carrying the finalized `seed` left off.
     fn crc64_xz(seed: u64, data: &[u8]) -> u64 {
         let mut digest =
             crc_fast::Digest::new_with_init_state(crc_fast::CrcAlgorithm::Crc64Xz, !seed);

@@ -185,6 +185,13 @@ impl Lzma2RunDecoder {
     /// `Progress::read` on the next call. Input larger than the remaining packed
     /// range, including an EOS byte, is rejected before any output is written.
     ///
+    /// A call that consumes all of `input` and returns `written < max_output`
+    /// has delivered every byte that input decodes to. Once the run's last
+    /// packed byte has been consumed by such a call, [`finish`](Self::finish)
+    /// may follow directly: no call with empty input is needed to drain it.
+    /// A call that stops at `max_output` may still owe output; call again
+    /// with the remaining input, or with an empty slice if none remains.
+    ///
     /// # Errors
     /// Corrupt data errors retain the run index and output offset. Sink errors pass
     /// through unchanged; cancellation is `Error::Cancelled` in an
@@ -282,7 +289,14 @@ impl Lzma2RunDecoder {
             read += used;
             written += produced;
             status = next_status;
-            if used == 0 && produced == 0 || read == input.len() {
+            // Stop when the decoder is stuck, or when the input is spent and
+            // the step came back short: a short step means the coder needs
+            // bytes it does not have. A full step after the last input byte
+            // may still owe output (a match running past the step or the ring
+            // end, or range-coder state already holding the next symbols), so
+            // keep going until `max_output` or a short step; the caller then
+            // never has to drain with empty input.
+            if (used == 0 && produced == 0) || (read == input.len() && produced < step) {
                 break;
             }
         }
