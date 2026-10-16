@@ -1030,14 +1030,14 @@ impl Lzma2AdaptiveDecoder {
     /// # Errors
     ///
     /// Returns [`Error::Cancelled`] after [`Lzma2AdaptiveDecoder::cancel`],
-    /// and [`Error::InternalFailure`] if the range is not inside the buffer.
+    /// and [`Error::Param`] if the range is not inside the buffer.
     pub fn feed_shared(
         &mut self,
         seg: &Arc<Vec<u8>>,
         range: Range<usize>,
     ) -> Result<Option<Range<usize>>, Error> {
         if range.end > seg.len() || range.start > range.end {
-            return Err(Error::InternalFailure);
+            return Err(Error::Param);
         }
         let len = range.end - range.start;
         if self.room_to_take(len, true)? < len {

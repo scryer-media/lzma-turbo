@@ -652,7 +652,9 @@ mod tests {
             reader.src.reads, 0,
             "completed output lost its admission slot"
         );
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let error = error.downcast::<XzError>().expect("an XzError payload");
+        assert_eq!(error.kind.lzma(), Some(crate::Error::InternalFailure));
         assert_eq!(reader.next_dispatch, 3);
         assert_eq!(reader.ready.len(), 2);
     }

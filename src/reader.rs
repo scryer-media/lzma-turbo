@@ -15,7 +15,7 @@ use crate::lzma2::Lzma2Decoder;
 const IN_BUF_SIZE: usize = 1 << 16;
 
 fn to_io(e: Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
+    e.into()
 }
 
 struct Source<R> {
@@ -81,10 +81,7 @@ impl<R: Read> LzmaReader<R> {
     fn check_memory(props: LzmaProps, memory_limit: u64) -> io::Result<()> {
         let required = Self::memory_required(props);
         if required > memory_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("LZMA reader requires {required} bytes, limit is {memory_limit}"),
-            ));
+            return Err(to_io(Error::memory_limit(required, memory_limit)));
         }
         Ok(())
     }
@@ -191,10 +188,7 @@ impl<R: Read> LzmaReader<R> {
             // No progress and nothing more to come, or nothing taken from
             // input that is there: the end cannot be established.
             if progress.read == 0 && (self.src.eof || self.src.pos < self.src.len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated LZMA stream",
-                ));
+                return Err(to_io(Error::Truncated));
             }
         }
     }
@@ -250,10 +244,7 @@ impl<R: Read> Read for LzmaReader<R> {
                     self.done = true;
                 }
                 Status::NeedsMoreInput if self.src.eof && progress.read == 0 && written == 0 => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated LZMA stream",
-                    ));
+                    return Err(to_io(Error::Truncated));
                 }
                 _ => {}
             }
@@ -318,10 +309,7 @@ impl<R: Read> Lzma2Reader<R> {
     pub fn with_memory_limit(inner: R, dict_prop: u8, memory_limit: u64) -> io::Result<Self> {
         let required = Self::memory_required(dict_prop)?;
         if required > memory_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("LZMA2 reader requires {required} bytes, limit is {memory_limit}"),
-            ));
+            return Err(to_io(Error::memory_limit(required, memory_limit)));
         }
         Ok(Lzma2Reader {
             src: Source::new(inner),
@@ -401,10 +389,7 @@ impl<R: Read> Lzma2Reader<R> {
                 return Ok(0);
             }
             if used == 0 && self.src.eof {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated LZMA2 stream",
-                ));
+                return Err(to_io(Error::Truncated));
             }
         }
     }
@@ -434,10 +419,7 @@ impl<R: Read> Read for Lzma2Reader<R> {
                     break;
                 }
                 if progress.read == 0 && self.src.eof {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated LZMA2 stream",
-                    ));
+                    return Err(to_io(Error::Truncated));
                 }
             }
         }

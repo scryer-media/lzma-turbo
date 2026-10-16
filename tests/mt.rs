@@ -216,7 +216,9 @@ fn a_corrupt_run_is_reported_with_its_index_and_offset() {
         }
     };
     match err {
-        Error::CorruptRun { index, out_offset } => {
+        Error::CorruptRun {
+            index, out_offset, ..
+        } => {
             assert_eq!(index, 3, "wrong run blamed");
             // Everything before the bad run was delivered and is still good.
             assert_eq!(delivered, out_offset);

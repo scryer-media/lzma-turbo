@@ -10,7 +10,12 @@ use core::fmt;
 pub use crate::error::XzErrorKind;
 
 /// An xz read failure, located.
+///
+/// `Display` renders the kind and the location; `source()` is the kind's own
+/// source, the LZMA2 [`crate::Error`] behind an [`XzErrorKind::Lzma`]. Build
+/// one with [`XzError::at`] or [`XzError::in_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct XzError {
     /// What went wrong.
     pub kind: XzErrorKind,
@@ -61,21 +66,20 @@ impl fmt::Display for XzError {
     }
 }
 
-impl core::error::Error for XzError {}
+impl core::error::Error for XzError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        // The kind is rendered above, so its source is this error's.
+        core::error::Error::source(&self.kind)
+    }
+}
 
+/// The `io::ErrorKind` is the kind's class: `UnexpectedEof` for truncation,
+/// `OutOfMemory` for the memory limit, `Unsupported` for a check or filter
+/// this build lacks, an LZMA2 failure's own class, and `InvalidData` for the
+/// rest. The [`XzError`] is the payload, for `io::Error::downcast`.
 impl From<XzError> for std::io::Error {
     fn from(e: XzError) -> Self {
-        let kind = match e.kind {
-            XzErrorKind::TruncatedInput | XzErrorKind::TruncatedVli => {
-                std::io::ErrorKind::UnexpectedEof
-            }
-            XzErrorKind::MemoryLimit { .. } => std::io::ErrorKind::OutOfMemory,
-            XzErrorKind::UnsupportedCheck | XzErrorKind::UnsupportedFilter => {
-                std::io::ErrorKind::Unsupported
-            }
-            _ => std::io::ErrorKind::InvalidData,
-        };
-        std::io::Error::new(kind, e)
+        std::io::Error::new(e.kind.io_kind(), e)
     }
 }
 

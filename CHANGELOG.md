@@ -1,7 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - Unreleased
 
+- Breaking: every failure is a typed error of its own class, and an
+  `io::Error` built from one carries it as the payload with the kind of
+  its class, so `io::Error::downcast` gives it back.
+  - `Error` gains `Truncated` (input ended before the stream did,
+    `UnexpectedEof`) and `MemoryLimit { needed, limit }` (a reader's
+    memory budget, `OutOfMemory`). The readers, `run_boundaries` and the
+    parallel reader return them where they returned text errors or
+    `CorruptData`.
+  - `Error::OutputEof` is removed; nothing produced it.
+  - `Error::CorruptRun` and `Error::MemoryLimit`, and
+    `XzErrorKind::MemoryLimit` and `XzErrorKind::TooMuchOutput`, are
+    `#[non_exhaustive]`: match them with `..` and build them with
+    `Error::corrupt_run`, `Error::memory_limit`, `XzErrorKind::memory_limit`
+    and `XzErrorKind::too_much_output`. `XzError` is `#[non_exhaustive]`;
+    build it with `XzError::at` or `XzError::in_block`.
+  - `From<Error> for io::Error`: `Unsupported` for `UnsupportedProps`,
+    `InvalidData` for corrupt data, `UnexpectedEof` for truncation,
+    `OutOfMemory` for `Alloc` and `MemoryLimit`, `Interrupted` for
+    `Cancelled`, `InvalidInput` for `Param` and `Other` for
+    `InternalFailure`, `Read` and `Write`. The readers and decoders map
+    through it instead of calling everything `InvalidData`, the writers
+    instead of calling everything `Other`, and `From<XzError>` keeps the
+    class of an LZMA2 failure inside an xz block. A memory budget was
+    `InvalidInput`, a `dict_prop` above 40 in `run_boundaries` was
+    `InvalidInput`, and `UnsupportedProps` from a reader was `InvalidData`.
+  - `XzErrorKind::Lzma` returns its `Error` from `source()` and renders as
+    "xz LZMA2 layer failed" instead of repeating it, so each cause appears
+    once in a `source()` chain; `XzError::source()` is its kind's.
+  - `Lzma2AdaptiveDecoder::feed_shared` refuses a range outside its buffer
+    with `Param` instead of `InternalFailure`, and a sink that reports more
+    than it was given is `Param` instead of a text error. A panicked
+    parallel-reader thread is `InternalFailure` instead of a text error,
+    and the parallel reader hands back the decode thread's own error
+    instead of a copy of its message.
+  - `Error` implements `core::error::Error` without `std`; `Bcj2Error` and
+    `CryptoError` convert to `io::Error`; `Error::is_corrupt` and
+    `XzErrorKind::lzma` save matching on the variants.
+  - Display: `Alloc`, `InternalFailure` and `Param` name the coder rather
+    than the decoder or the encoder, since both return them.
 - Build: the `test` profile drops debuginfo, split debuginfo and incremental
   compilation; a cold `cargo test --all-features --no-run` is about 19 s
   instead of 21 s on an Apple M5 Max and the test run is unchanged. Raising
