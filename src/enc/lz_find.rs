@@ -133,8 +133,9 @@ pub(crate) struct MatchBuffer<T> {
     storage: Vec<T>,
     start: usize,
     len: usize,
-    /// Advised to use huge pages already: a buffer allocated for a small
-    /// stream and kept for a large one is advised when the large one comes.
+    /// Advised to use huge pages: a buffer allocated for a small stream and
+    /// kept for a large one is advised when the large one comes, and one
+    /// kept from a large stream for a small one has the advice withdrawn.
     advised: bool,
 }
 
@@ -213,13 +214,20 @@ impl<T: Zeroable> MatchBuffer<T> {
     }
 
     /// Advises huge pages for a buffer about to serve a stream of at most
-    /// `data_limit` bytes, unless it has been or the stream is small. A buffer
-    /// kept from a small stream is unaligned, so only the huge pages wholly
-    /// inside it are advised.
+    /// `data_limit` bytes, or withdraws the advice when the stream is small.
+    /// A buffer kept from a small stream is unaligned, so only the huge pages
+    /// wholly inside it are advised. One kept from a large stream keeps its
+    /// padding, which `mem_usage` already counts, but faults what a small
+    /// stream first touches in base pages.
     pub(crate) fn advise_for(&mut self, data_limit: u64) {
-        if !self.advised && huge_pages_for(data_limit) {
-            crate::enc::huge_pages::advise_slice(self);
-            self.advised = true;
+        let want = huge_pages_for(data_limit);
+        if want != self.advised {
+            if want {
+                crate::enc::huge_pages::advise_slice(self);
+            } else {
+                crate::enc::huge_pages::unadvise_slice(self);
+            }
+            self.advised = want;
         }
     }
 
@@ -2005,6 +2013,62 @@ mod tests {
             window,
             "the unbounded window is longer"
         );
+
+        // Kept from a large stream for a small one, the buffers are not
+        // reallocated and the advice is withdrawn; a large stream advises
+        // them again.
+        let (hash, window, allocs) = (kept.hash.as_ptr(), kept.buf_base.as_ptr(), kept.allocs);
+        kept.create(4 << 20, 1 << 12, 32, 274, small_limit).unwrap();
+        assert_eq!(
+            (kept.hash.as_ptr(), kept.buf_base.as_ptr(), kept.allocs),
+            (hash, window, allocs)
+        );
+        assert!(!kept.hash.advised && !kept.buf_base.advised);
+        kept.create(4 << 20, 1 << 12, 32, 274, u64::MAX).unwrap();
+        assert_eq!(kept.allocs, allocs);
+        assert!(kept.hash.advised && kept.buf_base.advised);
+    }
+
+    /// What the kernel holds for a kept finder's buffers as the streams it
+    /// serves change size: `MADV_HUGEPAGE` (`hg` in `/proc/self/smaps`) for a
+    /// large one, `MADV_NOHUGEPAGE` (`nh`) for a small one that reuses them.
+    #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
+    #[test]
+    fn a_kept_finder_withdraws_huge_pages_for_a_small_stream() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            std::eprintln!("skipped: this kernel has no transparent huge pages");
+            return;
+        }
+        // The `VmFlags` of the mapping that holds `addr`.
+        let flags = |addr: usize| -> std::vec::Vec<std::string::String> {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut inside = false;
+            for line in smaps.lines() {
+                let range = line.split(' ').next().unwrap_or("");
+                if let Some((lo, hi)) = range.split_once('-')
+                    && let (Ok(lo), Ok(hi)) =
+                        (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                {
+                    inside = lo <= addr && addr < hi;
+                } else if inside && let Some(rest) = line.strip_prefix("VmFlags:") {
+                    return rest.split_whitespace().map(str::to_owned).collect();
+                }
+            }
+            panic!("no mapping holds {addr:#x}");
+        };
+        let has = |addr: usize, flag: &str| flags(addr).iter().any(|f| f == flag);
+        let mut mf = MatchFinder::new();
+        mf.create(4 << 20, 1 << 12, 32, 274, u64::MAX).unwrap();
+        let (hash, window) = (mf.hash.as_ptr().addr(), mf.buf_base.as_ptr().addr());
+        assert!(has(hash, "hg") && has(window, "hg"));
+        let allocs = mf.allocs;
+        mf.create(4 << 20, 1 << 12, 32, 274, 2 << 20).unwrap();
+        assert_eq!(mf.allocs, allocs, "the buffers are kept");
+        assert!(has(hash, "nh") && !has(hash, "hg"));
+        assert!(has(window, "nh") && !has(window, "hg"));
+        mf.create(4 << 20, 1 << 12, 32, 274, u64::MAX).unwrap();
+        assert!(has(hash, "hg") && !has(hash, "nh"));
+        assert!(has(window, "hg") && !has(window, "nh"));
     }
 
     /// The table [`crc_table`] derives is the one `MatchFinder_Construct`

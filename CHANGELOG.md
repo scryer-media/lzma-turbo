@@ -31,7 +31,10 @@
   encoded with a large dictionary made far more of its tables resident than
   it touched. Larger limits and streams with no limit keep the huge pages,
   and a buffer kept from a small stream is advised when a larger one reuses
-  it. Output bytes are unchanged. Both take effect only when the caller sets
+  it. A buffer kept from a large stream for a smaller one has the advice
+  withdrawn with `MADV_NOHUGEPAGE`, so what the small stream first touches
+  faults in base pages; it is kept rather than reallocated, and its padding
+  stays inside what `mem_usage` reports. Output bytes are unchanged. Both take effect only when the caller sets
   a limit; a caller that sets none keeps today's padded window. For a stream
   of under about 1 MiB, the limit already shrank the window below the huge-page
   threshold.
