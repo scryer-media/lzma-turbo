@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.10.1 - Unreleased
+
+- `Lzma2AdaptiveDecoder` no longer counts parked capacity as held. Since
+  0.10.0 it parks finished output buffers and input pieces for reuse up to
+  half its limit and charged them in `held_bytes()`, so a caller that gates
+  its reads on `held_bytes()` saw parked buffers as committed memory and
+  read the next run only after the last wave was handed over: under a
+  memory limit that affords two runs, waves went 2, 1, 2, 1, 2 where 0.9.0
+  fed 2, 2, 2, 2.
+  - `held_bytes()` reports only what is in flight: input pieces not yet
+    finished, runs out with workers, and runs landed but not yet handed
+    over. The new `parked_bytes()` reports parked output buffers and
+    finished input pieces waiting to be reused. The memory limit governs
+    their sum, as before.
+  - The decoder gives parked capacity back before it refuses input, holds
+    back a run, or exceeds its limit: `set_memory_limit` sheds parked
+    capacity at once when a lowered limit falls below the sum, and input
+    refused for room first sheds parked output except the buffer the next
+    dispatch reuses.
+  - `dispatch_cost` is what a dispatch adds to `held_bytes()`: the run's
+    unpacked size or the parked buffer it reuses, whichever is larger. It
+    was what the dispatch added to held and parked together.
+  - `AdaptiveLedger::peak_held_bytes` is the peak of held and parked
+    together, the figure the limit governs.
+
 ## 0.10.0 - 2026-10-16
 
 - Breaking: every failure is a typed error of its own class, and an
