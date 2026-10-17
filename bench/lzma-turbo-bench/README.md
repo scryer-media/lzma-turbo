@@ -166,6 +166,15 @@ lzma-turbo fails, or a run finishes without a peak RSS, the row fails.
   liblzma's C allocations do not reach the Rust heap counter, which leaves
   its "peak alloc" near zero. The bare-converter rows read their whole input
   into memory and say how much.
+- A decode shot reads its output 64 KiB at a time, the size class xz itself
+  moves data in, and hands the `xz` and raw `lzma2` readers the bare file:
+  they fill a 64 KiB input buffer of their own. Until 0.10.1 the shot read
+  1 MiB at a time behind a 1 MiB `BufReader`, which put 1 MiB on
+  lzma-turbo's peak RSS on the single-stream rows (`decode/xz`,
+  `decode/lzma2-raw`, `decode/xz-multi`, `check/*`, `filter/decode/*`):
+  11.3 MiB then and 10.3 MiB now, against xz's 9.7 MiB, while the crate's
+  own allocation peak stayed at 8.09 MiB. Compare peaks across that change
+  with care.
 - `codebin.bin` is the host's own machine code. A BCJ filter for another
   architecture has little to convert in it.
 - The compressed fixtures depend on the xz and 7-Zip that wrote them. For

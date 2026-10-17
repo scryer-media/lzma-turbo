@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.10.1 - 2026-10-17
+
+- `Lzma2AdaptiveDecoder` no longer counts parked capacity as held. Since
+  0.10.0 it parks finished output buffers and input pieces for reuse up to
+  half its limit and charged them in `held_bytes()`, so a caller that gates
+  its reads on `held_bytes()` saw parked buffers as committed memory and
+  read the next run only after the last wave was handed over: under a
+  memory limit that affords two runs, waves went 2, 1, 2, 1, 2 where 0.9.0
+  fed 2, 2, 2, 2.
+  - `held_bytes()` reports only what is in flight: input pieces not yet
+    finished, runs out with workers, and runs landed but not yet handed
+    over. The new `parked_bytes()` reports parked output buffers and
+    finished input pieces waiting to be reused. The memory limit governs
+    their sum, as before.
+  - The decoder gives parked capacity back before it refuses input, holds
+    back a run, or exceeds its limit: `set_memory_limit` sheds parked
+    capacity at once when a lowered limit falls below the sum, and input
+    refused for room first sheds parked output except the buffer the next
+    dispatch reuses.
+  - `dispatch_cost` is what a dispatch adds to `held_bytes()`: the run's
+    unpacked size or the parked buffer it reuses, whichever is larger. It
+    was what the dispatch added to held and parked together.
+  - `AdaptiveLedger::peak_held_bytes` is the peak of held and parked
+    together, the figure the limit governs.
+- On Linux the encoder no longer aligns or advises huge pages for the match
+  finder's window and hash and son tables when `Lzma2Encoder::set_data_limit`
+  promises fewer than 8 MiB of input. With `MADV_HUGEPAGE`, the first byte
+  written into each 2 MiB of a buffer faulted in all 2 MiB, so a small stream
+  encoded with a large dictionary made far more of its tables resident than
+  it touched. Larger limits and streams with no limit keep the huge pages,
+  and a buffer kept from a small stream is advised when a larger one reuses
+  it. A buffer kept from a large stream for a smaller one has the advice
+  withdrawn with `MADV_NOHUGEPAGE`, so what the small stream first touches
+  faults in base pages; it is kept rather than reallocated, and its padding
+  stays inside what `mem_usage` reports. Output bytes are unchanged. Both take effect only when the caller sets
+  a limit; a caller that sets none keeps today's padded window. For a stream
+  of under about 1 MiB, the limit already shrank the window below the huge-page
+  threshold.
+- Bench harness: most of the gap between lzma-turbo's and xz's peak RSS on
+  the single-stream decode rows (`decode/xz/p256`, `decode/lzma2-raw/p256`,
+  `decode/xz-multi/p256x3`, `check/crc32`, `check/sha256`,
+  `filter/decode/delta64`) was the harness, not the crate. A decode shot
+  read its output 1 MiB at a time behind a 1 MiB `BufReader`, on top of the
+  crate's own 64 KiB input buffer. It now reads 64 KiB at a time, as xz
+  does, and hands the `xz` and raw `lzma2` readers the bare file. On an
+  Apple M5 Max those rows peak at 10.3 MiB where they peaked at 11.3 MiB,
+  against xz's 9.7 MiB. The crate's own allocation peak is 8,483,096 bytes
+  before and after, the 8 MiB dictionary and 92 KiB. The remaining 0.6 MiB
+  is outside the crate's heap.
+- `XzParallelReader` decodes through the serial path when it comes down to
+  one thread - asked for, all the memory limit affords, or a file of one
+  block - and costs what `XzReader` does: the largest block's dictionary,
+  clamped to the block, plus a 64 KiB input buffer and a probability table.
+  It does so only when that costs no more than holding the largest block. A
+  block header that leaves out the block's size, as a streaming `xz -9`
+  writes it, asks for its whole dictionary, 64 MiB however small the block;
+  such a file keeps the whole-block hold at one thread and fits every limit
+  it fitted in 0.10.0. So does a stream of no blocks, which `xz` writes for
+  empty input: holding it costs only the probability table, less than the
+  serial reader's input buffer.
+  It held a whole block's output until the block's check passed, which at
+  one thread bought no speed and cost a buffer the size of the largest
+  block. The hold is now an explicit opt-in, `XzOptions::verified_output`;
+  without it a one-thread decode returns a block's bytes before its check is
+  read and reports a failed check at the block's end. Decoded bytes are
+  unchanged. On an Apple M5 Max, `decode/xz-par` at one thread peaks at
+  10.4 MiB where it peaked at 26.6 MiB with 24 MiB blocks and 18.6 MiB with
+  16 MiB blocks, against xz's 9.7 MiB, in the same time.
+  - `XzParallelReader::memory_estimate()` at threads=1 drops to the serial
+    decoder's figure where the serial path is taken, and is the 0.10.0
+    figure where it is not. A caller that sizes a budget from it, or that expects
+    construction to fail when one held block does not fit, sees a smaller
+    estimate and a reader where it had an error. Weaver's
+    `open_filesystem_xz_decoder` is one: its tests that a one-worker budget
+    gets the parallel decoder at one thread, and that one byte less falls
+    back to the sequential decoder, will take the parallel branch for the
+    smaller budget when weaver takes this release. Set
+    `with_verified_output(true)` to keep the 0.10.0 figures.
+  - The estimate still grows with the thread count: one thread costs the
+    serial figure or one worker, whichever is less, and more threads cost
+    one worker each.
+
 ## 0.10.0 - 2026-10-16
 
 - Breaking: every failure is a typed error of its own class, and an

@@ -44,6 +44,14 @@ use crate::{Crc32, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_fro
 
 const IN_CHUNK: usize = 1 << 20;
 
+/// What a decode lane reads its output in. xz moves data in pieces of this
+/// class and the crate's readers fill a 64 KiB input buffer of their own, so
+/// a larger piece would only add to the process's peak RSS what the crate
+/// does not hold: the 1 MiB this used to be, with a 1 MiB `BufReader` in
+/// front of the crate's own buffer, put 1 MiB on the single-stream rows'
+/// peak.
+const READ_CHUNK: usize = 1 << 16;
+
 pub const HELP: &str = "\
   --shot LANE    run one measurement and print one JSON line, for a harness
                  that measures each contender as its own process:
@@ -191,7 +199,8 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             })
         }
         "lzma2" => {
-            let (prop, stream) = lzma2_stream(path)?;
+            // `Lzma2Reader` buffers its own input.
+            let (prop, stream) = lzma2_stream_unbuffered(path)?;
             read_all(bytes_in, shot.verify, || {
                 Lzma2Reader::with_memory_limit(stream, prop, u64::MAX).map_err(|e| e.to_string())
             })
@@ -226,7 +235,8 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             })
         }
         "xz" => {
-            let file = open(path)?;
+            // The reader buffers its own input, as `xz-par` does.
+            let file = File::open(path).map_err(|e| e.to_string())?;
             read_all(bytes_in, shot.verify, || Ok(XzReader::new(file)))
         }
         "xz-par" => {
@@ -375,7 +385,7 @@ fn read_all<R: Read>(
     verify: bool,
     build: impl FnOnce() -> Result<R, String>,
 ) -> Result<Line, String> {
-    let mut buf = vec![0u8; OUT_CHUNK];
+    let mut buf = vec![0u8; READ_CHUNK];
     let mut sink = Sink::new(verify);
     let base = alloc_watch_reset();
     let t0 = Instant::now();
@@ -404,6 +414,17 @@ fn read_all<R: Read>(
 /// The raw LZMA2 stream of a single-block `.xz` or a single-folder `.7z`, as
 /// a reader positioned on its first byte, with its dictionary property byte.
 fn lzma2_stream(path: &Path) -> Result<(u8, std::io::Take<BufReader<File>>), String> {
+    let (prop, stream) = lzma2_stream_unbuffered(path)?;
+    let len = stream.limit();
+    Ok((
+        prop,
+        BufReader::with_capacity(IN_CHUNK, stream.into_inner()).take(len),
+    ))
+}
+
+/// [`lzma2_stream`] with no buffer in front of the file, for a reader that
+/// buffers its own input.
+fn lzma2_stream_unbuffered(path: &Path) -> Result<(u8, std::io::Take<File>), String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let (prop, offset, len) = if ext == "7z" {
@@ -431,7 +452,7 @@ fn lzma2_stream(path: &Path) -> Result<(u8, std::io::Take<BufReader<File>>), Str
     };
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| e.to_string())?;
-    Ok((prop, BufReader::with_capacity(IN_CHUNK, file).take(len)))
+    Ok((prop, file.take(len)))
 }
 
 fn read_up_to(file: &mut File, buf: &mut [u8]) -> Result<usize, String> {

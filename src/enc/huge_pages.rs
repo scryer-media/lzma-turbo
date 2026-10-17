@@ -58,6 +58,23 @@ pub(crate) fn advise_slice<T>(slice: &[T]) {
     );
 }
 
+/// Withdraw the advice from the logical region of a buffer [`advise_slice`]
+/// advised, so that a smaller stream reusing it faults in base pages.
+/// Pages already resident keep their backing. C has no counterpart:
+/// `BigAlloc` never keeps a buffer from one stream for the next.
+pub(crate) fn unadvise_slice<T>(slice: &[T]) {
+    let _ = unadvise_slice_result(slice);
+}
+
+/// [`unadvise_slice`], with what `madvise` returned.
+fn unadvise_slice_result<T>(slice: &[T]) -> Option<i32> {
+    advise_with(
+        slice.as_ptr().addr(),
+        core::mem::size_of_val(slice),
+        madvise_nohugepage,
+    )
+}
+
 #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
 fn madvise_hugepage(start: usize, length: usize) -> i32 {
     // asm-generic/mman-common.h.
@@ -80,9 +97,35 @@ fn madvise_hugepage(start: usize, length: usize) -> i32 {
     unsafe { madvise(start as *mut core::ffi::c_void, length, MADV_HUGEPAGE) }
 }
 
+#[cfg(all(target_os = "linux", feature = "std", not(miri)))]
+fn madvise_nohugepage(start: usize, length: usize) -> i32 {
+    // asm-generic/mman-common.h.
+    const MADV_NOHUGEPAGE: core::ffi::c_int = 15;
+    unsafe extern "C" {
+        fn madvise(
+            addr: *mut core::ffi::c_void,
+            length: usize,
+            advice: core::ffi::c_int,
+        ) -> core::ffi::c_int;
+    }
+    // SAFETY: as for `MADV_HUGEPAGE`: `MADV_NOHUGEPAGE` changes neither the
+    // contents nor the mapping of the range, only whether the kernel may back
+    // it with huge pages. The range is page-aligned and inside the caller's
+    // allocation (`interior`); a refusal is an error the caller ignores. The
+    // call is verified natively by
+    // `the_kernel_withdraws_the_advice_and_the_bytes_are_unchanged`.
+    unsafe { madvise(start as *mut core::ffi::c_void, length, MADV_NOHUGEPAGE) }
+}
+
 /// Elsewhere there is nothing to advise.
 #[cfg(not(all(target_os = "linux", feature = "std", not(miri))))]
 fn madvise_hugepage(_start: usize, _length: usize) -> i32 {
+    0
+}
+
+/// Nor anything to withdraw.
+#[cfg(not(all(target_os = "linux", feature = "std", not(miri))))]
+fn madvise_nohugepage(_start: usize, _length: usize) -> i32 {
     0
 }
 
@@ -182,5 +225,25 @@ mod tests {
             return;
         }
         assert_eq!(ret, Some(0), "madvise(MADV_HUGEPAGE) refused: {err}");
+    }
+
+    /// The advice withdrawn from a buffer advised before: the kernel accepts
+    /// it and every byte is what it was.
+    #[cfg(all(target_os = "linux", feature = "std", not(miri)))]
+    #[test]
+    fn the_kernel_withdraws_the_advice_and_the_bytes_are_unchanged() {
+        let pattern = |i: usize| (i.wrapping_mul(29) ^ (i >> 13)) as u8;
+        let len = 6 << 20;
+        let buf: alloc::vec::Vec<u8> = (0..len).map(pattern).collect();
+        advise_slice(&buf);
+        let ret = unadvise_slice_result(&buf);
+        let err = std::io::Error::last_os_error();
+        assert!(buf.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+        assert!(ret.is_some(), "6 MiB holds a whole huge page");
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            std::eprintln!("skipped: this kernel has no transparent huge pages");
+            return;
+        }
+        assert_eq!(ret, Some(0), "madvise(MADV_NOHUGEPAGE) refused: {err}");
     }
 }

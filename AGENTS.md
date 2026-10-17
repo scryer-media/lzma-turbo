@@ -164,9 +164,13 @@ port rules and what was left out are in `docs/encoder.md`.
      checked-parser differential test exercises the single-threaded,
      inline and threaded variants natively and under Miri. `MT` is selected
      at block entry and the finder variant cannot change within the block.
-   - `madvise_hugepage`: `the_advice_covers_only_whole_huge_pages_inside_the_buffer`
-     checks the range, and `the_kernel_takes_the_advice_and_the_bytes_are_unchanged`
-     checks the real FFI call natively on Linux. Miri has no `madvise`.
+   - `madvise_hugepage` and `madvise_nohugepage`:
+     `the_advice_covers_only_whole_huge_pages_inside_the_buffer` checks the
+     range, and `the_kernel_takes_the_advice_and_the_bytes_are_unchanged` and
+     `the_kernel_withdraws_the_advice_and_the_bytes_are_unchanged` check the
+     real FFI calls natively on Linux;
+     `a_kept_finder_withdraws_huge_pages_for_a_small_stream` checks the
+     mapping flags a kept finder ends with. Miri has no `madvise`.
    - SDK normalization kernels in `src/enc/lz_find/normalize.rs`:
      `normalization_matches_scalar_at_every_alignment_and_tail` checks prefix,
      bulk and tail against scalar saturation, including every word alignment.
