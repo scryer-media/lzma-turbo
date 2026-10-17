@@ -368,22 +368,21 @@ impl Lzma2RunScanner {
 ///
 /// # Errors
 ///
-/// [`std::io::ErrorKind::InvalidInput`] for `dict_prop > 40`,
-/// [`std::io::ErrorKind::InvalidData`] for a stream the scanner rejects,
-/// [`std::io::ErrorKind::UnexpectedEof`] for a range that ends before the
-/// stream's end marker does, and any error the source itself returns.
+/// [`Error::UnsupportedProps`] for `dict_prop > 40`
+/// ([`std::io::ErrorKind::Unsupported`]), [`Error::CorruptData`] for a stream
+/// the scanner rejects ([`std::io::ErrorKind::InvalidData`]),
+/// [`Error::Truncated`] for a range that ends before the stream's end marker
+/// does ([`std::io::ErrorKind::UnexpectedEof`]), each as the `io::Error`
+/// payload, and any error the source itself returns.
 #[cfg(feature = "std")]
 pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
     mut source: R,
     dict_prop: u8,
 ) -> std::io::Result<Vec<Lzma2Run>> {
-    use std::io::{Error as IoError, ErrorKind, SeekFrom};
+    use std::io::{Error as IoError, SeekFrom};
 
     if dict_prop > 40 {
-        return Err(IoError::new(
-            ErrorKind::InvalidInput,
-            Error::UnsupportedProps,
-        ));
+        return Err(Error::UnsupportedProps.into());
     }
     let start = source.stream_position()?;
     let end = source.seek(SeekFrom::End(0))?;
@@ -402,7 +401,7 @@ pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
         let skip = scanner.payload_remaining();
         if skip != 0 {
             if skip > end - at {
-                failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+                failed = Some(IoError::from(Error::Truncated));
                 break;
             }
             scanner.skip_payload(skip);
@@ -414,12 +413,12 @@ pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
             .unwrap_or(usize::MAX)
             .min(buf.len());
         if want == 0 {
-            failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+            failed = Some(IoError::from(Error::Truncated));
             break;
         }
         let n = source.read(&mut buf[..want])?;
         if n == 0 {
-            failed = Some(IoError::new(ErrorKind::UnexpectedEof, Error::CorruptData));
+            failed = Some(IoError::from(Error::Truncated));
             break;
         }
         match scanner.feed(&buf[..n]) {
@@ -430,7 +429,7 @@ pub fn run_boundaries<R: std::io::Read + std::io::Seek>(
                 }
             }
             Err(e) => {
-                failed = Some(IoError::new(ErrorKind::InvalidData, e));
+                failed = Some(IoError::from(e));
                 break;
             }
         }

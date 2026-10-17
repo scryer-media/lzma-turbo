@@ -102,6 +102,20 @@ impl core::fmt::Display for Bcj2Error {
 
 impl core::error::Error for Bcj2Error {}
 
+/// [`Bcj2Error::Data`] is `io::ErrorKind::InvalidData` and
+/// [`Bcj2Error::UnalignedStream`], a caller's slice, is
+/// `io::ErrorKind::InvalidInput`, each with the [`Bcj2Error`] as the payload.
+#[cfg(feature = "std")]
+impl From<Bcj2Error> for std::io::Error {
+    fn from(e: Bcj2Error) -> Self {
+        let kind = match e {
+            Bcj2Error::Data => std::io::ErrorKind::InvalidData,
+            Bcj2Error::UnalignedStream => std::io::ErrorKind::InvalidInput,
+        };
+        std::io::Error::new(kind, e)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Little helpers, as in `bcj`: the C's GetBe32a/SetBe32a/SetUi32 with the
 // alignment Rust does not need told.

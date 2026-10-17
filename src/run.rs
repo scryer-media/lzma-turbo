@@ -168,13 +168,7 @@ impl Lzma2RunDecoder {
     }
 
     fn corrupt(&self) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            Error::CorruptRun {
-                index: self.index,
-                out_offset: self.run.out_offset,
-            },
-        )
+        Error::corrupt_run(self.index, self.run.out_offset).into()
     }
 
     /// Consumes a prefix of `input`, delivering at most `max_output` bytes.
@@ -194,8 +188,8 @@ impl Lzma2RunDecoder {
     ///
     /// # Errors
     /// Corrupt data errors retain the run index and output offset. Sink errors pass
-    /// through unchanged; cancellation is `Error::Cancelled` in an
-    /// `Interrupted` I/O error. All errors poison the decoder.
+    /// through unchanged; cancellation is `Error::Cancelled` in an I/O error
+    /// of kind `Other`. All errors poison the decoder.
     pub fn decode<F>(
         &mut self,
         input: &[u8],
@@ -250,7 +244,7 @@ impl Lzma2RunDecoder {
                 .decode_block(start + step, &input[read..], mode)
                 .map_err(|error| match error {
                     Error::CorruptData => self.corrupt(),
-                    other => io::Error::new(io::ErrorKind::InvalidData, other),
+                    other => other.into(),
                 })?;
             if next_status == Status::FinishedWithMark {
                 return Err(self.corrupt());
@@ -273,10 +267,8 @@ impl Lzma2RunDecoder {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(size) if size <= bytes.len() - sent => sent += size,
                     Ok(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "sink wrote past its slice",
-                        ));
+                        // The sink claimed bytes it was not given.
+                        return Err(Error::Param.into());
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
@@ -349,7 +341,7 @@ impl Lzma2RunDecoder {
 
 fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     if cancel.load(Ordering::Acquire) {
-        Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled))
+        Err(Error::Cancelled.into())
     } else {
         Ok(())
     }

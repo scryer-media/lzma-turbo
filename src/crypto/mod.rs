@@ -94,6 +94,15 @@ impl core::fmt::Display for CryptoError {
 
 impl core::error::Error for CryptoError {}
 
+/// A backend failure is the library's, not the caller's or the data's:
+/// `io::ErrorKind::Other`, with the [`CryptoError`] as the payload.
+#[cfg(feature = "std")]
+impl From<CryptoError> for std::io::Error {
+    fn from(e: CryptoError) -> Self {
+        std::io::Error::other(e)
+    }
+}
+
 /// Length of a SHA-256 digest, in bytes.
 pub const SHA256_LEN: usize = 32;
 

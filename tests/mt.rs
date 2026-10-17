@@ -157,6 +157,51 @@ fn truncation_anywhere_is_an_error_and_never_a_hang() {
     }
 }
 
+/// A stream that stops at a run boundary or just short of its end marker
+/// ended early, which every thread count reports as `Truncated`, not as
+/// corruption.
+#[test]
+fn a_stream_cut_between_runs_is_truncated_at_every_thread_count() {
+    let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 2);
+    let mut cuts: Vec<usize> = run_boundaries(&packed)
+        .iter()
+        .map(|(off, _)| *off as usize)
+        .filter(|&cut| cut > 0)
+        .collect();
+    cuts.push(packed.len() - 1);
+    for &cut in &cuts {
+        for &t in THREADS {
+            let err = decode_mt(prop, &packed[..cut], t).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "cut at {cut}, threads={t}: {err:?}"
+            );
+            assert_eq!(
+                err.downcast::<lzma_turbo::Error>().ok(),
+                Some(lzma_turbo::Error::Truncated),
+                "cut at {cut}, threads={t}"
+            );
+
+            let mut dec = Lzma2AdaptiveDecoder::new(prop, &opts(t)).expect("props");
+            dec.feed(&packed[..cut]).expect("feed");
+            dec.end_of_input();
+            let err = loop {
+                match dec.drain(|_, _| {}) {
+                    Ok(DrainStatus::Finished) => panic!("cut at {cut}, threads={t}: decoded"),
+                    Ok(_) => {}
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(
+                err,
+                lzma_turbo::Error::Truncated,
+                "adaptive, cut at {cut}, threads={t}"
+            );
+        }
+    }
+}
+
 #[test]
 fn corruption_in_any_run_agrees_with_the_single_threaded_decoder() {
     let (prop, packed, _) = multi_run(&["text.p1.xz", "mixed.p1.xz", "rand.p1.xz"], 2);
@@ -216,7 +261,9 @@ fn a_corrupt_run_is_reported_with_its_index_and_offset() {
         }
     };
     match err {
-        Error::CorruptRun { index, out_offset } => {
+        Error::CorruptRun {
+            index, out_offset, ..
+        } => {
             assert_eq!(index, 3, "wrong run blamed");
             // Everything before the bad run was delivered and is still good.
             assert_eq!(delivered, out_offset);

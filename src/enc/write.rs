@@ -32,9 +32,10 @@ use crate::xz::filter::FilterFlags;
 #[cfg(feature = "xz")]
 use crate::xz::stream::CheckType;
 
-/// Turns an encoder error into the `io::Error` a `Write` must return.
+/// Turns an encoder error into the `io::Error` a `Write` must return, of
+/// the error's class.
 fn io(e: Error) -> io::Error {
-    io::Error::other(e)
+    e.into()
 }
 
 /// Writes `out` to `inner`, removing from it what `inner` accepted, so that a
