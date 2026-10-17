@@ -4,10 +4,11 @@ Thanks for looking. A few things before you open a pull request:
 
 - Read [AGENTS.md](../AGENTS.md); the porting and performance rules there
   apply to humans too.
-- Run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`
-  and `cargo nextest run --workspace --exclude wasm-conformance --no-fail-fast`
+- Run `cargo fmt --all`,
+  `cargo clippy --workspace --exclude wasm-conformance --all-targets --all-features -- -D warnings`,
+  `cargo nextest run --workspace --exclude wasm-conformance --no-fail-fast`
   and `cargo test --doc --workspace --exclude wasm-conformance --no-fail-fast` locally.
-- If you touched the decoder, include before/after numbers from
+- If you touched the decoder or the encoder, include before/after numbers from
   `cargo run --release -p lzma-bench` per `docs/benchmarking.md`.
 - Bump the crate version, `Cargo.lock` and the crate changelog in the
   same PR as the code change.

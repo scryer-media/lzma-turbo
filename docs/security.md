@@ -36,9 +36,14 @@ stream, the block and the file offset.
 
 ## The decoder
 
-The LZMA and LZMA2 decoders allocate exactly one dictionary, sized by the
-property byte the caller passes, and nothing else per stream. Every buffer
-index in the decode loop is bounds-checked by the compiler; the assembly loops
-are entered only after the same margin checks the C makes, and the crate
-builds and passes its tests with `--no-default-features`, where no `unsafe`
-code from a dependency is present at all.
+The LZMA and LZMA2 decoders allocate a dictionary, sized by the property byte
+the caller passes, and a probability table, sized by `lc` and `lp`, and
+nothing else per stream. The decode loop is the C's fast loop, unchecked in
+exactly the places the C is: the Rust loop and the assembly loops are both
+entered only after the margin checks the C makes, and the `// SAFETY:`
+comment in `lzma_dec_decode_real` lists the three invariants that keep every
+read and write in bounds. `tests/guard_pages.rs` runs both loops with the
+dictionary, the probability table and the input each against a no-access
+page, so a one-byte overrun faults, and the fuzz targets run them on
+malformed input. With `--no-default-features` the decoder builds with no
+dependency at all, so no `unsafe` code but its own is present.

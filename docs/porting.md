@@ -139,8 +139,8 @@ C: `C/Xz.h`, `C/XzIn.c`, `C/XzDec.c`, `C/XzCrc64.c`, `C/Bra.c`, `C/Bra86.c`,
 | `Xz.c` (`Xz_ParseIndex`-adjacent VLI helpers) | `src/xz/vli.rs` | Variable-length integers, hardened: nine bytes, 63 bits, shortest encoding only. |
 | `XzDec.c` (`CXzUnpacker`, `XzUnpacker_Code`) | `src/xz/reader.rs`, `src/xz/blockdec.rs` | The state machine and the per-block decode. |
 | `XzDec.c` (`CXzCheck`), `XzCrc64.c` | `src/xz/check.rs`, `src/crc.rs` | The block check, computed by whoever decoded the block. |
-| `Bra.c`, `Bra86.c`, `BraIA64.c` | `src/xz/bcj.rs` | All eight branch converters, decode side, with the C's branchless x86. |
-| `Delta.c` | `src/xz/delta.rs` | The delta filter, with the C's 256-byte rotating history. |
+| `Bra.c`, `Bra86.c`, `BraIA64.c` | `src/filters/bcj.rs` | All eight branch converters, decode side, with the C's branchless x86. |
+| `Delta.c` | `src/filters/delta.rs` | The delta filter, with the C's 256-byte rotating history. |
 | — | `src/xz/filter.rs` | Filter flags, chain validation and the streaming converter pipeline. There is no single C counterpart: 7-Zip's chain lives inside `CXzUnpacker`. |
 | `XzDecMt.c` (`XzDecMt_Callback_Code`) | `src/xz/pool.rs`, `src/xz/parallel.rs` | Block-parallel decoding of a seekable file, scheduled from the index. |
 | — | `src/xz/adaptive.rs` | Decoding a file that is still arriving. No C counterpart: `XzDecMt` is handed a finished file. |

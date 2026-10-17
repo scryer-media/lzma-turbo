@@ -14,8 +14,8 @@ domain (`C/` in the LZMA SDK).
 | `C/Lzma2Enc.h` / `C/Lzma2Enc.c` | the chunk layer: `Lzma2EncInt_InitBlock`, `Lzma2EncInt_EncodeSubblock` with its copy-chunk fallback, `CLimitedSeqInStream`, `Lzma2Enc_WriteProperties`, `LZMA2_DIC_SIZE_FROM_PROP`; and the block layer: `CLzma2EncInt` per block, `Lzma2Enc_EncodeMt1` in both its stream and its memory form, `Lzma2EncProps_Normalize`'s block-size and thread arithmetic, `Lzma2Enc_MtCallback_Code` / `_Write` | `src/enc/lzma2_enc.rs`, `src/enc/stream.rs` |
 | `C/MtCoder.h` / `C/MtCoder.c` | `MtCoder_Code` and `ThreadFunc2`: the read token, the block semaphore, the free-block list and the in-order write turn | `src/enc/mt_coder.rs` |
 | `C/Threads.h` / `C/Threads.c` | `CSemaphore` (`Semaphore_OptCreateInit`, `_Wait`, `_Release1`), beside the `CAutoResetEvent` the decoder already had | `src/mt/sync.rs`, `src/mt/event.rs` |
-| `C/Bra.c` / `C/Bra86.c` / `C/BraIA64.c` | the branch converters in the encode direction: `z7_BranchConvSt_X86_Enc` and `z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64,RISCV}_Enc` | `src/xz/bcj.rs`, beside the decode direction |
-| `C/Delta.c` | `Delta_Encode` | `src/xz/delta.rs`, beside `Delta_Decode` |
+| `C/Bra.c` / `C/Bra86.c` / `C/BraIA64.c` | the branch converters in the encode direction: `z7_BranchConvSt_X86_Enc` and `z7_BranchConv_{ARM64,ARM,ARMT,PPC,SPARC,IA64,RISCV}_Enc` | `src/filters/bcj.rs`, beside the decode direction |
+| `C/Delta.c` | `Delta_Encode` | `src/filters/delta.rs`, beside `Delta_Decode` |
 | — | the `.xz` frame, from the format specification rather than from `C/XzEnc.c` | `src/enc/xz_enc.rs` |
 | — | `std::io::Write` adapters, which the C has no equivalent of | `src/enc/write.rs` |
 

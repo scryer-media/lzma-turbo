@@ -3,7 +3,7 @@ name: large-streams
 # The >4 GiB streams in tests/large_streams.rs: through the encoder, the
 # sequential reader, the parallel reader, the adaptive decoder and the system
 # `xz`. They are `#[ignore]`d in the ordinary suite for their run time, so
-# they run here, weekly and on demand. ubuntu-24.04 ships xz-utils, which is
+# they run here, weekly and on demand. ubuntu-26.04 ships xz-utils, which is
 # the independent decoder the tests call; nothing is downloaded for it.
 on:
   schedule:
@@ -20,7 +20,7 @@ env:
 jobs:
   large-streams:
     name: large-streams
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

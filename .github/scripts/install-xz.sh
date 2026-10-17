@@ -2,14 +2,16 @@
 # Put the xz the .xz container and encoder tests are written against on PATH,
 # on every runner these workflows use.
 #
-# ubuntu-24.04 ships xz 5.4.5 - the release Debian reverted to after the
-# CVE-2024-3094 backdoor in 5.6.0/5.6.1 - and tests/xz_container.rs drives the
-# system `xz` to produce the vectors it decodes. Filters that arrived in 5.6
-# (--riscv among them) are rejected there, so those tests fail on the runner
-# while passing everywhere the developer works. macOS and Windows have no `xz`
-# at all, which is why `tests/xz_encoder.rs` used to skip its external-decode
-# tests on two of the four platforms the writer is meant to be proved on.
-# Rather than skip, install a known xz ahead of whatever the image has.
+# tests/xz_container.rs drives the system `xz` to produce the vectors it
+# decodes, so the tests depend on whichever xz the image happens to ship.
+# ubuntu-24.04 shipped xz 5.4.5 - the release Debian reverted to after the
+# CVE-2024-3094 backdoor in 5.6.0/5.6.1 - which rejects filters that arrived in
+# 5.6 (--riscv among them), so those tests failed on the runner while passing
+# everywhere the developer works. ubuntu-26.04 ships 5.8.3, but the image's
+# version is still not ours to choose. macOS and Windows have no `xz` at all,
+# which is why `tests/xz_encoder.rs` used to skip its external-decode tests on
+# two of the four platforms the writer is meant to be proved on. Rather than
+# skip, install a known xz ahead of whatever the image has.
 #
 # The version and its checksum are pinned, the way every action in these
 # workflows is pinned by SHA: a build tool fetched as "latest" over the network

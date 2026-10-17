@@ -21,7 +21,7 @@ env:
 jobs:
   hygiene:
     name: hygiene
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,7 +89,7 @@ jobs:
 
   fmt:
     name: fmt
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,7 +113,7 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -130,7 +130,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       RUSTDOCFLAGS: -D warnings
@@ -152,9 +152,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -260,7 +260,7 @@ jobs:
 
   wasm:
     name: wasm-${{ matrix.lane }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -333,7 +333,7 @@ jobs:
   # place wasmtime is compiled; its clippy runs here for the same reason.
   wasm-conformance:
     name: wasm-conformance
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -363,7 +363,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -381,7 +381,7 @@ jobs:
 
   package:
     name: package
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -420,13 +420,13 @@ jobs:
         include:
           # JWasm is the SDK's Linux x86 assembler; clang its arm64 one.
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             targets: >-
               aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc
               x86_64-unknown-linux-gnu x86_64-apple-darwin x86_64-pc-windows-msvc
           # GCC's assembler as a second, non-LLVM opinion on arm64.
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             targets: aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc
           # Microsoft's ml64, which the SDK's Windows build uses.
           - platform: windows-x86_64
@@ -489,10 +489,10 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             require_asm: "1"
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             require_asm: "1"
           - platform: macos-aarch64
             runner: macos-15
@@ -549,9 +549,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -624,7 +624,7 @@ jobs:
   # positives. The nightly is pinned exactly as fuzz.yml pins its own.
   thread-sanitizer:
     name: thread-sanitizer
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     env:
       TSAN_TOOLCHAIN: nightly-2026-09-01
@@ -688,7 +688,7 @@ jobs:
   # sweep keeps the full selection, including native-only tests.
   unchecked-kernel-miri-plan:
     name: unchecked-kernel-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -756,7 +756,7 @@ jobs:
   unchecked-kernel-miri-tests:
     name: miri-${{ matrix.test }}
     needs: unchecked-kernel-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -784,7 +784,7 @@ jobs:
     name: unchecked-kernel-miri
     if: always()
     needs: [unchecked-kernel-miri-plan, unchecked-kernel-miri-tests]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require every Miri shard and the native release sweep
@@ -800,7 +800,7 @@ jobs:
   # that file does not explain does not get in.
   vectors:
     name: vectors
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -825,9 +825,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -859,9 +859,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -928,7 +928,7 @@ jobs:
   # every one of them and runs none, in a couple of minutes.
   fuzz-check:
     name: fuzz-check
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     env:
       FUZZ_TOOLCHAIN: nightly-2026-09-01
@@ -965,7 +965,7 @@ jobs:
     name: ci-complete
     if: always()
     needs: [hygiene, fmt, clippy, docs, test, rosetta, wasm, wasm-conformance, msrv, package, asm-provenance, sdk-oracle, memory-safety, thread-sanitizer, unchecked-kernel-miri, vectors, xz-utils-suite, encoder-parity, fuzz-check, fuzz-differential]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Fail if any required lane failed
