@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.1 - Unreleased
+## 0.10.1 - 2026-10-17
 
 - `Lzma2AdaptiveDecoder` no longer counts parked capacity as held. Since
   0.10.0 it parks finished output buffers and input pieces for reuse up to
