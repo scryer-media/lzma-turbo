@@ -57,7 +57,9 @@
   block header that leaves out the block's size, as a streaming `xz -9`
   writes it, asks for its whole dictionary, 64 MiB however small the block;
   such a file keeps the whole-block hold at one thread and fits every limit
-  it fitted in 0.10.0.
+  it fitted in 0.10.0. So does a stream of no blocks, which `xz` writes for
+  empty input: holding it costs only the probability table, less than the
+  serial reader's input buffer.
   It held a whole block's output until the block's check passed, which at
   one thread bought no speed and cost a buffer the size of the largest
   block. The hold is now an explicit opt-in, `XzOptions::verified_output`;

@@ -510,10 +510,14 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
 ///
 /// `None` once the cost passes `cap`, what a held block costs: a header that
 /// leaves out the block's size gets the whole advertised dictionary, which
-/// for `xz -9` is 64 MiB however small the block. Also `None` for a header
-/// that cannot be read, which the held decode then reports at that block.
+/// for `xz -9` is 64 MiB however small the block, and a stream of no blocks
+/// holds nothing but the probability table. Also `None` for a header that
+/// cannot be read, which the held decode then reports at that block.
 fn serial_cost<R: Read + Seek>(src: &mut R, blocks: &[Plan], cap: u64) -> Option<u64> {
     let fixed = super::reader::BUF as u64 + PROBS_BYTES;
+    if fixed > cap {
+        return None;
+    }
     let mut dict = 0u64;
     let mut header = [0u8; MAX_BLOCK_HEADER_SIZE];
     for plan in blocks {
@@ -863,6 +867,37 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(output, plain);
+    }
+
+    #[test]
+    fn one_thread_holds_an_empty_stream_for_no_more_than_its_probabilities() {
+        let archive =
+            crate::encode_xz(&[], &crate::LzmaEncProps::new(), CheckType::Crc64, 0).unwrap();
+        let open = |opts: XzOptions| XzParallelReader::with_options(Cursor::new(&archive), opts);
+        let held = open(
+            XzOptions::default()
+                .with_threads(1)
+                .with_verified_output(true),
+        )
+        .unwrap();
+        assert!(held.blocks.is_empty(), "xz writes no block for empty input");
+        assert_eq!(held.memory_estimate(), PROBS_BYTES);
+        let serial = PROBS_BYTES + super::super::reader::BUF as u64;
+        // Unlimited, and under a limit between the hold and the serial
+        // reader, one thread costs what the hold does.
+        for limit in [u64::MAX, PROBS_BYTES, serial - 1] {
+            let mut reader = open(
+                XzOptions::default()
+                    .with_threads(1)
+                    .with_memory_limit(limit),
+            )
+            .expect("an empty stream fits what its hold costs");
+            assert!(reader.serial.is_none());
+            assert_eq!(reader.memory_estimate(), held.memory_estimate());
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).unwrap();
+            assert!(output.is_empty());
+        }
     }
 
     fn reader_blocks(archive: &[u8]) -> Vec<Plan> {
