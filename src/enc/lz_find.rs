@@ -99,6 +99,31 @@ pub(crate) fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     Ok(v)
 }
 
+/// The fewest bytes a stream must be able to supply for a finder's window and
+/// tables to be aligned to huge pages and advised to use them.
+///
+/// C: `BigAlloc` decides by the size of the allocation alone, and so did this
+/// port. A finder's tables are sized by its dictionary and an unbounded
+/// stream's window by its block, whatever the stream turns out to hold, and
+/// with `MADV_HUGEPAGE` the first byte written into each 2 MiB of them faults
+/// all 2 MiB in zeroed. A finder given a 2 KiB stream paid about 2 MiB of
+/// resident memory for it, once per worker. Below this many bytes the stream
+/// touches too few huge pages for the TLB to gain what those faults cost, so
+/// the buffers are allocated as they are asked for, with neither padding nor
+/// advice.
+///
+/// 8 MiB is four huge pages. It is also the input buffer sevenz-turbo reads
+/// a folder into, so every folder it encodes from one read stays on base
+/// pages, and every larger one keeps huge pages. A stream nobody can bound
+/// (`u64::MAX`) keeps them too.
+pub(crate) const HUGE_PAGE_DATA_MIN: u64 = 8 << 20;
+
+/// Whether a stream of at most `data_limit` bytes gets huge pages; see
+/// [`HUGE_PAGE_DATA_MIN`].
+fn huge_pages_for(data_limit: u64) -> bool {
+    data_limit >= HUGE_PAGE_DATA_MIN
+}
+
 /// C: `BigAlloc` aligns large tables, windows and handoff buffers before
 /// huge-page advice. Keep Vec's original owner and
 /// zero allocation: an aligned interior avoids eager initialization by an
@@ -108,6 +133,9 @@ pub(crate) struct MatchBuffer<T> {
     storage: Vec<T>,
     start: usize,
     len: usize,
+    /// Advised to use huge pages already: a buffer allocated for a small
+    /// stream and kept for a large one is advised when the large one comes.
+    advised: bool,
 }
 
 pub(crate) type MatchTables = MatchBuffer<u32>;
@@ -118,8 +146,20 @@ impl<T: Zeroable> MatchBuffer<T> {
     /// huge page.
     const PAGE_ELEMS: usize = (2 << 20) / core::mem::size_of::<T>();
 
+    /// [`Self::padded_len_for`] a stream nobody can bound, which is the most
+    /// a buffer of `len` elements ever allocates.
     pub(crate) fn padded_len(len: usize) -> Result<usize, Error> {
-        if cfg!(all(target_os = "linux", feature = "std")) && len > Self::PAGE_ELEMS / 2 {
+        Self::padded_len_for(len, u64::MAX)
+    }
+
+    /// The elements [`Self::new_for`] asks for to hold `len` for a stream of
+    /// at most `data_limit` bytes: `len`, and on Linux a huge page less one
+    /// more to align it when the buffer is large and so is the stream.
+    pub(crate) fn padded_len_for(len: usize, data_limit: u64) -> Result<usize, Error> {
+        if cfg!(all(target_os = "linux", feature = "std"))
+            && len > Self::PAGE_ELEMS / 2
+            && huge_pages_for(data_limit)
+        {
             len.checked_add(Self::PAGE_ELEMS - 1).ok_or(Error::Alloc)
         } else {
             Ok(len)
@@ -127,14 +167,22 @@ impl<T: Zeroable> MatchBuffer<T> {
     }
 
     pub(crate) fn new(len: usize) -> Result<Self, Error> {
-        Self::new_with(len, crate::buffer::zeroed_vec::<T>)
+        Self::new_for(len, u64::MAX)
+    }
+
+    /// `len` zeroed elements for a stream of at most `data_limit` bytes,
+    /// aligned and advised to use huge pages only when the stream is as large
+    /// as [`HUGE_PAGE_DATA_MIN`].
+    pub(crate) fn new_for(len: usize, data_limit: u64) -> Result<Self, Error> {
+        Self::new_with(len, data_limit, crate::buffer::zeroed_vec::<T>)
     }
 
     fn new_with(
         len: usize,
+        data_limit: u64,
         mut allocate: impl FnMut(usize) -> Result<Vec<T>, Error>,
     ) -> Result<Self, Error> {
-        let mut padded = Self::padded_len(len)?;
+        let mut padded = Self::padded_len_for(len, data_limit)?;
         let storage = match allocate(padded) {
             Ok(storage) => storage,
             // C: BigAlloc falls back to ordinary alignment on refusal. The
@@ -154,13 +202,25 @@ impl<T: Zeroable> MatchBuffer<T> {
         // The padding covers every alignment offset. Advise only the logical
         // table before writes: padding must not add resident huge pages.
         assert!(start <= padded - len);
-        let tables = Self {
+        let mut tables = Self {
             storage,
             start,
             len,
+            advised: false,
         };
-        crate::enc::huge_pages::advise_slice(&tables);
+        tables.advise_for(data_limit);
         Ok(tables)
+    }
+
+    /// Advises huge pages for a buffer about to serve a stream of at most
+    /// `data_limit` bytes, unless it has been or the stream is small. A buffer
+    /// kept from a small stream is unaligned, so only the huge pages wholly
+    /// inside it are advised.
+    pub(crate) fn advise_for(&mut self, data_limit: u64) {
+        if !self.advised && huge_pages_for(data_limit) {
+            crate::enc::huge_pages::advise_slice(self);
+            self.advised = true;
+        }
     }
 
     pub(crate) fn allocated_words(&self) -> usize {
@@ -669,7 +729,9 @@ impl MatchFinder {
 
     /// What [`MatchFinder::create`] would allocate for this configuration, in
     /// bytes: the window, unless `window` is false (C: `directInput`, which
-    /// creates none), plus the hash and son tables.
+    /// creates none), plus the hash and son tables. This is for a stream
+    /// nobody can bound; a `data_limit` only ever shortens the window and
+    /// drops the huge-page padding, so it is the most `create` allocates.
     pub(crate) fn mem_usage(
         &mut self,
         history_size: u32,
@@ -714,7 +776,8 @@ impl MatchFinder {
     /// `data_limit` is a promise, not the C's `expectedDataSize` hint: the
     /// stream this finder is about to be given supplies at most that many
     /// bytes, `u64::MAX` when nobody can say. It only ever shortens the
-    /// window; see [`MatchFinder::plan`].
+    /// window (see [`MatchFinder::plan`]) and, below [`HUGE_PAGE_DATA_MIN`],
+    /// leaves the window and tables off huge pages.
     pub(crate) fn create(
         &mut self,
         history_size: u32,
@@ -741,11 +804,13 @@ impl MatchFinder {
         self.block_size = plan.block_size;
         if !self.direct_input && self.buf_base.len() < plan.block_size as usize {
             self.buf_base = MatchWindow::default();
-            self.buf_base = MatchWindow::new(plan.block_size as usize)?;
+            self.buf_base = MatchWindow::new_for(plan.block_size as usize, data_limit)?;
             #[cfg(test)]
             {
                 self.allocs += 1;
             }
+        } else if !self.direct_input {
+            self.buf_base.advise_for(data_limit);
         }
 
         self.heads_at = 0;
@@ -762,13 +827,14 @@ impl MatchFinder {
 
         // C 22.02: "we don't reallocate buffer, if old size is enough"
         if !self.hash.is_empty() && self.num_refs >= plan.num_refs {
+            self.hash.advise_for(data_limit);
             self.son_base = plan.hash_size_sum;
             return Ok(());
         }
 
         self.hash = MatchTables::default();
         self.num_refs = plan.num_refs;
-        self.hash = MatchTables::new(plan.num_refs)?;
+        self.hash = MatchTables::new_for(plan.num_refs, data_limit)?;
         self.son_base = plan.hash_size_sum;
         #[cfg(test)]
         {
@@ -1849,7 +1915,7 @@ mod tests {
         use super::MatchTables;
         let len = MatchTables::PAGE_ELEMS + 17;
         let mut requests = alloc::vec::Vec::new();
-        let tables = MatchTables::new_with(len, |words| {
+        let tables = MatchTables::new_with(len, u64::MAX, |words| {
             requests.push(words);
             if words != len {
                 Err(crate::Error::Alloc)
@@ -1871,9 +1937,74 @@ mod tests {
             }
         );
         assert!(matches!(
-            MatchTables::new_with(len, |_| Err(crate::Error::Alloc)),
+            MatchTables::new_with(len, u64::MAX, |_| Err(crate::Error::Alloc)),
             Err(crate::Error::Alloc)
         ));
+    }
+
+    #[test]
+    fn a_finder_for_a_small_stream_allocates_its_buffers_unpadded() {
+        use super::{HUGE_PAGE_DATA_MIN, MatchTables, MatchWindow};
+        // A 4 MiB dictionary: tables of about 9 MiB and, for an unbounded
+        // stream, a window over 4 MiB, both large enough to pad on Linux.
+        let create = |data_limit: u64| {
+            let mut mf = MatchFinder::new();
+            mf.create(4 << 20, 1 << 12, 32, 274, data_limit).unwrap();
+            mf
+        };
+        // Under the threshold, and still a window over 1 MiB.
+        let small_limit = 2 << 20;
+        assert!(small_limit < HUGE_PAGE_DATA_MIN);
+        let small = create(small_limit);
+        assert_eq!(small.hash.allocated_words(), small.num_refs);
+        assert_eq!(small.hash.len(), small.num_refs);
+        assert!(small.num_refs > MatchTables::PAGE_ELEMS / 2);
+        assert_eq!(small.buf_base.allocated_words(), small.block_size as usize);
+        assert!(small.block_size as usize > MatchWindow::PAGE_ELEMS / 2);
+        assert!(!small.hash.advised && !small.buf_base.advised);
+
+        let large = create(u64::MAX);
+        let padded = cfg!(all(target_os = "linux", feature = "std"));
+        let pad = |elems: usize| if padded { elems - 1 } else { 0 };
+        assert_eq!(
+            large.hash.allocated_words(),
+            large.num_refs + pad(MatchTables::PAGE_ELEMS)
+        );
+        assert_eq!(
+            large.buf_base.allocated_words(),
+            large.block_size as usize + pad(MatchWindow::PAGE_ELEMS)
+        );
+        assert!(large.hash.advised && large.buf_base.advised);
+        if padded {
+            assert_eq!(large.hash.as_ptr().addr() % (2 << 20), 0);
+            assert_eq!(large.buf_base.as_ptr().addr() % (2 << 20), 0);
+        }
+        // What `mem_usage` estimates is what an unbounded stream allocates,
+        // and no bound allocates more.
+        let mut probe = MatchFinder::new();
+        let estimate = probe.mem_usage(4 << 20, 1 << 12, 32, 274, true).unwrap();
+        assert_eq!(estimate, large.allocated());
+        assert!(small.allocated() <= estimate);
+
+        // Kept for a stream that can be large, the small stream's buffers are
+        // advised and not reallocated.
+        let mut kept = create(small_limit);
+        let (hash, window) = (kept.hash.as_ptr(), kept.buf_base.as_ptr());
+        let allocs = kept.allocs;
+        kept.create(4 << 20, 1 << 12, 32, 274, small_limit).unwrap();
+        assert_eq!(kept.allocs, allocs);
+        assert!(
+            !kept.hash.advised,
+            "a bound below the threshold advises nothing"
+        );
+        kept.create(4 << 20, 1 << 12, 32, 274, u64::MAX).unwrap();
+        assert_eq!((kept.hash.as_ptr(), kept.allocs), (hash, allocs + 1));
+        assert!(kept.hash.advised && kept.buf_base.advised);
+        assert_ne!(
+            kept.buf_base.as_ptr(),
+            window,
+            "the unbounded window is longer"
+        );
     }
 
     /// The table [`crc_table`] derives is the one `MatchFinder_Construct`

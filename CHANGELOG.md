@@ -24,6 +24,17 @@
     was what the dispatch added to held and parked together.
   - `AdaptiveLedger::peak_held_bytes` is the peak of held and parked
     together, the figure the limit governs.
+- On Linux the encoder no longer aligns or advises huge pages for the match
+  finder's window and hash and son tables when `Lzma2Encoder::set_data_limit`
+  promises fewer than 8 MiB of input. With `MADV_HUGEPAGE`, the first byte
+  written into each 2 MiB of a buffer faulted in all 2 MiB, so a small stream
+  encoded with a large dictionary made far more of its tables resident than
+  it touched. Larger limits and streams with no limit keep the huge pages,
+  and a buffer kept from a small stream is advised when a larger one reuses
+  it. Output bytes are unchanged. Both take effect only when the caller sets
+  a limit; a caller that sets none keeps today's padded window. For a stream
+  of under about 1 MiB, the limit already shrank the window below the huge-page
+  threshold.
 
 ## 0.10.0 - 2026-10-16
 
