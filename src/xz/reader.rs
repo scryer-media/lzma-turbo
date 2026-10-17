@@ -30,7 +30,7 @@ use crate::crc::Crc32;
 
 /// The input buffer. Large enough to hold any single field - a block header is
 /// at most 1024 bytes - with room left over to keep the LZMA2 decoder fed.
-const BUF: usize = 1 << 16;
+pub(crate) const BUF: usize = 1 << 16;
 
 /// The largest check field the format can describe: reserved ids 13-15 are
 /// sixty-four bytes (spec §2.1.1.2).

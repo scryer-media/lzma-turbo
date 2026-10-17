@@ -121,6 +121,18 @@ pub struct XzOptions {
     /// Where the caller wants the decoded output cut for its own checksums.
     /// The decoder computes these in the same pass as the block's own check.
     pub plan: ChecksumPlan,
+    /// Whether [`XzParallelReader`] holds each block until its check has
+    /// passed, so that no byte of a corrupt block is ever returned, at every
+    /// thread count.
+    ///
+    /// With more than one thread the parallel reader decodes whole blocks
+    /// anyway, and always holds them. With one it does so only when this is
+    /// set, at the cost of a buffer the size of the largest block. Unset, the
+    /// default, a one-thread decode runs as [`XzReader`] does, in the
+    /// block's dictionary: a block's bytes are returned as they are decoded,
+    /// and a failed check is reported at the block's end. Ignored by
+    /// [`XzReader`], which always works that way.
+    pub verified_output: bool,
 }
 
 impl Default for XzOptions {
@@ -134,6 +146,7 @@ impl Default for XzOptions {
             max_unpack_bytes: None,
             concatenated: true,
             plan: ChecksumPlan::none(),
+            verified_output: false,
         }
     }
 }
@@ -178,6 +191,13 @@ impl XzOptions {
     #[must_use]
     pub fn with_plan(mut self, plan: ChecksumPlan) -> Self {
         self.plan = plan;
+        self
+    }
+
+    /// Sets [`XzOptions::verified_output`].
+    #[must_use]
+    pub fn with_verified_output(mut self, on: bool) -> Self {
+        self.verified_output = on;
         self
     }
 }

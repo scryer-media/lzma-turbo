@@ -19,10 +19,12 @@ use alloc::vec::Vec;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use super::XzOptions;
+use super::block::{BlockHeader, MAX_BLOCK_HEADER_SIZE, header_size_from_first_byte};
 use super::check::BlockCheck;
 use super::error::{XzError, XzErrorKind, XzResult};
 use super::index::{XzStreamIndex, stream_table};
 use super::pool::{XzDone, XzJob, XzPool};
+use super::reader::XzReader;
 use super::stream::CheckType;
 
 /// What a worker costs besides its buffers: the LZMA2 probability table, which
@@ -54,6 +56,12 @@ struct Plan {
 /// The source has to be `Read + Seek`, but not `Send`: it is only ever read on
 /// the caller's own thread.
 ///
+/// When the decode comes down to one thread - asked for, all the memory limit
+/// affords, or a file of one block - it runs as [`super::XzReader`] does, in
+/// each block's dictionary, and costs what that does. Bytes of a block are
+/// then returned before its check is read. [`XzOptions::verified_output`]
+/// keeps the whole-block hold at one thread too.
+///
 /// # Example
 ///
 /// ```no_run
@@ -75,7 +83,11 @@ struct Plan {
 /// # }
 /// ```
 pub struct XzParallelReader<R: Read + Seek> {
-    src: R,
+    /// The source, while blocks are read from it here. A serial decode owns
+    /// it instead.
+    src: Option<R>,
+    /// The decode, when one thread runs it as [`XzReader`] does.
+    serial: Option<Box<XzReader<R>>>,
     opts: XzOptions,
     blocks: Vec<Plan>,
     /// Where `src` is positioned, so a contiguous run of blocks is read
@@ -129,17 +141,6 @@ impl<R: Read + Seek> XzParallelReader<R> {
             .checked_add(largest_in)
             .and_then(|v| v.checked_add(PROBS_BYTES))
             .ok_or_else(|| XzError::at(XzErrorKind::SizeMismatch, 0, 0))?;
-        if per_worker > opts.memory_limit {
-            return Err(XzError::at(
-                XzErrorKind::MemoryLimit {
-                    needed: per_worker,
-                    limit: opts.memory_limit,
-                },
-                0,
-                0,
-            ));
-        }
-
         let want = if opts.threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -151,8 +152,63 @@ impl<R: Read + Seek> XzParallelReader<R> {
             usize::try_from(opts.memory_limit / per_worker.max(1)).unwrap_or(usize::MAX);
         let threads = want.min(affordable).min(blocks.len()).max(1);
 
+        // One thread gains nothing from holding a whole block: it decodes in
+        // the block's dictionary instead, as `XzReader` does, and costs what
+        // that does. C: `XzDecMt_Decode_ST`, which streams. Holding the block
+        // until its check passes is the caller's to ask for.
+        if threads == 1 && !opts.verified_output {
+            let needed = serial_cost(&mut src, &blocks)?;
+            if needed > opts.memory_limit {
+                return Err(XzError::at(
+                    XzErrorKind::MemoryLimit {
+                        needed,
+                        limit: opts.memory_limit,
+                    },
+                    0,
+                    0,
+                ));
+            }
+            let start = streams.first().map_or(0, |s| s.stream_offset);
+            src.seek(SeekFrom::Start(start))
+                .map_err(|_| XzError::at(XzErrorKind::TruncatedInput, 0, start))?;
+            // The index has been read whole, so the streams it maps are the
+            // file's: the serial reader reads every one of them.
+            let serial = XzReader::with_options(src, opts.clone().with_concatenated(true));
+            return Ok(XzParallelReader {
+                src: None,
+                serial: Some(Box::new(serial)),
+                opts,
+                blocks,
+                pos: u64::MAX,
+                next_dispatch: 0,
+                next_emit: 0,
+                pool: XzPool::new(),
+                threads: 1,
+                in_flight: 0,
+                ready: BTreeMap::new(),
+                current: None,
+                spare_out: Vec::new(),
+                spare_in: Vec::new(),
+                checks: Vec::new(),
+                total_out: 0,
+                per_worker: needed,
+                failed: false,
+            });
+        }
+        if per_worker > opts.memory_limit {
+            return Err(XzError::at(
+                XzErrorKind::MemoryLimit {
+                    needed: per_worker,
+                    limit: opts.memory_limit,
+                },
+                0,
+                0,
+            ));
+        }
+
         Ok(XzParallelReader {
-            src,
+            src: Some(src),
+            serial: None,
             opts,
             blocks,
             pos: u64::MAX,
@@ -182,6 +238,12 @@ impl<R: Read + Seek> XzParallelReader<R> {
     /// What the decode will cost at its peak, in bytes: one block's output
     /// buffer, one block's compressed bytes and one probability table per
     /// worker, sized by the largest block in the file.
+    ///
+    /// A one-thread decode without [`XzOptions::verified_output`] holds no
+    /// block: it costs the largest block's dictionary, clamped to the block as
+    /// [`XzReader`] clamps it, plus its input buffer and probability table.
+    /// That is never more than one worker, so the estimate still grows with
+    /// the thread count.
     #[must_use]
     pub fn memory_estimate(&self) -> u64 {
         self.per_worker.saturating_mul(self.threads as u64)
@@ -203,19 +265,31 @@ impl<R: Read + Seek> XzParallelReader<R> {
     /// when the options carry a [`crate::ChecksumPlan`].
     #[must_use]
     pub fn block_checks(&self) -> &[BlockCheck] {
-        &self.checks
+        match &self.serial {
+            Some(serial) => serial.block_checks(),
+            None => &self.checks,
+        }
     }
 
     /// Gives the underlying source back.
     pub fn into_inner(self) -> R {
-        self.src
+        match self.serial {
+            Some(serial) => serial.into_inner(),
+            None => self.src.expect("a source or a serial decode"),
+        }
+    }
+
+    /// The source, which blocks are read from here unless a serial decode
+    /// owns it.
+    fn src(&mut self) -> &mut R {
+        self.src.as_mut().expect("read by the serial decode")
     }
 
     /// Reads one block's bytes and hands them to a worker.
     fn dispatch_one(&mut self) -> io::Result<()> {
         let plan = self.blocks[self.next_dispatch];
         if self.pos != plan.file_offset {
-            self.src.seek(SeekFrom::Start(plan.file_offset))?;
+            self.src().seek(SeekFrom::Start(plan.file_offset))?;
             self.pos = plan.file_offset;
         }
         let want = usize::try_from(plan.padded_size).map_err(|_| {
@@ -240,7 +314,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
             ))
         })?;
         bytes.resize(want, 0u8);
-        self.src.read_exact(&mut bytes)?;
+        self.src().read_exact(&mut bytes)?;
         self.pos += plan.padded_size;
 
         // Grow the pool only as far as there is work for it.
@@ -276,7 +350,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
             // Preserve indexed, whole-block verification before adoption.
             let plan = self.blocks[self.next_dispatch];
             if self.pos != plan.file_offset {
-                self.src.seek(SeekFrom::Start(plan.file_offset))?;
+                self.src().seek(SeekFrom::Start(plan.file_offset))?;
             }
             self.pos = u64::MAX;
             let mut job = XzJob {
@@ -293,7 +367,8 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 plan: self.opts.plan.clone(),
                 out: self.spare_out.pop().unwrap_or_default(),
             };
-            let checks = match super::pool::decode_block_reader(&mut job, &mut self.src) {
+            let src = self.src.as_mut().expect("read by the serial decode");
+            let checks = match super::pool::decode_block_reader(&mut job, src) {
                 Ok(checks) => checks,
                 Err(error) => {
                     // As in the worker path, malformed blocks stop delivery.
@@ -386,6 +461,20 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
         if out.is_empty() || self.failed {
             return Ok(0);
         }
+        if let Some(serial) = self.serial.as_mut() {
+            return match serial.read(out) {
+                Ok(n) => {
+                    self.total_out += n as u64;
+                    Ok(n)
+                }
+                Err(error) => {
+                    // As with whole blocks, a malformed stream stops delivery
+                    // and a source I/O error may be retried.
+                    self.failed = error.get_ref().is_some_and(|e| e.is::<XzError>());
+                    Err(error)
+                }
+            };
+        }
         loop {
             if let Some((buf, pos, len)) = self.current.as_mut() {
                 if *pos < *len {
@@ -403,6 +492,34 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
             }
         }
     }
+}
+
+/// What decoding `blocks` one after another in their dictionaries costs at its
+/// peak: the largest dictionary any block's header asks for, clamped as
+/// [`XzReader`] clamps it, plus the reader's input buffer and a probability
+/// table. Reads each block's header, which the index does not carry.
+fn serial_cost<R: Read + Seek>(src: &mut R, blocks: &[Plan]) -> XzResult<u64> {
+    let mut dict = 0u64;
+    let mut header = [0u8; MAX_BLOCK_HEADER_SIZE];
+    for plan in blocks {
+        let located =
+            |kind| XzError::in_block(kind, plan.stream, plan.block_in_stream, plan.file_offset);
+        src.seek(SeekFrom::Start(plan.file_offset))
+            .and_then(|_| src.read_exact(&mut header[..1]))
+            .map_err(|_| located(XzErrorKind::TruncatedInput))?;
+        let size =
+            header_size_from_first_byte(header[0]).ok_or(located(XzErrorKind::BadBlockHeader))?;
+        src.read_exact(&mut header[1..size])
+            .map_err(|_| located(XzErrorKind::TruncatedInput))?;
+        let parsed = BlockHeader::parse(&header[..size]).map_err(located)?;
+        dict = dict.max(super::blockdec::dict_bytes(
+            parsed.chain.dict_prop,
+            parsed.uncompressed_size,
+        ));
+    }
+    Ok(dict
+        .saturating_add(super::reader::BUF as u64)
+        .saturating_add(PROBS_BYTES))
 }
 
 /// Turns the indexes into the block list, checking the caller's caps against
@@ -529,14 +646,19 @@ mod tests {
             calls: 0,
             largest: 0,
         };
-        let mut reader =
-            XzParallelReader::with_options(source, XzOptions::default().with_threads(1)).unwrap();
+        let mut reader = XzParallelReader::with_options(
+            source,
+            XzOptions::default()
+                .with_threads(1)
+                .with_verified_output(true),
+        )
+        .unwrap();
         let first = reader.blocks[0];
-        reader.src.largest = 0;
+        reader.src().largest = 0;
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(output, plain);
-        assert!(reader.src.largest <= 256 << 10);
+        assert!(reader.src().largest <= 256 << 10);
         assert!(reader.spare_in.iter().all(|b| b.capacity() <= 256 << 10));
         assert_eq!(reader.pool.spawned(), 0);
         // A slightly larger packed block must not double reusable storage.
@@ -566,7 +688,9 @@ mod tests {
             for threads in [1, 2] {
                 let mut r = XzParallelReader::with_options(
                     Cursor::new(&bad),
-                    XzOptions::default().with_threads(threads),
+                    XzOptions::default()
+                        .with_threads(threads)
+                        .with_verified_output(true),
                 )
                 .unwrap();
                 let mut output = Vec::new();
@@ -584,6 +708,111 @@ mod tests {
             }
             assert_eq!(errors[0], errors[1]);
         }
+    }
+
+    #[test]
+    fn one_thread_decodes_serially_unless_verified_output_is_asked_for() {
+        let mut state = 0x9e3779b9u32;
+        let plain: Vec<u8> = (0..700_001)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state % 7) as u8
+            })
+            .collect();
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(1 << 16);
+        let one = crate::encode_xz(&plain, &props, CheckType::Crc64, 200_000).unwrap();
+        // Two streams with padding between them, as `xz` concatenates.
+        let mut archive = one.clone();
+        archive.extend_from_slice(&[0; 4]);
+        archive.extend_from_slice(&one);
+        let mut both = plain.clone();
+        both.extend_from_slice(&plain);
+
+        let estimate = |opts: XzOptions| {
+            XzParallelReader::with_options(Cursor::new(&archive), opts)
+                .unwrap()
+                .memory_estimate()
+        };
+        let serial = estimate(XzOptions::default().with_threads(1));
+        let held = estimate(
+            XzOptions::default()
+                .with_threads(1)
+                .with_verified_output(true),
+        );
+        let mut reader = XzParallelReader::with_options(
+            Cursor::new(&archive),
+            XzOptions::default().with_threads(1),
+        )
+        .unwrap();
+        assert!(reader.serial.is_some());
+        assert_eq!(reader.threads(), 1);
+        // The block's dictionary, clamped to the block, plus the reader's
+        // input buffer and probabilities: well under one held block.
+        assert_eq!(
+            serial,
+            (1 << 16) + super::super::reader::BUF as u64 + PROBS_BYTES
+        );
+        assert!(serial < held);
+        let mut last = serial;
+        for threads in [2, 4] {
+            let next = estimate(XzOptions::default().with_threads(threads));
+            assert!(next >= last, "{threads} threads cost less than fewer");
+            last = next;
+        }
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, both);
+        assert_eq!(reader.pool.spawned(), 0);
+        assert_eq!(reader.into_inner().position(), archive.len() as u64);
+
+        // The serial figure is the limit it is held to.
+        let refused = XzParallelReader::with_options(
+            Cursor::new(&archive),
+            XzOptions::default()
+                .with_threads(1)
+                .with_memory_limit(serial - 1),
+        )
+        .err()
+        .expect("a limit below the serial cost");
+        assert_eq!(
+            refused.kind,
+            XzErrorKind::MemoryLimit {
+                needed: serial,
+                limit: serial - 1,
+            }
+        );
+        XzParallelReader::with_options(
+            Cursor::new(&archive),
+            XzOptions::default()
+                .with_threads(1)
+                .with_memory_limit(serial),
+        )
+        .unwrap();
+
+        // A corrupt check fails the decode and the reader stays failed, as a
+        // held decode does; bytes before the check have been delivered.
+        let mut bad = archive.clone();
+        let first = reader_blocks(&archive)[0];
+        let at = first.file_offset as usize + first.padded_size as usize - 1;
+        bad[at] ^= 0x80;
+        let mut r =
+            XzParallelReader::with_options(Cursor::new(&bad), XzOptions::default().with_threads(1))
+                .unwrap();
+        let mut output = Vec::new();
+        let error = r.read_to_end(&mut output).unwrap_err();
+        assert!(error.get_ref().unwrap().is::<XzError>());
+        assert!(output.len() <= first.unpacked_len);
+        assert_eq!(r.read(&mut [0; 1]).unwrap(), 0);
+    }
+
+    fn reader_blocks(archive: &[u8]) -> Vec<Plan> {
+        XzParallelReader::with_options(Cursor::new(archive), XzOptions::default().with_threads(2))
+            .unwrap()
+            .blocks
     }
 
     #[test]
@@ -644,12 +873,13 @@ mod tests {
                 },
             );
         }
-        reader.src.armed = true;
+        reader.src().armed = true;
         // This scheduler fixture intentionally has no real worker. After
         // refusing read-ahead it reports that no worker can supply block zero.
         let error = reader.advance().unwrap_err();
         assert_eq!(
-            reader.src.reads, 0,
+            reader.src().reads,
+            0,
             "completed output lost its admission slot"
         );
         assert_eq!(error.kind(), io::ErrorKind::Other);

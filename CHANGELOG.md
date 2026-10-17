@@ -46,6 +46,30 @@
   against xz's 9.7 MiB. The crate's own allocation peak is 8,483,096 bytes
   before and after, the 8 MiB dictionary and 92 KiB. The remaining 0.6 MiB
   is outside the crate's heap.
+- `XzParallelReader` decodes through the serial path when it comes down to
+  one thread - asked for, all the memory limit affords, or a file of one
+  block - and costs what `XzReader` does: the largest block's dictionary,
+  clamped to the block, plus a 64 KiB input buffer and a probability table.
+  It held a whole block's output until the block's check passed, which at
+  one thread bought no speed and cost a buffer the size of the largest
+  block. The hold is now an explicit opt-in, `XzOptions::verified_output`;
+  without it a one-thread decode returns a block's bytes before its check is
+  read and reports a failed check at the block's end. Decoded bytes are
+  unchanged. On an Apple M5 Max, `decode/xz-par` at one thread peaks at
+  10.4 MiB where it peaked at 26.6 MiB with 24 MiB blocks and 18.6 MiB with
+  16 MiB blocks, against xz's 9.7 MiB, in the same time.
+  - `XzParallelReader::memory_estimate()` at threads=1 drops to the serial
+    decoder's figure. A caller that sizes a budget from it, or that expects
+    construction to fail when one held block does not fit, sees a smaller
+    estimate and a reader where it had an error. Weaver's
+    `open_filesystem_xz_decoder` is one: its tests that a one-worker budget
+    gets the parallel decoder at one thread, and that one byte less falls
+    back to the sequential decoder, will take the parallel branch for the
+    smaller budget when weaver takes this release. Set
+    `with_verified_output(true)` to keep the 0.10.0 figures.
+  - The estimate still grows with the thread count: one thread costs the
+    serial figure, which is never more than one worker, and more threads
+    cost one worker each.
 
 ## 0.10.0 - 2026-10-16
 
