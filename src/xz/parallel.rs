@@ -58,9 +58,10 @@ struct Plan {
 ///
 /// When the decode comes down to one thread - asked for, all the memory limit
 /// affords, or a file of one block - it runs as [`super::XzReader`] does, in
-/// each block's dictionary, and costs what that does. Bytes of a block are
-/// then returned before its check is read. [`XzOptions::verified_output`]
-/// keeps the whole-block hold at one thread too.
+/// each block's dictionary, and costs what that does, unless that dictionary
+/// costs more than holding the block. Bytes of a block are then returned
+/// before its check is read. [`XzOptions::verified_output`] keeps the
+/// whole-block hold at one thread too.
 ///
 /// # Example
 ///
@@ -155,9 +156,15 @@ impl<R: Read + Seek> XzParallelReader<R> {
         // One thread gains nothing from holding a whole block: it decodes in
         // the block's dictionary instead, as `XzReader` does, and costs what
         // that does. C: `XzDecMt_Decode_ST`, which streams. Holding the block
-        // until its check passes is the caller's to ask for.
-        if threads == 1 && !opts.verified_output {
-            let needed = serial_cost(&mut src, &blocks)?;
+        // until its check passes is the caller's to ask for. A dictionary
+        // bigger than the held block keeps the hold, so one thread never
+        // costs more than one worker and the estimate grows with threads.
+        let serial = if threads == 1 && !opts.verified_output {
+            serial_cost(&mut src, &blocks, per_worker)
+        } else {
+            None
+        };
+        if let Some(needed) = serial {
             if needed > opts.memory_limit {
                 return Err(XzError::at(
                     XzErrorKind::MemoryLimit {
@@ -240,10 +247,12 @@ impl<R: Read + Seek> XzParallelReader<R> {
     /// worker, sized by the largest block in the file.
     ///
     /// A one-thread decode without [`XzOptions::verified_output`] holds no
-    /// block: it costs the largest block's dictionary, clamped to the block as
-    /// [`XzReader`] clamps it, plus its input buffer and probability table.
-    /// That is never more than one worker, so the estimate still grows with
-    /// the thread count.
+    /// block when that is cheaper: it costs the largest block's dictionary,
+    /// clamped to the block as [`XzReader`] clamps it, plus its input buffer
+    /// and probability table. When that would be more than one worker - a
+    /// header that leaves out the block's size asks for its whole dictionary -
+    /// the decode holds the block as before. Either way one thread costs no
+    /// more than one worker, so the estimate grows with the thread count.
     #[must_use]
     pub fn memory_estimate(&self) -> u64 {
         self.per_worker.saturating_mul(self.threads as u64)
@@ -498,28 +507,30 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
 /// peak: the largest dictionary any block's header asks for, clamped as
 /// [`XzReader`] clamps it, plus the reader's input buffer and a probability
 /// table. Reads each block's header, which the index does not carry.
-fn serial_cost<R: Read + Seek>(src: &mut R, blocks: &[Plan]) -> XzResult<u64> {
+///
+/// `None` once the cost passes `cap`, what a held block costs: a header that
+/// leaves out the block's size gets the whole advertised dictionary, which
+/// for `xz -9` is 64 MiB however small the block. Also `None` for a header
+/// that cannot be read, which the held decode then reports at that block.
+fn serial_cost<R: Read + Seek>(src: &mut R, blocks: &[Plan], cap: u64) -> Option<u64> {
+    let fixed = super::reader::BUF as u64 + PROBS_BYTES;
     let mut dict = 0u64;
     let mut header = [0u8; MAX_BLOCK_HEADER_SIZE];
     for plan in blocks {
-        let located =
-            |kind| XzError::in_block(kind, plan.stream, plan.block_in_stream, plan.file_offset);
-        src.seek(SeekFrom::Start(plan.file_offset))
-            .and_then(|_| src.read_exact(&mut header[..1]))
-            .map_err(|_| located(XzErrorKind::TruncatedInput))?;
-        let size =
-            header_size_from_first_byte(header[0]).ok_or(located(XzErrorKind::BadBlockHeader))?;
-        src.read_exact(&mut header[1..size])
-            .map_err(|_| located(XzErrorKind::TruncatedInput))?;
-        let parsed = BlockHeader::parse(&header[..size]).map_err(located)?;
+        src.seek(SeekFrom::Start(plan.file_offset)).ok()?;
+        src.read_exact(&mut header[..1]).ok()?;
+        let size = header_size_from_first_byte(header[0])?;
+        src.read_exact(&mut header[1..size]).ok()?;
+        let parsed = BlockHeader::parse(&header[..size]).ok()?;
         dict = dict.max(super::blockdec::dict_bytes(
             parsed.chain.dict_prop,
             parsed.uncompressed_size,
         ));
+        if dict.saturating_add(fixed) > cap {
+            return None;
+        }
     }
-    Ok(dict
-        .saturating_add(super::reader::BUF as u64)
-        .saturating_add(PROBS_BYTES))
+    Some(dict + fixed)
 }
 
 /// Turns the indexes into the block list, checking the caller's caps against
@@ -807,6 +818,51 @@ mod tests {
         assert!(error.get_ref().unwrap().is::<XzError>());
         assert!(output.len() <= first.unpacked_len);
         assert_eq!(r.read(&mut [0; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn one_thread_holds_the_block_when_its_header_asks_for_more_dictionary() {
+        let plain: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(1 << 16);
+        let mut archive = crate::encode_xz(&plain, &props, CheckType::Crc64, 0).unwrap();
+        // Rewrite the one block's header as a streaming `xz -9` writes it: no
+        // sizes, a 64 MiB dictionary. The header keeps its length, so the
+        // index still holds.
+        let first = reader_blocks(&archive)[0];
+        let start = first.file_offset as usize;
+        let size = super::super::block::header_size_from_first_byte(archive[start]).unwrap();
+        let header = &mut archive[start..start + size];
+        header[1..].fill(0);
+        header[2..5].copy_from_slice(&[0x21, 0x01, 28]);
+        let crc = crate::crc::crc32(&header[..size - 4]);
+        header[size - 4..].copy_from_slice(&crc.to_le_bytes());
+        let parsed = BlockHeader::parse(header).unwrap();
+        assert_eq!(parsed.uncompressed_size, None);
+        assert_eq!(super::super::blockdec::dict_bytes(28, None), 64 << 20);
+
+        let open = |opts: XzOptions| XzParallelReader::with_options(Cursor::new(&archive), opts);
+        let held = open(
+            XzOptions::default()
+                .with_threads(1)
+                .with_verified_output(true),
+        )
+        .unwrap()
+        .memory_estimate();
+        assert!(held < 1 << 20);
+        // A limit that pays for the held block but not the dictionary.
+        let mut reader = open(XzOptions::default().with_threads(1).with_memory_limit(held))
+            .expect("one thread fits where one worker does");
+        assert!(reader.serial.is_none());
+        assert_eq!(reader.memory_estimate(), held);
+        for threads in [2, 4] {
+            let more = open(XzOptions::default().with_threads(threads)).unwrap();
+            assert!(more.memory_estimate() >= held);
+        }
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, plain);
     }
 
     fn reader_blocks(archive: &[u8]) -> Vec<Plan> {
