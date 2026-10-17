@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0 - Unreleased
+## 0.10.0 - 2026-10-16
 
 - Breaking: every failure is a typed error of its own class, and an
   `io::Error` built from one carries it as the payload with the kind of

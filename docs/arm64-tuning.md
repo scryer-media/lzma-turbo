@@ -1,6 +1,8 @@
-# arm64 LZMA decode-loop tuning on Apple M5 Max — findings for the Rust port
+# arm64 LZMA decode-loop tuning on Apple M5 Max
 
-Audience: the agent porting the decoder to Rust `core::arch::asm!`.
+Written before the decoder's arm64 loop was ported. The port took this advice:
+`src/lzma/decode_opt/lzma_dec_opt_aarch64.S` is the SDK's stock loop, built
+into a Rust naked function by `src/lzma/decode_opt/aarch64.rs`.
 Full experiment log with every number: `asm-lab/RESULTS.md`.
 
 ## TL;DR
