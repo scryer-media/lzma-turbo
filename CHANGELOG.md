@@ -35,6 +35,17 @@
   a limit; a caller that sets none keeps today's padded window. For a stream
   of under about 1 MiB, the limit already shrank the window below the huge-page
   threshold.
+- Bench harness: most of the gap between lzma-turbo's and xz's peak RSS on
+  the single-stream decode rows (`decode/xz/p256`, `decode/lzma2-raw/p256`,
+  `decode/xz-multi/p256x3`, `check/crc32`, `check/sha256`,
+  `filter/decode/delta64`) was the harness, not the crate. A decode shot
+  read its output 1 MiB at a time behind a 1 MiB `BufReader`, on top of the
+  crate's own 64 KiB input buffer. It now reads 64 KiB at a time, as xz
+  does, and hands the `xz` and raw `lzma2` readers the bare file. On an
+  Apple M5 Max those rows peak at 10.3 MiB where they peaked at 11.3 MiB,
+  against xz's 9.7 MiB. The crate's own allocation peak is 8,483,096 bytes
+  before and after, the 8 MiB dictionary and 92 KiB. The remaining 0.6 MiB
+  is outside the crate's heap.
 
 ## 0.10.0 - 2026-10-16
 
