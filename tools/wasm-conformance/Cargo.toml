@@ -19,7 +19,7 @@ wasmtime-wasi = "48.0.6"
 # The host side of the reference embedding checksums with the same libraries
 # the native build of lzma-turbo does: no hand-written CRC or SHA on either
 # side of the boundary.
-crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+crc-turbo = { version = "1.11.0", default-features = false, features = ["std"] }
 sha2 = "0.11.0"
 # The seed-contract test holds the host CRCs to the crate's own: the one place
 # the harness links lzma-turbo, and only its native checksum backend.

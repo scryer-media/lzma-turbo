@@ -22,7 +22,7 @@
 //! Every case prints one line, and the lines are the conformance claim: the
 //! native driver in `tools/wasm-conformance/tests/wasm_host_conformance.rs` runs this same program
 //! natively - where the delegating features are inert, so the in-process
-//! `crc-fast` and `sha2`/AWS-LC backends do the work and no hook is called -
+//! `crc-turbo` and `sha2`/AWS-LC backends do the work and no hook is called -
 //! and requires the two reports to be byte for byte identical. So the decoded
 //! bytes AND the verdicts, including the failure text of every corrupted
 //! stream, must match the native decoder exactly.

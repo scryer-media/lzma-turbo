@@ -503,7 +503,7 @@ func renderTierNote(b *strings.Builder, report *Report) {
 			loop = "the assembly decode loop"
 		}
 		fmt.Fprintf(b, "- LZMA decode: %s, chosen at compile time for %s-%s (compile-time target features: %s).\n", loop, build.TargetArch, build.TargetOS, dash(strings.Join(build.CompileTargetFeatures, " ")))
-		fmt.Fprintf(b, "- CRC-32 / CRC-64: crc-fast, which picked `%s` / `%s` at run time on this host.\n", build.CRC32Tier, build.CRC64Tier)
+		fmt.Fprintf(b, "- CRC-32 / CRC-64: crc-turbo, which picked `%s` / `%s` at run time on this host.\n", build.CRC32Tier, build.CRC64Tier)
 		fmt.Fprintf(b, "- SHA-256: %s, which dispatches internally.\n", build.SHA256Backend)
 	} else {
 		fmt.Fprintln(b, "- (lzma-bench --shot info was unavailable; the build facts are not recorded.)")

@@ -185,7 +185,7 @@ port rules and what was left out are in `docs/encoder.md`.
      default production decoding retains the checked slice implementation.
 4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
    everything they reach must build from `core` and `alloc` alone. The only
-   library dependencies the crate may take are `crc-fast`, behind the `crc`
+   library dependencies the crate may take are `crc-turbo`, behind the `crc`
    feature, and the SHA-256 backends — `aws-lc-rs` behind `crypto`, `sha2`
    behind `native-crypto` — all optional, all confined to `src/crc.rs` and
    `src/crypto/`, and none of them reachable from the decoder even when the

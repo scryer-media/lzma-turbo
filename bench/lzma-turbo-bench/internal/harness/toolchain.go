@@ -34,7 +34,7 @@ type Tool struct {
 func (t Tool) Found() bool { return t.Path != "" && t.Missing == "" }
 
 // BuildInfo is what `lzma-bench --shot info` reports about the build: which
-// decode loop it compiled, and which CRC tier crc-fast picked on this host.
+// decode loop it compiled, and which CRC tier crc-turbo picked on this host.
 type BuildInfo struct {
 	LzmaTurbo             string   `json:"lzma_turbo"`
 	AsmLoop               bool     `json:"asm_loop"`
@@ -115,7 +115,7 @@ type ToolchainOptions struct {
 }
 
 // The crates the report names, from Cargo.lock.
-var lockedCrates = []string{"lzma-rust2", "liblzma", "liblzma-sys", "crc-fast", "aws-lc-rs", "aws-lc-sys"}
+var lockedCrates = []string{"lzma-rust2", "liblzma", "liblzma-sys", "crc-turbo", "aws-lc-rs", "aws-lc-sys"}
 
 // xzFilters are the xz options probed, by the name the harness uses.
 var xzFilters = []struct{ name, option string }{

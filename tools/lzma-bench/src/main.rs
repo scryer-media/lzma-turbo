@@ -650,7 +650,7 @@ fn time_command(cmd: &[String]) -> Option<Duration> {
 // ---------------------------------------------------------------------------
 
 /// The output checksum, from the crate's own `crc` module, which is
-/// `crc-fast` over the carry-less multiply units.
+/// `crc-turbo` over the carry-less multiply units.
 ///
 /// The single-threaded lane keeps this outside the timed region, but the
 /// multi-threaded one cannot: a push decoder hands its output to a sink, and

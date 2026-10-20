@@ -8,7 +8,7 @@
 //! the embedder's business. `lzma-turbo` takes no dependency on any runtime,
 //! SDK or interface definition; it only calls the `fn` pointers it was handed.
 //!
-//! The point is speed. `crc-fast` reaches its published throughput through the
+//! The point is speed. `crc-turbo` reaches its published throughput through the
 //! carry-less multiply units, and wasm has no `pclmulqdq`, no `vmull_p64` and
 //! no equivalent; `sha2` on wasm likewise runs the plain 32-bit compression
 //! function with no `sha256rnds2` or `sha256h` behind it. A host that already
@@ -73,14 +73,14 @@
 //! [`crate::crc::Crc64Xz`] carry a plain integer across `update` calls. A host
 //! whose CRC library exposes only a running (pre-final-xor) register seeds it
 //! with `!seed` and applies the final xor on the way out; the reference host in
-//! `tools/wasm-conformance/tests/wasm_host_conformance.rs` does exactly that with `crc-fast`'s
+//! `tools/wasm-conformance/tests/wasm_host_conformance.rs` does exactly that with `crc-turbo`'s
 //! `Digest::new_with_init_state`, and the native test at the bottom of
 //! [`crate::crc`] proves the three properties above through the real registry.
 //!
 //! Note what is *not* delegated: [`crate::crc::crc32_combine`] and
 //! [`crate::crc::crc64_xz_combine`]. Folding two checksums is arithmetic on
 //! two integers and a length, not a pass over data, so crossing a boundary for
-//! it would be pure overhead. They stay on `crc-fast` on every target.
+//! it would be pure overhead. They stay on `crc-turbo` on every target.
 //!
 //! ### SHA-256
 //!
@@ -276,7 +276,7 @@ pub(crate) fn hooks() -> HostHashHooks {
 /// target with no wasm runtime in sight. Every test installs this same set,
 /// which keeps a parallel `cargo test` deterministic.
 ///
-/// The CRCs come from `crc-fast` and the digest from whichever SHA-256 backend
+/// The CRCs come from `crc-turbo` and the digest from whichever SHA-256 backend
 /// this build has, exactly as the hashing rule requires: nothing here is a
 /// hand-written checksum.
 #[cfg(all(
@@ -293,26 +293,22 @@ pub(crate) fn install_reference_hooks_for_test() {
     #[cfg(all(feature = "crypto", not(feature = "native-crypto")))]
     type RefSha = crate::crypto::awslc::Sha256;
 
-    // CRC-32 goes through the crate's guarded dispatch, which keeps an
-    // aarch64 core without the CRC instructions off `crc-fast`'s fused
-    // CRC-32 path, and is chained onto `seed` by combining: the CRC of the
-    // whole stream so far is the combine of the CRC before and the CRC of
-    // the new bytes, and the CRC of nothing is zero.
+    // Both CRCs are "init all ones, final xor all ones", so `crc-turbo`'s
+    // running register is the bitwise complement of the finalized value:
+    // seeding the digest with `!seed` resumes exactly where a stream carrying
+    // the finalized `seed` left off.
     fn crc32(seed: u32, data: &[u8]) -> u32 {
-        crate::crc::crc32_combine(
-            seed,
-            crate::crc::native_crc32_for_test(data),
-            data.len() as u64,
-        )
+        let mut digest = crc_turbo::Digest::new_with_init_state(
+            crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
+            u64::from(!seed),
+        );
+        digest.update(data);
+        digest.finalize() as u32
     }
 
-    // CRC-64/XZ needs no guard. Both CRCs are "init all ones, final xor all
-    // ones", so `crc-fast`'s running register is the bitwise complement of
-    // the finalized value: seeding the digest with `!seed` resumes exactly
-    // where a stream carrying the finalized `seed` left off.
     fn crc64_xz(seed: u64, data: &[u8]) -> u64 {
         let mut digest =
-            crc_fast::Digest::new_with_init_state(crc_fast::CrcAlgorithm::Crc64Xz, !seed);
+            crc_turbo::Digest::new_with_init_state(crc_turbo::CrcAlgorithm::Crc64Xz, !seed);
         digest.update(data);
         digest.finalize()
     }

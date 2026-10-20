@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.2 - 2026-10-20
+
+- CRC-32 and CRC-64/XZ come from `crc-turbo` 1.11, the maintained fork of
+  `crc-fast`, in place of `crc-fast` 1.10. The `crc` feature now enables
+  `crc-turbo`; the `crc` module's API is unchanged and so are the checksums.
+- The aarch64 guard that sent CRC-32 through `crc-fast`'s generic
+  parameter-based calculator on cores without the CRC extension is removed.
+  `crc-fast` ran its CRC-instruction fusion kernel without checking for that
+  extension; `crc-turbo` checks it before choosing the kernel, so every CRC
+  now goes through the library's own dispatch.
+- On x86-64 CPUs that have VPCLMULQDQ without AVX-512 (AMD Zen 3, Intel Alder
+  Lake through Arrow Lake), `crc-turbo` folds 256 bits at a time where
+  `crc-fast` used its 128-bit SSE tier. `CRC_TURBO_TIER` pins the tier.
+
 ## 0.10.1 - 2026-10-17
 
 - `Lzma2AdaptiveDecoder` no longer counts parked capacity as held. Since

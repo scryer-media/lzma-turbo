@@ -38,7 +38,7 @@ stand; they are not a CRC of anything.
 
 The `.xz` writer is behind `xz` as well, and its block checks come from the
 same places the reader's do: CRC-32 and CRC-64/XZ from `crate::crc`
-(`crc-fast`), SHA-256 from `crate::crypto` (`aws-lc-rs` behind `crypto`,
+(`crc-turbo`), SHA-256 from `crate::crypto` (`aws-lc-rs` behind `crypto`,
 `sha2` behind `native-crypto`). A check this build cannot compute is a
 parameter error rather than a stream written without it.
 

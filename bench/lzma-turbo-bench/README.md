@@ -62,13 +62,13 @@ lzma-turbo-bench merge     [--out merged.md] host-a/report.json host-b/report.js
 - `toolchain` prints what every row depends on, as JSON:
   - the crate version, commit and dirty flag, plus `rustc`, `cargo` and Go;
   - the `lzma-bench` binary's SHA-256 and what `lzma-bench --shot info` says
-    about the build: the decode loop compiled in, the CRC tier `crc-fast`
+    about the build: the decode loop compiled in, the CRC tier `crc-turbo`
     picked on this CPU, and the commit it was built from. Without `--build`
     a binary is refused unless it was built clean from the checkout's commit
     and the checkout is clean, since the report names the checkout;
   - for each oracle, its path, version banner, SHA-256 and how it was found;
   - for `xz`, the filters it supports;
-  - the `Cargo.lock` versions of lzma-rust2, liblzma, crc-fast and aws-lc-rs.
+  - the `Cargo.lock` versions of lzma-rust2, liblzma, crc-turbo and aws-lc-rs.
 - `fixtures` runs `cargo xtask fixtures`, then builds the harness's extra
   fixtures. It checks every file against `bench/fixtures/README.md` and caches
   the digests in `bench/fixtures/manifest.json`.
@@ -157,7 +157,7 @@ lzma-turbo fails, or a run finishes without a peak RSS, the row fails.
   average read before each run is kept in `raw.json`, and its median per row
   in `report.json`.
 - The ISA section states the facts that apply to every row on the host. The
-  decode loop is fixed at compile time. `crc-fast` chooses the CRC tier at
+  decode loop is fixed at compile time. `crc-turbo` chooses the CRC tier at
   run time, and aws-lc-rs dispatches SHA-256 internally. The rest is
   portable Rust, so the tier difference between two hosts is in the CPU and
   in those two libraries.

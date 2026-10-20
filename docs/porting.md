@@ -120,7 +120,7 @@ has. Both directions are ported:
 | `Bcj2Enc.c` (`Bcj2Enc_Encode`, `Bcj2Enc_Encode_2`) | `src/filters/bcj2.rs` | The encoder, including the `temp` lookahead `Bcj2Enc_Encode` wraps `Bcj2Enc_Encode_2` in, the three finish modes, and the relative-limit, file-size and block-overlap conditions that decide whether an offset is converted. |
 
 Two things the xz layer needs, and which the crate already had: the checksums
-in [`crate::crc`] (`crc` feature, `crc-fast`; CRC-32 is xz check type 1 and
+in [`crate::crc`] (`crc` feature, `crc-turbo`; CRC-32 is xz check type 1 and
 CRC-64/XZ is type 4) and the SHA-256 in [`crate::crypto`] (check type 10),
 which is `aws-lc-rs` under the `crypto` feature and RustCrypto's `sha2` under
 `native-crypto`, the latter winning when both are on. `xz` therefore implies
@@ -318,7 +318,7 @@ How each constraint is met:
    unpacked offsets where its boundaries fall and each worker emits one CRC
    per piece of its block between them, in one pass. The pieces are folded
    into whatever ranges the consumer wants with `crc::CrcFolder`, over
-   `crc32_combine` / `crc64_xz_combine` — `crc-fast`'s `checksum_combine` at
+   `crc32_combine` / `crc64_xz_combine` — `crc-turbo`'s `checksum_combine` at
    both widths, so there is no GF(2) matrix here. A worker only ever sees its
    own block, so the threaded path always cuts at block boundaries as well;
    that is a refinement of the caller's cuts and folds away.

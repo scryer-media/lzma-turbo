@@ -374,10 +374,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1932d832b1d6c0fcb852d4b1fd1fe9930fc2e0cfa7d125a90ee3f86978310d"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
+name = "crc-turbo"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
 dependencies = [
  "digest 0.10.7",
  "spin",
@@ -1066,7 +1066,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "lzma-bench"
 version = "0.5.0"
 dependencies = [
- "crc-fast",
+ "crc-turbo",
  "liblzma",
  "lzma-rust2",
  "lzma-turbo",
@@ -1083,10 +1083,10 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "aws-lc-rs",
- "crc-fast",
+ "crc-turbo",
  "sha2 0.11.0",
 ]
 
@@ -1847,7 +1847,7 @@ dependencies = [
 name = "wasm-conformance"
 version = "0.0.0"
 dependencies = [
- "crc-fast",
+ "crc-turbo",
  "lzma-turbo",
  "sha2 0.11.0",
  "wasmtime",
