@@ -4,7 +4,7 @@
 //! the xz one). Neither is used by the decoder: they belong to the layer that
 //! reads a container and verifies what came out of it.
 //!
-//! Both are carry-less-multiply implementations from [`crc_fast`], which is
+//! Both are carry-less-multiply implementations from [`crc_turbo`], which is
 //! the one library dependency this crate takes for them. Requires the `crc`
 //! feature.
 //!
@@ -14,7 +14,7 @@
 //! and the one-shot [`crc32`] / [`crc64_xz`] compute nothing themselves: each
 //! carries a running checksum in a plain integer and folds bytes into it
 //! through the embedder's `crc32` / `crc64_xz` hooks (see [`crate::hooks`]).
-//! wasm has no carry-less multiply instruction, so `crc-fast`'s whole reason
+//! wasm has no carry-less multiply instruction, so `crc-turbo`'s whole reason
 //! for existing is absent there, while a host that has one can checksum an xz
 //! block far faster than the guest can.
 //!
@@ -31,63 +31,12 @@
 //! Folding is arithmetic on two checksums and a length, never a pass over
 //! data, so crossing a boundary for it would be pure overhead.
 //!
-//! On a native target `crc-host` is accepted and inert: the `crc-fast`
+//! On a native target `crc-host` is accepted and inert: the `crc-turbo`
 //! implementations stay active and no hook is ever called.
 
-use crc_fast::CrcAlgorithm;
+use crc_turbo::CrcAlgorithm;
 #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-use crc_fast::Digest;
-
-#[cfg(any(target_arch = "aarch64", test))]
-fn needs_generic_crc32(algorithm: CrcAlgorithm, has_crc: bool) -> bool {
-    matches!(algorithm, CrcAlgorithm::Crc32IsoHdlc) && !has_crc
-}
-
-/// The public parameter-based API bypasses the dependency's CRC-instruction
-/// fusion dispatch. Its generic calculator uses detected PMULL or software.
-/// C: `CrcGenerateTable` likewise selects CRC instructions only when supported.
-#[cfg(any(target_arch = "aarch64", test))]
-fn generic_crc32_params() -> crc_fast::CrcParams {
-    static PARAMS: std::sync::OnceLock<crc_fast::CrcParams> = std::sync::OnceLock::new();
-    *PARAMS.get_or_init(|| {
-        crc_fast::CrcParams::new(
-            "CRC-32/ISO-HDLC",
-            32,
-            0x04c1_1db7,
-            0xffff_ffff,
-            true,
-            0xffff_ffff,
-            0xcbf4_3926,
-        )
-    })
-}
-
-#[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-#[inline]
-fn native_digest(algorithm: CrcAlgorithm) -> Digest {
-    #[cfg(target_arch = "aarch64")]
-    if needs_generic_crc32(algorithm, std::arch::is_aarch64_feature_detected!("crc")) {
-        return Digest::new_with_params(generic_crc32_params());
-    }
-    Digest::new(algorithm)
-}
-
-#[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-#[inline]
-fn native_checksum(algorithm: CrcAlgorithm, data: &[u8]) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    if needs_generic_crc32(algorithm, std::arch::is_aarch64_feature_detected!("crc")) {
-        return crc_fast::checksum_with_params(generic_crc32_params(), data);
-    }
-    crc_fast::checksum(algorithm, data)
-}
-
-/// CRC-32 of `data` through the same guarded dispatch the crate's own
-/// checksums take, for the reference host in [`crate::hooks`].
-#[cfg(all(test, not(target_family = "wasm")))]
-pub(crate) fn native_crc32_for_test(data: &[u8]) -> u32 {
-    native_checksum(CrcAlgorithm::Crc32IsoHdlc, data) as u32
-}
+use crc_turbo::Digest;
 
 /// Fold `data` into a running CRC-32 through the embedder-installed hook.
 ///
@@ -110,7 +59,7 @@ fn crc64_xz_host(seed: u64, data: &[u8]) -> u64 {
 }
 
 /// Emits one checksum width twice over: the host-delegated running-integer
-/// form for a wasm build with `crc-host`, and the `crc_fast::Digest` wrapper
+/// form for a wasm build with `crc-host`, and the `crc_turbo::Digest` wrapper
 /// for every other build. Exactly one of the two compiles, and the two present
 /// the same API down to the `Default` impl and the one-shot free function.
 macro_rules! digest {
@@ -156,7 +105,7 @@ macro_rules! digest {
             /// A digest over no bytes yet.
             #[must_use]
             pub fn new() -> Self {
-                Self(native_digest($algo))
+                Self(Digest::new($algo))
             }
 
             /// Feeds the next bytes of the stream.
@@ -191,7 +140,7 @@ macro_rules! digest {
         #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
         #[must_use]
         pub fn $one(data: &[u8]) -> $out {
-            native_checksum($algo, data) as $out
+            crc_turbo::checksum($algo, data) as $out
         }
     };
 }
@@ -249,7 +198,7 @@ pub trait Foldable: Copy + Eq {
 /// checksum of any prefix, including the empty one (`0`).
 #[must_use]
 pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
-    crc_fast::checksum_combine(
+    crc_turbo::checksum_combine(
         CrcAlgorithm::Crc32IsoHdlc,
         u64::from(crc_a),
         u64::from(crc_b),
@@ -262,7 +211,7 @@ pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
 /// `len_b` is the number of bytes `b` was computed over.
 #[must_use]
 pub fn crc64_xz_combine(crc_a: u64, crc_b: u64, len_b: u64) -> u64 {
-    crc_fast::checksum_combine(CrcAlgorithm::Crc64Xz, crc_a, crc_b, len_b)
+    crc_turbo::checksum_combine(CrcAlgorithm::Crc64Xz, crc_a, crc_b, len_b)
 }
 
 impl Foldable for u32 {
@@ -374,17 +323,6 @@ impl<W: Foldable> CrcFolder<W> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn crc_capability_selection_is_specific_to_iso_hdlc() {
-        for has_crc in [false, true] {
-            assert_eq!(
-                needs_generic_crc32(CrcAlgorithm::Crc32IsoHdlc, has_crc),
-                !has_crc
-            );
-            assert!(!needs_generic_crc32(CrcAlgorithm::Crc64Xz, has_crc));
-        }
-    }
-
     #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
     fn crc32_byte_oracle(data: &[u8]) -> u32 {
         let mut state = u32::MAX;
@@ -397,55 +335,34 @@ mod tests {
         !state
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-    fn forced_generic_crc32() -> Crc32 {
-        Crc32(Digest::new_with_params(generic_crc32_params()))
-    }
-
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-    fn generic_crc32_matches_the_polynomial_at_dispatch_boundaries() {
-        let params = generic_crc32_params();
-        assert_eq!((params.width, params.poly), (32, 0x04c1_1db7));
-        assert_eq!(
-            (params.init, params.init_algorithm, params.xorout),
-            (0xffff_ffff, 0xffff_ffff, 0xffff_ffff)
-        );
-        assert!(params.refin && params.refout);
-        assert_eq!(params.check, 0xcbf4_3926);
+    fn crc32_matches_the_polynomial_at_dispatch_boundaries() {
         let data: alloc::vec::Vec<u8> = (0u32..4112).map(|i| (i * 37 + i / 7) as u8).collect();
         for offset in 0..16 {
             for len in (0..=257).chain([1023, 1024, 1025, 4096]) {
                 let bytes = &data[offset..offset + len];
                 let expected = crc32_byte_oracle(bytes);
-                assert_eq!(
-                    crc_fast::checksum_with_params(params, bytes) as u32,
-                    expected,
-                    "offset {offset}, len {len}"
-                );
-                let mut digest = forced_generic_crc32();
+                let mut digest = Crc32::new();
                 digest.update(bytes);
-                assert_eq!(digest.finalize(), expected);
-                assert_eq!(crc32(bytes), expected);
+                assert_eq!(digest.finalize(), expected, "offset {offset}, len {len}");
+                assert_eq!(crc32(bytes), expected, "offset {offset}, len {len}");
             }
         }
         // The encoder constructs every hash-table entry with this one-byte CRC.
         for byte in 0..=255u8 {
             let data = [byte];
-            assert_eq!(
-                crc_fast::checksum_with_params(params, &data) as u32,
-                crc32_byte_oracle(&data)
-            );
+            assert_eq!(crc32(&data), crc32_byte_oracle(&data));
         }
     }
 
     #[test]
     #[cfg(not(all(target_arch = "wasm32", feature = "crc-host")))]
-    fn generic_crc32_streaming_reset_and_combine_keep_iso_values() {
+    fn crc32_streaming_reset_and_combine_keep_iso_values() {
         let data: alloc::vec::Vec<u8> = (0u32..8192).map(|i| (i * 31 + 7) as u8).collect();
         let expected = crc32_byte_oracle(&data);
         for chunk in [1, 3, 127, 128, 129, 1024, 1025, 8192] {
-            let mut digest = forced_generic_crc32();
+            let mut digest = Crc32::new();
             for bytes in data.chunks(chunk) {
                 digest.update(&[]);
                 digest.update(bytes);
@@ -455,8 +372,8 @@ mod tests {
             assert_eq!(digest.finalize(), 0);
         }
         for cut in [0, 1, 127, 128, 1024, 8191, 8192] {
-            let mut left = forced_generic_crc32();
-            let mut right = forced_generic_crc32();
+            let mut left = Crc32::new();
+            let mut right = Crc32::new();
             left.update(&data[..cut]);
             right.update(&data[cut..]);
             assert_eq!(

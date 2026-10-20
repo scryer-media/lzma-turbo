@@ -145,8 +145,8 @@ pub fn run(shot: &Shot, file: Option<&Path>) -> i32 {
 }
 
 /// The build's own facts, for the report header. The CRC tier is the one
-/// `crc-fast` picked at run time on this machine; the crate's CRCs are
-/// `crc-fast`'s, at the version the lockfile pins for both. The commit and
+/// `crc-turbo` picked at run time on this machine; the crate's CRCs are
+/// `crc-turbo`'s, at the version the lockfile pins for both. The commit and
 /// dirty flag are the checkout's when this binary was built (`build.rs`),
 /// empty and null where git could not say, so the harness can refuse a binary
 /// that is not the source it reports.
@@ -178,8 +178,8 @@ fn info() -> String {
         lzma_turbo::ASM_LOOP,
         std::env::consts::ARCH,
         std::env::consts::OS,
-        crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
-        crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc64Xz),
+        crc_turbo::get_calculator_target(crc_turbo::CrcAlgorithm::Crc32IsoHdlc),
+        crc_turbo::get_calculator_target(crc_turbo::CrcAlgorithm::Crc64Xz),
         lzma_turbo::crypto::SHA256_BACKEND,
         env!("LZMA_BENCH_BUILD_COMMIT"),
         match env!("LZMA_BENCH_BUILD_DIRTY") {

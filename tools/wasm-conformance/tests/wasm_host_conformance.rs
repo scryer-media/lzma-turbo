@@ -5,7 +5,7 @@
 //! streaming SHA-256 (see `lzma_turbo::hooks`) - as wired by
 //! `examples/wasm_xz_conformance.rs`, whose hooks forward to its own raw
 //! imports in a `host` namespace. It doubles as the reference implementation of
-//! that ABI: the host functions below satisfy it exactly, with `crc-fast` and
+//! that ABI: the host functions below satisfy it exactly, with `crc-turbo` and
 //! `sha2` doing the arithmetic, so there is no hand-written checksum on either
 //! side of the boundary.
 //!
@@ -115,11 +115,11 @@ fn memory_of(caller: &mut Caller<'_, Ctx>) -> Memory {
 }
 
 /// Resume a CRC from a finalized `seed`. Both algorithms are "init all ones,
-/// final xor all ones", so `crc-fast`'s running register is the bitwise
+/// final xor all ones", so `crc-turbo`'s running register is the bitwise
 /// complement of the finalized value in both directions - seeding the digest
 /// with `!seed` continues exactly where a stream carrying `seed` left off.
-fn resume_crc(algorithm: crc_fast::CrcAlgorithm, init_state: u64, data: &[u8]) -> u64 {
-    let mut digest = crc_fast::Digest::new_with_init_state(algorithm, init_state);
+fn resume_crc(algorithm: crc_turbo::CrcAlgorithm, init_state: u64, data: &[u8]) -> u64 {
+    let mut digest = crc_turbo::Digest::new_with_init_state(algorithm, init_state);
     digest.update(data);
     digest.finalize()
 }
@@ -132,7 +132,7 @@ fn host_crc32(mut caller: Caller<'_, Ctx>, seed: i32, ptr: i32, len: i32) -> i32
     let memory = memory_of(&mut caller);
     let data = guest_slice(&memory, &caller, ptr, len);
     resume_crc(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
         u64::from(!seed),
         &data,
     ) as u32 as i32
@@ -145,7 +145,7 @@ fn host_crc64_xz(mut caller: Caller<'_, Ctx>, seed: i64, ptr: i32, len: i32) -> 
     }
     let memory = memory_of(&mut caller);
     let data = guest_slice(&memory, &caller, ptr, len);
-    resume_crc(crc_fast::CrcAlgorithm::Crc64Xz, !seed, &data) as i64
+    resume_crc(crc_turbo::CrcAlgorithm::Crc64Xz, !seed, &data) as i64
 }
 
 fn host_sha256_init(caller: Caller<'_, Ctx>) -> i64 {
@@ -580,9 +580,9 @@ fn reference_host_crcs_satisfy_the_seed_contract() {
     let data: Vec<u8> = (0u32..4096).map(|i| (i * 37 + 11) as u8).collect();
 
     let crc32 = |seed: u32, d: &[u8]| {
-        resume_crc(crc_fast::CrcAlgorithm::Crc32IsoHdlc, u64::from(!seed), d) as u32
+        resume_crc(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, u64::from(!seed), d) as u32
     };
-    let crc64 = |seed: u64, d: &[u8]| resume_crc(crc_fast::CrcAlgorithm::Crc64Xz, !seed, d);
+    let crc64 = |seed: u64, d: &[u8]| resume_crc(crc_turbo::CrcAlgorithm::Crc64Xz, !seed, d);
 
     assert_eq!(crc32(0, &data), lzma_turbo::crc::crc32(&data));
     assert_eq!(crc64(0, &data), lzma_turbo::crc::crc64_xz(&data));

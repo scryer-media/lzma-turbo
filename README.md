@@ -119,7 +119,7 @@ in [docs/security.md](docs/security.md).
 | --- | --- | --- |
 | `std` | yes | the `std::io` readers and writers |
 | `asm` | yes | 7-Zip's assembly decode loops on `aarch64` and `x86_64`, and the encoder's match-finder assembly on `x86_64` and macOS `aarch64` |
-| `crc` | yes | CRC-32 and CRC-64, from `crc-fast`; implies `std` |
+| `crc` | yes | CRC-32 and CRC-64, from `crc-turbo`; implies `std` |
 | `crypto` | yes | SHA-256 from AWS-LC, which needs a C compiler; implies `std` |
 | `enc` | yes | the encoder; implies `crc` |
 | `filters` | yes, through `xz` | the BCJ, BCJ2 and delta converters on their own: `no_std`, no dependencies |

@@ -2,7 +2,7 @@
 name = "lzma-turbo"
 description = "LZMA and LZMA2 decoding in Rust, ported from the 7-Zip reference decoder for its speed"
 readme = "README.md"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
@@ -20,15 +20,15 @@ exclude = [
 
 [features]
 default = ["std", "asm", "crc", "crypto", "xz", "enc"]
-std = ["crc-fast?/std"]
+std = ["crc-turbo?/std"]
 # The hand-written decode loops ported from the LZMA SDK's Asm/ tree, used on
 # aarch64 and x86_64. Turning it off falls back to the portable Rust port of
 # the C loop, which is what every other target gets anyway.
 asm = []
-# CRC-32 and CRC-64/XZ from `crc-fast`, which uses the carry-less multiply
+# CRC-32 and CRC-64/XZ from `crc-turbo`, which uses the carry-less multiply
 # units. Default because every xz stream carries one of them (check types 1
 # and 4); the decoder itself never touches either.
-crc = ["std", "dep:crc-fast"]
+crc = ["std", "dep:crc-turbo"]
 # The BCJ and delta converters on their own: `no_std`, no dependency. They
 # are xz's filters, but 7z carries the same ones under the same ids, so a 7z
 # reader wants them without the container below.
@@ -56,7 +56,7 @@ native-crypto = ["dep:sha2"]
 # `hooks` module) instead of computing them here. Engaged on `wasm32` ONLY: on
 # a native target the feature is accepted but inert, so feature unification in
 # a mixed workspace cannot silently turn a native build into a delegating one.
-# It adds no dependency - `crc-fast` stays, because the checksum *combine* is
+# It adds no dependency - `crc-turbo` stays, because the checksum *combine* is
 # arithmetic rather than a pass over data and is never delegated - and it
 # implies `crc`, whose API it reimplements rather than replaces.
 crc-host = ["crc"]
@@ -92,14 +92,14 @@ adaptive-stats = ["std"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
-crc-fast = { version = "1.10.0", default-features = false, optional = true }
+crc-turbo = { version = "1.11.0", default-features = false, optional = true }
 sha2 = { version = "0.11.0", default-features = false, optional = true }
 
 # The tests checksum with the same libraries the native build of this crate
 # does: no hand-written CRC or SHA anywhere. Native-only, so they stay off the
 # wasm example build.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+crc-turbo = { version = "1.11.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0" }
 
 # The two wasm guest examples are reference embeddings of the `hooks` seam:
@@ -150,7 +150,7 @@ debug = 1
 # a debug build is run for. `test` inherits this, so both unit and integration
 # tests get it. Raising this crate to 3 was measured and left out: the cold
 # build was no faster and the run was not measurably faster on this suite.
-# Overrides for the hot dependencies (crc-fast, sha2, AWS-LC) were measured and
+# Overrides for the hot dependencies (crc-turbo, sha2, AWS-LC) were measured and
 # left out too: they saved nothing measurable in the run and cost 10+ s of
 # cold compile.
 [profile.dev]
