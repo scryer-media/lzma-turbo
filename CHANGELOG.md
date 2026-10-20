@@ -13,6 +13,11 @@
 - On x86-64 CPUs that have VPCLMULQDQ without AVX-512 (AMD Zen 3, Intel Alder
   Lake through Arrow Lake), `crc-turbo` folds 256 bits at a time where
   `crc-fast` used its 128-bit SSE tier. `CRC_TURBO_TIER` pins the tier.
+- `tools/wasm-conformance` requires `wasmtime` and `wasmtime-wasi` 48.0.7,
+  which fixes RUSTSEC-2026-0378 (a panic lowering a host-created component
+  stream) and RUSTSEC-2026-0379 (an aarch64 Cranelift `br_table` miscompile).
+  `wasmtime` is a dependency of that test tool only and never reaches the
+  published crate.
 
 ## 0.10.1 - 2026-10-17
 
