@@ -12,9 +12,9 @@ the encoder. Readability that costs throughput is not wanted.
 
 Read before changing code:
 
-- `docs/design-rules.md`: the porting, dependency and performance rules.
-- `docs/porting.md` and `docs/encoder.md`: how the decoder and encoder were
-  ported, and the reference commit.
+- `docs/design-rules.md`: the dependency and performance rules.
+- `docs/porting.md` and `docs/encoder.md`: where each part of the decoder
+  and encoder came from, and the fast-loop invariants unsafe code relies on.
 - `docs/unsafe-validation.md`: every unsafe surface and what checks it.
 - `docs/security.md` and `SECURITY.md`: the limits and the threat model.
 - `docs/benchmarking.md`: the acceptance gate.

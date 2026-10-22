@@ -1,7 +1,8 @@
 # Unsafe-code validation
 
-`unsafe` is allowed where the C relies on the margin invariant (see
-`docs/porting.md`), and elsewhere only with the verification recorded here.
+`unsafe` is allowed where the C relies on the margin invariant (see the
+fast-loop invariants in `docs/porting.md`), and elsewhere only with the
+verification recorded here.
 Every unsafe block carries a `// SAFETY:` comment identifying its invariant
 and the check that establishes it. Portable encoder paths have checked
 differential tests in the ordinary native suite and the required

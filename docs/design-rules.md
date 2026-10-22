@@ -1,25 +1,8 @@
 # Design rules
 
 The rules this crate's code holds to, beyond the general ones in
-`AGENTS.md`. Read this before changing a decoder, encoder or filter, a
-dependency, or anything measured by the acceptance gate.
-
-## Porting
-
-1. Port, do not redesign. Keep the reference decoder's structure: one decode
-   loop, coder state in locals, per-symbol limit checks under a margin, a
-   separate slow path near buffer edges. See `docs/porting.md`, and
-   `docs/encoder.md` for the encoder's port rules and what was left out.
-2. The reference is `C/` in a checkout of github.com/ip7z/7zip at the commit
-   named in `docs/porting.md`. Cite the C function name in a comment when a
-   Rust function corresponds to one.
-3. `unsafe` is allowed where the C relies on the margin invariant, and
-   elsewhere only with the verification recorded in
-   `docs/unsafe-validation.md`, which lists every unsafe surface and the
-   tests that check it.
-4. Correctness is proven differentially: decoded bytes must equal what
-   `xz -dc` / `7zz` produce for the same input, byte for byte, and malformed
-   input must return an error rather than panic or read out of bounds.
+`AGENTS.md`. Read this before changing a dependency, or anything measured
+by the acceptance gate.
 
 ## Dependencies
 

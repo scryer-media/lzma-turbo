@@ -19,10 +19,6 @@ domain (`C/` in the LZMA SDK).
 | — | the `.xz` frame, from the format specification rather than from `C/XzEnc.c` | `src/enc/xz_enc.rs` |
 | — | `std::io::Write` adapters, which the C has no equivalent of | `src/enc/write.rs` |
 
-The rules in `docs/design-rules.md` and `docs/porting.md` apply here as they do to the
-decoder: port, do not redesign; cite the C function name; `unsafe` only where
-the C relies on a margin invariant.
-
 ## Features
 
 The encoder is behind the `enc` feature, which is on by default and which

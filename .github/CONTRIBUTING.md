@@ -3,7 +3,7 @@
 Thanks for looking. A few things before you open a pull request:
 
 - Read [AGENTS.md](../AGENTS.md) and [docs/design-rules.md](../docs/design-rules.md);
-  the porting and performance rules there apply to humans too.
+  the dependency and performance rules there apply to humans too.
 - Run `cargo fmt --all`,
   `cargo clippy --workspace --exclude wasm-conformance --all-targets --all-features -- -D warnings`,
   `cargo nextest run --workspace --exclude wasm-conformance --no-fail-fast`
