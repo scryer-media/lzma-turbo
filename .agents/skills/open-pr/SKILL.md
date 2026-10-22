@@ -73,7 +73,7 @@ cargo package --locked -p lzma-turbo
   in `.github/workflows/ci.yml` (`--no-default-features`, `std`, `enc`,
   `enc,xz`, `native-crypto`).
 - A change to `unsafe` code, the assembly kernels or the match finder runs the
-  selectors listed in `AGENTS.md` for it.
+  selectors listed in `docs/unsafe-validation.md` for it.
 - Keep the pre-commit hook on: `git config core.hooksPath .githooks`.
 
 ## 6. Commit

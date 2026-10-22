@@ -186,7 +186,7 @@ The audit covers input/output ownership, properties and block planning, allocati
 - Update actual probability cells at all 25 range-coder sites and select the bound/remainder directly, retaining identical low/probability arithmetic and normalization.
 - For immutable direct input, omit only movable-window critical sections and pending-shift atomic swaps. Semaphore ownership, start/stop events, block counts and failure behavior remain intact. Streaming retains the window locks and shifts.
 
-The final buffered round added no further unsafe blocks, dependencies, eager scans, copies, page promotion or allocations. The complete change does add unsafe assembly, parser/window accesses, low-hash accesses and finder variant assumptions; their tests and native-only versus Miri coverage are enumerated in AGENTS.md. Native tests cover copied/direct equivalence, every hash width, exact tails, malformed tables, short output, reuse, producer panic and cancellation.
+The final buffered round added no further unsafe blocks, dependencies, eager scans, copies, page promotion or allocations. The complete change does add unsafe assembly, parser/window accesses, low-hash accesses and finder variant assumptions; their tests and native-only versus Miri coverage are enumerated in `docs/unsafe-validation.md`. Native tests cover copied/direct equivalence, every hash width, exact tails, malformed tables, short output, reuse, producer panic and cancellation.
 
 ## Rejected candidates and measurement integrity
 

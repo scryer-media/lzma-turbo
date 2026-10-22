@@ -7,220 +7,114 @@ These rules apply to every automated agent and every human contributor.
 An LZMA/LZMA2 library ported from Igor Pavlov's public-domain SDK: the decoder
 from `LzmaDec.c` / `Lzma2Dec.c`, and the encoder from `LzFind.c`, `LzmaEnc.c`
 and `Lzma2Enc.c`. The point of the crate is speed with parity to the
-reference — byte-identical output from the decoder, and bit-exact output from
-the encoder. Readability that costs throughput is not wanted. The encoder's
-port rules and what was left out are in `docs/encoder.md`.
+reference: byte-identical output from the decoder, and bit-exact output from
+the encoder. Readability that costs throughput is not wanted.
 
-## Porting rules
+Read before changing code:
 
-1. Port, do not redesign. Keep the reference decoder's structure: one decode
-   loop, coder state in locals, per-symbol limit checks under a margin, a
-   separate slow path near buffer edges. See `docs/porting.md`.
-2. The reference is `C/` in a checkout of github.com/ip7z/7zip at the commit
-   named in `docs/porting.md`. Cite the C function name in a comment when a Rust
-   function corresponds to one.
-3. `unsafe` is allowed where the C relies on the margin invariant, and
-   elsewhere only with the verification specified below. Every unsafe block
-   carries a `// SAFETY:` comment identifying its invariant and establishing
-   check. Portable encoder paths have checked differential tests in the
-   ordinary native suite and the required `unchecked-kernel-miri` CI job.
-   Miri results do not verify assembly or OS FFI. The encoder inventory is:
+- `docs/design-rules.md`: the dependency and performance rules.
+- `docs/porting.md` and `docs/encoder.md`: where each part of the decoder
+  and encoder came from, and the fast-loop invariants unsafe code relies on.
+- `docs/unsafe-validation.md`: every unsafe surface and what checks it.
+- `docs/security.md` and `SECURITY.md`: the limits and the threat model.
+- `docs/benchmarking.md`: the acceptance gate.
+- `docs/failed-experiments.md`: what has been tried and did not pay. Do not
+  retry an entry without new evidence, and add to it when an experiment fails.
 
-   - Tree/table pointer access and the portable register walk:
-     `the_unchecked_walk_is_the_checked_walk_on_any_tables`,
-     `the_walk_refuses_what_it_cannot_vouch_for`, and the six
-     `the_register_walk_*` tests in `src/enc/lz_find_mt.rs`. Native and Miri;
-     Miri exercises the portable walk and its entry-margin wrapper, including
-     unaligned whole-node copies and repeated nodes at each output boundary.
-     Non-macOS ARM64 builds with `asm` select this portable walk; it is Rust
-     pointer code, covered by both native differential tests and Miri.
-   - x86-64 assembly kernels: native-only. The fixed `asm` candidate selects
-     `sdk_walk_faithful` in `src/enc/bt_kernel_x86_64_sdk.S`, the complete
-     upstream expansion. The six
-     `the_register_walk_*` tests also invoke it directly and compare answers,
-     mutated trees and output against the checked walk, including invalid
-     margins, short output, SDK modes/error order, and every word/tail.
-     The earlier `sdk_walk` in `src/enc/bt_kernel_x86_64.S` remains available
-     to native tests and the non-default `kernel-ab` feature.
-     `sdk_walk_faithful_wide` in
-     `src/enc/bt_kernel_x86_64_sdk_wide.S` retains that flow with the bounded
-     match extension, also only for tests and `kernel-ab`. All six tests
-     explicitly run all three variants through the same margin wrapper; no
-     environment mutation is needed to select a test variant. Miri never
-     executes assembly. Branch targets inside these files are `L`-prefixed:
-     on Mach-O only `L` is assembler-local, and a `.L` label is a symbol that
-     starts its own atom, which `-dead_strip` removes when nothing references
-     it, so the fall-through code behind it vanishes from a release build.
-     The Rosetta CI lane runs these walks in an x86-64 macOS release build.
-   - macOS ARM64 `sdk_walk_arm64` in `src/enc/bt_kernel_aarch64_sdk.S`:
-     diagnostic-only complete SDK instruction flow. The six native
-     `the_register_walk_*` tests explicitly run it through the same checked
-     margin wrapper and compare output, tree mutations and error ordering.
-     `sdk_walk_arm64_wide` in `bt_kernel_aarch64_sdk_wide.S` carries the
-     portable bounded word scan and early child fetch into that flow. All six
-     tests explicitly exercise these assembly variants and pass on ARM64.
-     `sdk_walk_arm64_negative` in `bt_kernel_aarch64_negative.S` ports the
-     upstream x86 negative-offset control flow, child-first mismatch path
-     and long-copy loop to ARM64 with bounded word reads. The same six native
-     tests cover its output, tree mutations, tails and refusal ordering.
-     macOS ARM64 builds with `asm` select the negative-offset port;
-     Miri excludes this assembly and cannot verify it.
-   - Darwin anonymous output mappings in `src/enc/mapped_output.rs`:
-     `mapped_output_is_zeroed_bounded_and_owned_across_threads` checks native
-     mapping initialization, rejected sizes, independent lifetimes and Send.
-     `mapped_output_matches_owned_blocks_and_preserves_pending_storage`
-     checks encoder byte parity, pending-buffer isolation, reuse and write
-     errors. This OS FFI is native-only; Miri retains the Vec-backed path.
-     Only opted-in streamed byte sinks use mappings; custom ownership sinks
-     retain their existing Vec delivery. Mappings never become public Vecs.
-   - Shared decoder/encoder `zeroed_vec` in `src/buffer.rs`:
-     `a_zeroed_vec_is_zeroes_of_every_zeroable_type` beside it exercises the
-     common allocator in every feature set, native and Miri. `decoder_dictionary_allocation_failure_is_recoverable` checks both
-     decoder constructors under allocation refusal natively. Huge-page advice
-     remains encoder-only; the decoder allocation uses only `core` and `alloc`.
-   - Shared finder storage and borrowed direct-input lifetime/ownership in
-     `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
-     `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,
-     cancellation and reuse tests cover the threaded lifecycle as well.
-     `a_streamed_window_is_counted_when_reusing_a_block_coder` also checks
-     retained-window accounting between streams, natively.
-     Shared window references must be constructed directly from the raw base
-     through the consumer's published prefix, never over the writable append
-     tail. `the_published_window_stays_disjoint_from_hash_append` holds the
-     real window accessor across a synchronized `read_block` short read and
-     EOF. The other `the_published_window_*` tests cover physical clamping,
-     history, stored chunks, reuse and parked fallback state. These new tests
-     are selected by the native and Miri kernel CI filters, and the
-     `unchecked-kernel-miri` job runs each one under Miri. Native passes alone
-     do not prove this reference invariant; the Miri run is what does.
-     The safe owned-input transfer into the single-threaded finder is covered
-     by `owned_blocks_match_copied_windows_and_return_their_allocation` in
-     `src/enc/lzma2_enc.rs`, natively and under Miri, including write errors
-     and reuse through both owned and copied windows.
-   - macOS `reclaim_surplus_output` consumes a surplus byte Vec and advises
-     only complete pages inside that allocation with `MADV_FREE` before
-     deallocation. No advised bytes are read again; other slots are untouched.
-     `reclaiming_surplus_output_preserves_live_allocations` exercises the
-     real FFI and verifies neighboring buffers and delivery natively. Large
-     consumed buffers first use `shrink_result` to reduce allocator retention;
-     realloc refusal preserves the existing advice/free fallback. Miri
-     excludes this OS call; it does not verify allocator reclamation.
-   - `shrink_result` owns a global-allocator byte vector and only reallocates
-     to a nonzero size below its capacity; a null return preserves ownership.
-     `shrinking_a_result_preserves_bytes_and_releases_capacity` checks empty,
-     full and shortened buffers natively and in the Miri kernel job.
-     `result_shrink_failure_preserves_solid_and_parallel_output` injects
-     failure in both encoder paths natively.
-   - The test-only allocator in `tests/encoder_alloc.rs` delegates successful
-     allocations, reallocations and deallocations to `System`, and injects
-     null returns for selected layouts. Its native tests are
-     `hash_chain_head_allocation_failure_is_recoverable`,
-     `decoder_dictionary_allocation_failure_is_recoverable`,
-     `failed_reconfiguration_keeps_the_allocated_coder_usable`, and the
-     result-shrink failure test above; this allocator is not part of the
-     library or the Miri kernel job.
-   - Low-hash/table access in `mix_matches_kind`:
-     `the_mix_matches_kernel_matches_checked_tables`, native and Miri.
-     The `mix_matches_sdk` position-relative address path, selected by the
-     fixed x86-64 `asm` candidate, is also
-     covered by `the_sdk_consumer_preserves_checked_streams_and_normalization`
-     and `the_sdk_consumer_preserves_checked_held_block_tails`, comparing
-     full LZ-owned state and outputs with the checked consumer across all
-     finder families, both tail rules, and normalization. Native stream
-     coverage explicitly proves window slides; Miri bounds the stream size.
-   - `HeldRecords`, `consume_matches` and `consume_skip` in
-     `src/enc/lz_find_mt.rs`: only real producer acquisition certifies the
-     complete record partition. Raw pointers stay in one held block, and
-     only numeric positions survive handoff. Output capacity is checked
-     independently; short outputs and synthetic state retain the indexed
-     fallback. Reset, allocation replacement and teardown revoke provenance.
-     `held_records_preserve_short_output_and_synthetic_failure_state` checks
-     full fallback state and output; the stream/normalization consumer tests,
-     `skip_spans_preserve_checked_streams_and_normalization`, and
-     `a_direct_block_is_read_as_the_copied_window_is` compare independent
-     indexed consumption through interleavings, slides, cancellation and
-     reuse. `the_sdk_fused_consumer_preserves_produced_threaded_tails`
-     compares the fused positional BT4 consumer with the checked indexed
-     consumer on actual producer records, including short tails, full output
-     sentinels and consumer state, natively and under Miri. The
-     register-walk tests also check successful record partitions for every
-     native backend. `consume_skip` and the indexed path of `skip_kind` share
-     one loop, `skip_span`, over either cursor. Native tests do not establish
-     Miri verification, and Miri never verifies the assembly producers.
-   - High-hash table access in `get_heads` / `heads_loop`:
-     `get_heads_matches_the_indexed_loop` compares heads and the entire
-     mutated table against the indexed oracle for all seven families natively.
-     Miri uses bounded 16-bit tables for trusted H2/H3/H4/H5. Big families
-     retain full 24-bit trusted-domain native coverage; Miri exercises their
-     checked fallback through `get_heads_domain_fallback_preserves_checked_mutations`,
-     including arbitrary masks/CRC values, short tables/windows, and mutations
-     before a panic. `get_heads_refuses_a_short_window` checks entry rejection.
-   - `EncodeWindow` byte/word reads and parser `match_word!` / `opt!`
-     indexing: `encoder_window_reads_match_the_checked_parser` in
-     `src/enc/lzma_enc.rs`, native and Miri, across finder families, parser
-     modes, windows and tails. `the_window_match_lengths_equal_the_bytewise_oracle`
-     also checks match lengths in the native suite.
-   - `Finder::*_for` variant assumptions (`unreachable_unchecked`): the same
-     checked-parser differential test exercises the single-threaded,
-     inline and threaded variants natively and under Miri. `MT` is selected
-     at block entry and the finder variant cannot change within the block.
-   - `madvise_hugepage` and `madvise_nohugepage`:
-     `the_advice_covers_only_whole_huge_pages_inside_the_buffer` checks the
-     range, and `the_kernel_takes_the_advice_and_the_bytes_are_unchanged` and
-     `the_kernel_withdraws_the_advice_and_the_bytes_are_unchanged` check the
-     real FFI calls natively on Linux;
-     `a_kept_finder_withdraws_huge_pages_for_a_small_stream` checks the
-     mapping flags a kept finder ends with. Miri has no `madvise`.
-   - SDK normalization kernels in `src/enc/lz_find/normalize.rs`:
-     `normalization_matches_scalar_at_every_alignment_and_tail` checks prefix,
-     bulk and tail against scalar saturation, including every word alignment.
-     `normalization_x86_kernels_match_scalar` directly exercises SSE4.1 and
-     AVX2 after runtime feature checks, natively only. Miri selects the scalar
-     path and cannot verify the architecture kernels; ARM needs native tests.
-   - Diagnostic BCJ2 pointer cursors in `src/filters/bcj2/cursor.rs`:
-     `sdk_cursor_matches_checked_at_every_stream_and_output_edge` and
-     `sdk_cursor_matches_checked_for_malformed_streams` compare output, input
-     consumption, error and every decoder-state field, natively and in the
-     Miri kernel job. The port is available only to tests and `kernel-ab`;
-     default production decoding retains the checked slice implementation.
-4. No dependencies in the decoder modules: `src/lzma/`, `src/lzma2/` and
-   everything they reach must build from `core` and `alloc` alone. The only
-   library dependencies the crate may take are `crc-turbo`, behind the `crc`
-   feature, and the SHA-256 backends — `aws-lc-rs` behind `crypto`, `sha2`
-   behind `native-crypto` — all optional, all confined to `src/crc.rs` and
-   `src/crypto/`, and none of them reachable from the decoder even when the
-   default features have them on. Anything else needs a decision
-   from the maintainer, not from an agent. Dev-dependencies and the bench tool
-   may pull what they need.
-5. Correctness is proven differentially: decoded bytes must equal what
-   `xz -dc` / `7zz` produce for the same input, byte for byte, and malformed
-   input must return an error rather than panic or read out of bounds.
+## Working on a task
 
-## Performance rules
+- Carry a request through the edits, the checks that show it works, and the
+  handoff. Settle routine, reversible choices from the code and docs rather
+  than asking; ask when the answer changes correctness or what is authorised.
+- Read the code you are changing, and its tests, before changing it. Extend
+  what is there rather than adding a parallel path.
+- Other agents and people work in the same checkouts. Inspect the working
+  tree before editing, change only what the task needs, and treat someone
+  else's uncommitted work or failing check as something to report, not fix.
+- Keep plans, reports and handoffs out of the repository. Do not create,
+  edit or delete Markdown files outside the task at hand.
+- At handoff, say what changed, which checks ran and passed, which were not
+  run, and what is still open. Do not claim a speed-up without a measurement.
 
-- The acceptance gate is `docs/benchmarking.md`. A change that regresses the
-  gate does not merge, however clean it is.
-- Measure with `cargo run --release -p lzma-bench`, on an otherwise idle
-  machine, at least three runs, report the median.
-- Never commit fixture bytes. `cargo xtask fixtures` regenerates them.
+## Correctness
+
+- The reference is the oracle. Output is checked against the reference
+  implementation, differentially, and a difference is a bug whatever the
+  reason.
+- No input panics. Malformed, truncated or hostile input returns an error; it
+  never panics, reads or writes out of bounds, or does unbounded work.
+- Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
+  relies on and the check that established it. Code with `unsafe` is covered
+  by Miri wherever Miri can run it; a test Miri cannot run is ignored under
+  `cfg(miri)`, never the lane. Assembly and OS FFI are covered by native
+  tests. `docs/unsafe-validation.md` is updated in the same change.
+- A new public decoder or encoder entry point gets a fuzz target under
+  `fuzz/` in the same change.
+
+## Tests
+
+A test gives the same result on a slow, loaded or shared runner as on an idle
+workstation.
+
+- Wait for the condition the assertion depends on, never for elapsed time.
+  No fixed sleeps, no deadlines, no elapsed-time assertions, no timeouts as
+  a stand-in for a condition.
+- Do not assume one concurrent operation finishes before another unless the
+  code guarantees that order.
+- Never fix a flaky test with a longer timeout, a sleep or a retry. Find the
+  race and remove it.
+- Fixture bytes are generated, never committed.
+
+## Performance
+
+- A claimed speed-up shows the median of interleaved rounds against the
+  previous release, on the hardware it targets, with outputs compared before
+  timing. A change to one path shows the others unchanged.
+- Hardware without the feature a change needs is part of the claim: an AVX2
+  change is measured on an AVX-512 part too, and aarch64 whenever shared code
+  moves.
+- Raw benchmark data, machine-readable reports and profiling bundles stay
+  outside the repository. Commit Markdown summaries and source identities;
+  existing evidence is kept as `docs/benchmark-data.md` describes.
+
+## Dependencies
+
+- `Cargo.lock` is the source of truth: pass `--locked` to Cargo.
+- A new library dependency is the maintainer's decision, not an agent's.
+- Before upgrading dependencies, read `renovate.json` and honour every
+  exception in it.
+
+## Versions and pull requests
+
+- Any code change to the crate (`src/`) bumps its version, `Cargo.lock` and
+  `CHANGELOG.md` in the same change. The bump is what `cargo semver-checks`
+  says it is. A documentation- or CI-only change says so instead.
+- The version in a pull request is the latest one published on crates.io
+  plus one increment, never more. An unpublished version heading is not a
+  baseline: fold new work into it rather than bumping again.
+- Releases go through the repository's release workflow
+  (`docs/publishing.md`), never by hand.
 
 ## Repository hygiene
 
-- Commits are SSH-signed. Never pass `--no-gpg-sign`.
+- Commits are SSH-signed. Never pass `--no-gpg-sign` or set
+  `commit.gpgsign=false`; if signing fails, leave the change uncommitted.
+- No `Co-Authored-By` or other attribution trailers in commit messages.
 - Never run destructive git working-tree operations (`checkout --`,
   `restore`, `reset --hard`, `clean`, `stash`) in a shared checkout.
 - Branch names use gitflow prefixes: `feature/…`, `bugfix/…`, `hotfix/…`.
-- Do not push. The maintainer pushes.
+  Worktrees go under `.worktrees/`.
+- Agents do not push unless told to. The maintainer pushes.
 - The pre-commit hook (`.githooks/pre-commit`) rejects home paths, the local
   username and secrets. Keep it enabled: `git config core.hooksPath .githooks`.
-- `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`
-  must pass before a commit is proposed for review.
-- Any code change to the crate (`src/`) bumps its version, `Cargo.lock` and
-  `CHANGELOG.md` in the same change.
-- Use `cargo nextest run --no-fail-fast` for native test sweeps. Install
-  `cargo-nextest` 0.9.143 as in CI. Run doctests separately with `cargo test --doc`;
-  keep `cargo miri test` for interpreter checks. Exclude `wasm-conformance`
-  from ordinary workspace sweeps; its dedicated CI job runs it.
-- Keep raw benchmark data, machine-readable reports and profiling bundles
-  outside the repository. Commit Markdown summaries and source identities.
-  Existing evidence is preserved as described in `docs/benchmark-data.md`.
+- Before a commit is proposed: `cargo fmt --all`, `cargo clippy --locked
+  --workspace --all-targets -- -D warnings`, `cargo nextest run --locked
+  --no-fail-fast` and `cargo test --locked --doc`. Install `cargo-nextest`
+  0.9.143 as in CI, keep `cargo miri test` for interpreter checks, and
+  exclude `wasm-conformance` from ordinary workspace sweeps; its own CI job
+  runs it.
+
+## Code review
+
+Read `SECURITY.md` before reviewing, and judge findings against the threat
+model it states.
