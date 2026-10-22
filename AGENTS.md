@@ -18,6 +18,8 @@ Read before changing code:
 - `docs/unsafe-validation.md`: every unsafe surface and what checks it.
 - `docs/security.md` and `SECURITY.md`: the limits and the threat model.
 - `docs/benchmarking.md`: the acceptance gate.
+- `docs/failed-experiments.md`: what has been tried and did not pay. Do not
+  retry an entry without new evidence, and add to it when an experiment fails.
 
 ## Working on a task
 
