@@ -72,6 +72,12 @@ if [ "$os" = unix ]; then
   ./configure --prefix=/usr/local --disable-shared --enable-static --disable-doc --quiet
   make -j"$jobs" --silent
   sudo make install --silent
+  # macOS images now ship Homebrew's xz in /opt/homebrew/bin, which precedes
+  # /usr/local/bin. Put the pinned build first for every later step.
+  if [ -n "${GITHUB_PATH:-}" ]; then
+    echo /usr/local/bin >> "$GITHUB_PATH"
+  fi
+  export PATH="/usr/local/bin:$PATH"
 else
   # The zip carries bin_x86-64/ - xz.exe and its friends - and bin_i686-sse2/.
   name="xz-${VERSION}-windows.zip"
@@ -101,8 +107,8 @@ else
   export PATH="$bin:$PATH"
 fi
 
-# /usr/local/bin precedes /usr/bin on the runners, so this is what the tests
-# will spawn. Fail loudly here rather than three test failures later.
+# The pinned build now leads PATH, so this is what the tests will spawn. Fail
+# loudly here rather than three test failures later.
 hash -r
 echo "xz now on PATH: $(command -v xz) -> $(xz --version | head -n1)"
 xz --version | head -n1 | grep -q " ${VERSION}$"

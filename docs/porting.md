@@ -27,32 +27,19 @@ Not in scope: `XzDec.c`, `7zDec.c`, and the `Asm/x86/LzmaDecOpt.asm` /
 the parity target for the port; the asm loop is what `7zz` ships and is the
 acceptance target for the optimization phase.
 
-## Rules
+## Fast-loop invariants
 
-1. Faithful first. Port `LzmaDec_DecodeReal` as one function with the same
-   locals (`range`, `code`, `buf`, `probs`, `dic`, `dicPos`, `processedPos`,
-   `checkDicSize`, `state`, `rep0..rep3`, `limit`, `len`), the same macro
-   expansions (`NORMALIZE`, `IF_BIT_0`, `UPDATE_0`, `UPDATE_1`, `TREE_DECODE`,
-   `MATCHED_LITER_DEC`, `REV_BIT`), the same probability table layout and
-   offsets, the same state transitions. Keep the C comments. Name things as
-   the C does, in snake_case.
-2. Same shape, same guarantees. `DecodeReal` runs only while
-   `dicPos < limit` and `buf` has at least `LZMA_REQUIRED_INPUT_MAX` (20)
-   bytes of margin. The wrapper (`LzmaDec_DecodeToDic`) enforces that and
-   routes the tail through `LzmaDec_TryDummy` exactly as the C does. That
-   margin is what makes unchecked loads sound; document it as the invariant
-   on every `unsafe` block.
-3. Unchecked where the C is unchecked, and nowhere else. Raw pointer or
-   `get_unchecked` access is allowed inside the fast loop for `buf`, `probs`
-   and `dic` under the margin invariant. Everything outside the loop is
-   checked Rust.
-4. Port, then measure, then optimize. Do not restructure before a faithful
-   port passes differential tests and has a baseline number. Optimization
-   means codegen: checking the assembly for bounds checks and spills, not
-   redesigning the loop.
-5. No `#[inline(never)]` splits of the hot loop, no trait-object dispatch in
+1. `DecodeReal` runs only while `dicPos < limit` and `buf` has at least
+   `LZMA_REQUIRED_INPUT_MAX` (20) bytes of margin. The wrapper
+   (`LzmaDec_DecodeToDic`) enforces that and routes the tail through
+   `LzmaDec_TryDummy` exactly as the C does. That margin is what makes
+   unchecked loads sound; it is documented as the invariant on every
+   `unsafe` block.
+2. Raw pointer or `get_unchecked` access is allowed inside the fast loop for
+   `buf`, `probs` and `dic` under the margin invariant. Everything outside the
+   loop is checked Rust.
+3. No `#[inline(never)]` splits of the hot loop, no trait-object dispatch in
    it, no per-bit function calls that the compiler may not inline.
-6. Every step is checked against the oracle. See `docs/benchmarking.md`.
 
 ## Public API (initial)
 

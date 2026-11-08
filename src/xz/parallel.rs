@@ -107,7 +107,10 @@ pub struct XzParallelReader<R: Read + Seek> {
     checks: Vec<BlockCheck>,
     total_out: u64,
     per_worker: u64,
-    failed: bool,
+    /// The malformed-stream error that stopped delivery. Every later read
+    /// returns it again: a clean end after a failure would read as a whole
+    /// file to a caller that retries.
+    failed: Option<XzError>,
 }
 
 impl<R: Read + Seek> XzParallelReader<R> {
@@ -199,7 +202,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 checks: Vec::new(),
                 total_out: 0,
                 per_worker: needed,
-                failed: false,
+                failed: None,
             });
         }
         if per_worker > opts.memory_limit {
@@ -231,7 +234,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
             checks: Vec::new(),
             total_out: 0,
             per_worker,
-            failed: false,
+            failed: None,
         })
     }
 
@@ -382,7 +385,10 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 Err(error) => {
                     // As in the worker path, malformed blocks stop delivery.
                     // A source I/O error remains retryable with a fresh seek.
-                    self.failed = error.get_ref().is_some_and(|e| e.is::<XzError>());
+                    self.failed = error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<XzError>())
+                        .copied();
                     return Err(error);
                 }
             };
@@ -445,14 +451,10 @@ impl<R: Read + Seek> XzParallelReader<R> {
         } = done;
         self.spare_in.push(bytes);
         if let Err(kind) = res {
-            self.failed = true;
             self.spare_out.push(out);
-            return Err(io::Error::from(XzError::in_block(
-                kind,
-                stream,
-                block_in_stream,
-                file_offset,
-            )));
+            let error = XzError::in_block(kind, stream, block_in_stream, file_offset);
+            self.failed = Some(error);
+            return Err(io::Error::from(error));
         }
         if let Some(c) = checks
             && !self.opts.plan.is_none()
@@ -467,7 +469,10 @@ impl<R: Read + Seek> XzParallelReader<R> {
 
 impl<R: Read + Seek> Read for XzParallelReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() || self.failed {
+        if let Some(error) = self.failed {
+            return Err(io::Error::from(error));
+        }
+        if out.is_empty() {
             return Ok(0);
         }
         if let Some(serial) = self.serial.as_mut() {
@@ -479,7 +484,10 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
                 Err(error) => {
                     // As with whole blocks, a malformed stream stops delivery
                     // and a source I/O error may be retried.
-                    self.failed = error.get_ref().is_some_and(|e| e.is::<XzError>());
+                    self.failed = error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<XzError>())
+                        .copied();
                     Err(error)
                 }
             };
@@ -711,15 +719,13 @@ mod tests {
                 let mut output = Vec::new();
                 let error = r.read_to_end(&mut output).unwrap_err();
                 assert!(output.is_empty());
-                errors.push(
-                    error
-                        .get_ref()
-                        .unwrap()
-                        .downcast_ref::<XzError>()
-                        .unwrap()
-                        .kind,
+                let error = *error.get_ref().unwrap().downcast_ref::<XzError>().unwrap();
+                errors.push(error.kind);
+                let again = r.read(&mut [0; 1]).unwrap_err();
+                assert_eq!(
+                    again.get_ref().unwrap().downcast_ref::<XzError>(),
+                    Some(&error)
                 );
-                assert_eq!(r.read(&mut [0; 1]).unwrap(), 0);
             }
             assert_eq!(errors[0], errors[1]);
         }
@@ -809,7 +815,8 @@ mod tests {
         .unwrap();
 
         // A corrupt check fails the decode and the reader stays failed, as a
-        // held decode does; bytes before the check have been delivered.
+        // held decode does: every later read returns the error again. Bytes
+        // before the check have been delivered.
         let mut bad = archive.clone();
         let first = reader_blocks(&archive)[0];
         let at = first.file_offset as usize + first.padded_size as usize - 1;
@@ -821,7 +828,11 @@ mod tests {
         let error = r.read_to_end(&mut output).unwrap_err();
         assert!(error.get_ref().unwrap().is::<XzError>());
         assert!(output.len() <= first.unpacked_len);
-        assert_eq!(r.read(&mut [0; 1]).unwrap(), 0);
+        let again = r.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(
+            again.get_ref().unwrap().downcast_ref::<XzError>(),
+            error.get_ref().unwrap().downcast_ref::<XzError>()
+        );
     }
 
     #[test]
