@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.10.3 - 2026-11-08
+
+- `XzParallelReader` returns its error again on every read after a
+  malformed stream stops it. It used to report a clean end (`Ok(0)`) on the
+  next read, which a caller that retries after an error would take for a
+  whole file; `XzReader` already failed again. A source I/O error stays
+  retryable, as before.
+- Added `tests/advisories.rs`, built from hand-assembled `.xz` files, for the
+  published LZMA and xz advisories that apply to this crate:
+  - CVE-2026-14266 (7-Zip) and CVE-2025-31115 (liblzma's threaded decoder):
+    chunks carrying more or less than the block header or index declares;
+  - an index declaring a block no allocator could give;
+  - CVE-2021-42374 (BusyBox unlzma): a block whose first chunk keeps the
+    dictionary;
+  - CVE-2026-34743 (liblzma): streams with no blocks, alone and between
+    others;
+  - CVE-2021-29482 (ulikunitz/xz): an index count longer than nine bytes;
+  - CVE-2018-9251 and CVE-2018-14567 (libxml2): a failed reader keeps
+    failing;
+  - CVE-2021-28211 (EDK II): a `.lzma` stream longer than its header
+    declares is refused, nothing past the declared size is handed out, and a
+    retry fails again;
+  - CVE-2025-58058 (ulikunitz/xz) and CVE-2017-18258 (libxml2): a `.lzma`
+    header naming a huge dictionary is refused by the default limit before
+    anything is allocated.
+
 ## 0.10.2 - 2026-10-20
 
 - CRC-32 and CRC-64/XZ come from `crc-turbo` 1.11, the maintained fork of

@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "aws-lc-rs",
  "crc-turbo",
