@@ -471,78 +471,108 @@ mod borrowed_read_tests {
         }
     }
 
-    #[test]
-    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state() {
+    /// Borrowed reads match plain reads, chunk for chunk and error for
+    /// error, from a source that hands out at most `cap` bytes a call. One
+    /// test per source cap and dictionary property, so that each is its own
+    /// Miri CI job: as one test they took 26 minutes under Miri, and a 3-byte
+    /// cap still takes about 12.
+    fn check_borrowed_reads(cap: usize, prop: u8) {
         let data: Vec<u8> = (0..140_000).map(|i| (i * 29) as u8).collect();
         let packed = stored(&data);
-        for cap in [3, 997, 65536] {
-            for prop in [0, 16] {
-                for truncate in [0, 1, 41] {
-                    let input = &packed[..packed.len() - truncate];
-                    let source = || Fragmented {
-                        bytes: input,
-                        cap,
-                        interrupt: true,
-                    };
-                    let mut oracle = Lzma2Reader::new(source(), prop).unwrap();
-                    let mut candidate = Lzma2Reader::new(source(), prop).unwrap();
-                    let mut calls = 0;
-                    loop {
-                        let max = [0, 1, 4093, 65536, 7][calls % 5];
-                        calls += 1;
-                        let mut expected = vec![0; max];
-                        let result = oracle.read(&mut expected);
-                        let before = (
-                            candidate.src.pos,
-                            candidate.src.len,
-                            candidate.src.inner.bytes.len(),
-                            candidate.dec.dic_pos(),
+        for truncate in [0, 1, 41] {
+            let input = &packed[..packed.len() - truncate];
+            let source = || Fragmented {
+                bytes: input,
+                cap,
+                interrupt: true,
+            };
+            let mut oracle = Lzma2Reader::new(source(), prop).unwrap();
+            let mut candidate = Lzma2Reader::new(source(), prop).unwrap();
+            let mut calls = 0;
+            loop {
+                let max = [0, 1, 4093, 65536, 7][calls % 5];
+                calls += 1;
+                let mut expected = vec![0; max];
+                let result = oracle.read(&mut expected);
+                let before = (
+                    candidate.src.pos,
+                    candidate.src.len,
+                    candidate.src.inner.bytes.len(),
+                    candidate.dec.dic_pos(),
+                );
+                let mut got = Vec::new();
+                let borrowed = candidate.read_borrowed(max, &mut |bytes| {
+                    got.extend_from_slice(bytes);
+                    Ok(())
+                });
+                let actual = match borrowed {
+                    Some(result) => result,
+                    None => {
+                        assert_eq!(
+                            before,
+                            (
+                                candidate.src.pos,
+                                candidate.src.len,
+                                candidate.src.inner.bytes.len(),
+                                candidate.dec.dic_pos()
+                            )
                         );
-                        let mut got = Vec::new();
-                        let borrowed = candidate.read_borrowed(max, &mut |bytes| {
-                            got.extend_from_slice(bytes);
-                            Ok(())
-                        });
-                        let actual = match borrowed {
-                            Some(result) => result,
-                            None => {
-                                assert_eq!(
-                                    before,
-                                    (
-                                        candidate.src.pos,
-                                        candidate.src.len,
-                                        candidate.src.inner.bytes.len(),
-                                        candidate.dec.dic_pos()
-                                    )
-                                );
-                                let mut buf = vec![0; max];
-                                candidate
-                                    .read(&mut buf)
-                                    .inspect(|&n| got.extend_from_slice(&buf[..n]))
-                            }
-                        };
-                        match (result, actual) {
-                            (Ok(n), Ok(m)) => {
-                                assert_eq!(n, m);
-                                assert_eq!(&expected[..n], got);
-                                if n == 0 && max != 0 {
-                                    break;
-                                }
-                            }
-                            (Err(a), Err(b)) => {
-                                assert_eq!(a.kind(), b.kind());
-                                assert_eq!(a.to_string(), b.to_string());
-                                assert!(got.is_empty());
-                                if a.kind() != io::ErrorKind::Interrupted {
-                                    break;
-                                }
-                            }
-                            pair => panic!("different outcomes: {pair:?}"),
+                        let mut buf = vec![0; max];
+                        candidate
+                            .read(&mut buf)
+                            .inspect(|&n| got.extend_from_slice(&buf[..n]))
+                    }
+                };
+                match (result, actual) {
+                    (Ok(n), Ok(m)) => {
+                        assert_eq!(n, m);
+                        assert_eq!(&expected[..n], got);
+                        if n == 0 && max != 0 {
+                            break;
                         }
                     }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(a.kind(), b.kind());
+                        assert_eq!(a.to_string(), b.to_string());
+                        assert!(got.is_empty());
+                        if a.kind() != io::ErrorKind::Interrupted {
+                            break;
+                        }
+                    }
+                    pair => panic!("different outcomes: {pair:?}"),
                 }
             }
         }
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_3_prop_0() {
+        check_borrowed_reads(3, 0);
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_3_prop_16() {
+        check_borrowed_reads(3, 16);
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_997_prop_0() {
+        check_borrowed_reads(997, 0);
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_997_prop_16() {
+        check_borrowed_reads(997, 16);
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_65536_prop_0() {
+        check_borrowed_reads(65536, 0);
+    }
+
+    #[test]
+    fn borrowed_reads_preserve_read_chunks_errors_and_unsupported_state_cap_65536_prop_16() {
+        check_borrowed_reads(65536, 16);
     }
 
     #[test]
