@@ -7,6 +7,11 @@
   next read, which a caller that retries after an error would take for a
   whole file; `XzReader` already failed again. A source I/O error stays
   retryable, as before.
+- The BT3 match finder held to one thread writes the SDK's single-threaded
+  bytes again (#29). It ran the threaded finder's code inline, which adds the
+  2-byte hash match only while four bytes are left rather than three, so the
+  last few bytes of a stream could differ from the SDK's. The output was
+  always valid; BT2, BT4 and BT5 were never affected.
 - Added `tests/advisories.rs`, built from hand-assembled `.xz` files, for the
   published LZMA and xz advisories that apply to this crate:
   - CVE-2026-14266 (7-Zip) and CVE-2025-31115 (liblzma's threaded decoder):

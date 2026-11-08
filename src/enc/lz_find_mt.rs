@@ -6301,7 +6301,10 @@ mod tests {
             let mut inline = LzmaEncoder::new(&props).unwrap();
             let mut got = Vec::new();
             inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
-            assert!(inline.inner.mf.is_inline(), "{what}");
+            // BT3 held to one thread takes the single-threaded finder (see
+            // `LzmaEnc::finder_mode`); every other binary tree runs inline.
+            let inlined = kind != MatchFinderKind::Bt3;
+            assert_eq!(inline.inner.mf.is_inline(), inlined, "{what}");
             assert!(got == want, "{what}: LZMA");
 
             // LZMA2 through a stream, in blocks, and the same blocks coded
@@ -6319,7 +6322,7 @@ mod tests {
             inline.set_block_size(block);
             let mut got = Vec::new();
             inline.encode(&mut SliceStream::new(src), &mut got).unwrap();
-            assert!(inline.coder.finder_is_inline(), "{what}");
+            assert_eq!(inline.coder.finder_is_inline(), inlined, "{what}");
             assert!(got == want, "{what}: LZMA2 stream, block {block}");
 
             let mut blocks = Lzma2Encoder::new(&props).unwrap();
