@@ -245,7 +245,8 @@ pub(crate) struct LzmaEnc {
     pub(crate) finder_threads: bool,
     /// Whether a binary tree in normal mode held to one thread takes the
     /// inline finder ([`FinderMode::Inline`]) rather than the C's
-    /// single-threaded one. Always, except for the push encoders, whose
+    /// single-threaded one; BT3 never does, whatever this says (see
+    /// [`LzmaEnc::finder_mode`]). Always, except for the push encoders, whose
     /// queue bound is the single-threaded finder's look-ahead, and for the
     /// tests that compare the two.
     pub(crate) inline_finder: bool,
@@ -2160,8 +2161,13 @@ impl LzmaEnc {
     /// (`C/LzmaEnc.c:2705`) picks the threaded finder. Where it does not and
     /// only the thread count stood in the way, the same finder runs inline,
     /// on this thread: the binary tree in normal mode is exactly where it is
-    /// legal, and the matches are the single-threaded finder's. Never
-    /// anything but the single-threaded finder without `std`.
+    /// legal, and the matches are the single-threaded finder's. Except BT3:
+    /// the threaded finder adds the 2-byte hash match only while four bytes
+    /// are left (`MatchFinderMt_GetMatches`, `C/LzFindMt.c`), the
+    /// single-threaded `Bt3_MatchFinder_GetMatches` while three are, so
+    /// inline BT3 would differ from the C's `mtMode = 0` bytes at the end of
+    /// a stream. BT3 held to one thread takes the single-threaded finder.
+    /// Never anything but the single-threaded finder without `std`.
     fn finder_mode(&mut self) -> FinderMode {
         if !cfg!(feature = "std") || self.fast_mode || !self.mf.cfg().kind.bt_mode() {
             return FinderMode::St;
@@ -2176,7 +2182,7 @@ impl LzmaEnc {
         if !crate::kernel_ab::inline_finder() {
             return FinderMode::St;
         }
-        if self.inline_finder {
+        if self.inline_finder && self.mf.cfg().kind != MatchFinderKind::Bt3 {
             FinderMode::Inline
         } else {
             FinderMode::St

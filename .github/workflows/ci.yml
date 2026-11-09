@@ -706,6 +706,9 @@ jobs:
         enc::lzma_enc::tests::encoder_window_reads_match_the_checked_parser
         enc::lz_find::normalize::tests::normalization_
         filters::bcj2::cursor::tests::sdk_cursor_
+        lzma2::scan::tests::
+        reader::borrowed_read_tests::
+        reader::limit_tests::
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -757,7 +760,10 @@ jobs:
     name: miri-${{ matrix.test }}
     needs: unchecked-kernel-miri-plan
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    # The 3-byte-cap reader shards take about 12 minutes under Miri on an
+    # idle Apple M-series machine; a loaded runner can take several times
+    # that.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.unchecked-kernel-miri-plan.outputs.matrix) }}

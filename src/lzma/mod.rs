@@ -316,8 +316,11 @@ pub(crate) fn lzma_dec_decode_to_dic(
 
                 {
                     // we decode one symbol from (p->tempBuf) here, so the (bufLimit) is equal to (p->buf)
-                    let base = p.temp_buf.as_ptr();
-                    // SAFETY: `temp_buf` is `LZMA_REQUIRED_INPUT_MAX` bytes and
+                    // A copy, not a pointer into `p`: passing `p` below as
+                    // `&mut` would invalidate a pointer into `p.temp_buf`.
+                    let temp = p.temp_buf;
+                    let base = temp.as_ptr();
+                    // SAFETY: `temp` is `LZMA_REQUIRED_INPUT_MAX` bytes and
                     // `buf_limit == buf_start`, so the loop runs exactly one
                     // iteration, which consumes at most
                     // `LZMA_REQUIRED_INPUT_MAX` bytes: the whole buffer is the
