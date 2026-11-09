@@ -1,5 +1,5 @@
 // Command lzma-turbo-bench measures lzma-turbo against its oracles (xz,
-// 7-Zip, the LZMA SDK's 7lzma, lzma-rust2 and liblzma), one process per
+// 7-Zip, the LZMA SDK's 7lzma, lzma-rust2, liblzma and lzma-rs), one process per
 // measurement, with each process's peak RSS, and writes a report a fleet can
 // collect and merge across machines.
 //
