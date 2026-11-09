@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.4 - Unreleased
+
+- A caller can put a large dictionary on memory of its own, a mapped
+  scratch file for example, instead of RAM. A `WindowAllocator` hands out
+  `WindowMemory`, and a `WindowBacking` pairs it with an in-RAM limit: a
+  dictionary at or under the limit is allocated as before, and a bigger one
+  is asked of the allocator and no longer counts against the memory limit.
+  A ceiling, `WindowBacking::with_max_len` (4 GiB by default), refuses a
+  bigger one with the memory-limit error without asking. The memory need
+  not be zeroed. `LzmaReader::with_window`,
+  `LzmaReader::with_props_and_window`, `Lzma2Reader::with_window` and
+  `XzOptions::with_window` take one. The thread count stays the caller's:
+  `XzParallelReader` and `XzAdaptiveDecoder` workers each ask for their own
+  window for a block over the limit, so up to one per thread is alive at
+  once, and `XzParallelReader::memory_estimate` counts only what stays in
+  RAM. An allocator failure fails the decode with its `io::ErrorKind`, as
+  `XzErrorKind::WindowAlloc` from the xz readers. The threaded LZMA2
+  decoders take no backing and keep every buffer in RAM.
+
 ## 0.10.3 - 2026-11-08
 
 - `XzParallelReader` returns its error again on every read after a
