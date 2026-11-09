@@ -64,13 +64,27 @@ impl DicBuf {
     }
 
     /// Gives back an owned buffer, leaving an empty one. Caller memory is
-    /// released and an empty `Vec` returned in its place: only the threaded
-    /// decoders hand buffers back, and they never run on caller memory.
+    /// released and an empty `Vec` returned in its place.
     #[cfg(feature = "std")]
     pub(crate) fn take_vec(&mut self) -> Vec<u8> {
         match core::mem::take(self) {
             DicBuf::Owned(v) => v,
             DicBuf::Caller(_) => Vec::new(),
+        }
+    }
+
+    /// Whether this is memory a caller lent.
+    #[cfg(feature = "std")]
+    pub(crate) fn is_lent(&self) -> bool {
+        matches!(self, DicBuf::Caller(_))
+    }
+
+    /// Keeps an owned buffer in `spare` for the next block; drops caller
+    /// memory, which goes back to its allocator.
+    #[cfg(feature = "std")]
+    pub(crate) fn recycle_into(self, spare: &mut Vec<Vec<u8>>) {
+        if let DicBuf::Owned(v) = self {
+            spare.push(v);
         }
     }
 }

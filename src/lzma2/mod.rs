@@ -389,8 +389,15 @@ impl Lzma2Decoder {
     /// plus the `Lzma2Dec_Init` that `..._Code` does on `needInit`.
     #[cfg(feature = "std")]
     pub(crate) fn set_block_dic(&mut self, buf: alloc::vec::Vec<u8>, size: usize) {
+        self.set_block_buf(crate::buffer::DicBuf::Owned(buf), size);
+    }
+
+    /// As [`Lzma2Decoder::set_block_dic`], for a buffer that may be caller
+    /// memory: a threaded xz block whose dictionary is lent.
+    #[cfg(feature = "std")]
+    pub(crate) fn set_block_buf(&mut self, buf: crate::buffer::DicBuf, size: usize) {
         debug_assert!(buf.len() >= size);
-        self.decoder.dic = crate::buffer::DicBuf::Owned(buf);
+        self.decoder.dic = buf;
         self.decoder.dic_buf_size = size;
         self.reset();
     }
@@ -399,9 +406,15 @@ impl Lzma2Decoder {
     /// return it for the next block.
     #[cfg(feature = "std")]
     pub(crate) fn take_block_dic(&mut self) -> alloc::vec::Vec<u8> {
+        self.take_block_buf().take_vec()
+    }
+
+    /// As [`Lzma2Decoder::take_block_dic`], keeping caller memory as it is.
+    #[cfg(feature = "std")]
+    pub(crate) fn take_block_buf(&mut self) -> crate::buffer::DicBuf {
         self.decoder.dic_buf_size = 0;
         self.decoder.dic_pos = 0;
-        self.decoder.dic.take_vec()
+        core::mem::take(&mut self.decoder.dic)
     }
 
     /// C: `p->decoder.dicPos`. How much of the current block has been decoded.

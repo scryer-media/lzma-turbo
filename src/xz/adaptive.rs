@@ -37,6 +37,7 @@ use super::stream::{
     CheckType, STREAM_FOOTER_SIZE, STREAM_HEADER_SIZE, StreamFlags, StreamFooter, StreamHeader,
 };
 use super::vli;
+use crate::buffer::DicBuf;
 use crate::crc::Crc32;
 use crate::mt::adaptive::DrainStatus;
 
@@ -96,7 +97,7 @@ pub struct XzAdaptiveDecoder {
     ready: BTreeMap<u64, XzDone>,
     /// The block a limited drain stopped in the middle of: its buffer, how
     /// much of it is output, and how much of that has been handed over.
-    part: Option<(Vec<u8>, usize, usize)>,
+    part: Option<(DicBuf, usize, usize)>,
     spare_out: Vec<Vec<u8>>,
     spare_in: Vec<Vec<u8>>,
 
@@ -181,16 +182,22 @@ impl XzAdaptiveDecoder {
     }
 
     fn held_block_bytes(&self) -> u64 {
+        // Only bytes in RAM count: a block on caller memory holds its packed
+        // bytes alone.
         let ready = self
             .ready
             .values()
             .fold(self.outstanding_bytes, |held, done| {
-                held.saturating_add(done.unpacked_len as u64)
+                held.saturating_add(in_ram(done.lent, done.unpacked_len))
                     .saturating_add(done.bytes.len() as u64)
             });
         // The whole output allocation remains owned until its final byte is
         // delivered, even when only a small suffix is left.
-        ready.saturating_add(self.part.as_ref().map_or(0, |(_, len, _)| *len as u64))
+        ready.saturating_add(
+            self.part
+                .as_ref()
+                .map_or(0, |(buf, len, _)| in_ram(buf.is_lent(), *len)),
+        )
     }
 
     /// Total output handed to the caller so far.
@@ -533,8 +540,7 @@ impl XzAdaptiveDecoder {
             &self.opts.plan,
             self.opts.verify_checks,
             limits,
-            // The adaptive decoder keeps every dictionary in RAM.
-            None,
+            self.opts.window.as_ref(),
         )
         .map_err(|k| self.err(k))?;
         self.st = Some(dec);
@@ -595,8 +601,25 @@ impl XzAdaptiveDecoder {
         if held_blocks >= self.threads {
             return Ok(Dispatch::Busy);
         }
-        // One worker's cost, against the caller's limit.
-        let cost = unpacked + padded;
+        // A worker's block over the window's in-RAM limit goes on its own
+        // window, asked for by the worker; one over the ceiling is refused
+        // here and the allocator is never asked.
+        let window = self
+            .opts
+            .window
+            .as_ref()
+            .filter(|w| w.covers(unpacked_len))
+            .cloned();
+        if let Some(w) = &window
+            && !w.admits(unpacked_len)
+        {
+            return Err(self.err(XzErrorKind::MemoryLimit {
+                needed: unpacked,
+                limit: w.max_len(),
+            }));
+        }
+        // One worker's cost in RAM, against the caller's limit.
+        let cost = in_ram(window.is_some(), unpacked_len) + padded;
         if held_blocks > 0 && self.held_block_bytes().saturating_add(cost) > self.opts.memory_limit
         {
             return Ok(Dispatch::Busy);
@@ -618,7 +641,11 @@ impl XzAdaptiveDecoder {
         let check = self.flags.check;
         let verify = self.opts.verify_checks;
         let plan = self.opts.plan.clone();
-        let out = self.spare_out.pop().unwrap_or_default();
+        let out = if window.is_some() {
+            DicBuf::default()
+        } else {
+            DicBuf::Owned(self.spare_out.pop().unwrap_or_default())
+        };
         let threads = self.threads;
         let pool = self.pool.get_or_insert_with(XzPool::new);
         if pool.spawned() < threads {
@@ -637,6 +664,7 @@ impl XzAdaptiveDecoder {
             verify,
             plan,
             out,
+            window,
         };
         let sent = pool.dispatch(job);
         sent.map_err(|k| self.err(k))?;
@@ -906,7 +934,7 @@ impl XzAdaptiveDecoder {
             self.outstanding -= 1;
             self.outstanding_bytes = self
                 .outstanding_bytes
-                .saturating_sub(done.unpacked_len as u64 + done.bytes.len() as u64);
+                .saturating_sub(in_ram(done.lent, done.unpacked_len) + done.bytes.len() as u64);
             self.ready.insert(done.index, done);
             did = true;
         }
@@ -929,7 +957,7 @@ impl XzAdaptiveDecoder {
             }
             if *sent == *len {
                 let (buf, _, _) = self.part.take().expect("just borrowed");
-                self.spare_out.push(buf);
+                buf.recycle_into(&mut self.spare_out);
             } else {
                 return Ok(did);
             }
@@ -945,12 +973,13 @@ impl XzAdaptiveDecoder {
                 unpacked_len,
                 res,
                 out,
+                lent: _,
                 bytes,
                 checks,
             } = done;
             self.spare_in.push(bytes);
             if let Err(kind) = res {
-                self.spare_out.push(out);
+                out.recycle_into(&mut self.spare_out);
                 return Err(XzError::in_block(
                     kind,
                     stream,
@@ -968,7 +997,7 @@ impl XzAdaptiveDecoder {
                 self.checks.push(c);
             }
             if take == unpacked_len {
-                self.spare_out.push(out);
+                out.recycle_into(&mut self.spare_out);
             } else {
                 // The rest of this block goes out first on the next call,
                 // ahead of anything decoded in the meantime.
@@ -984,6 +1013,12 @@ impl XzAdaptiveDecoder {
         }
         Ok(did)
     }
+}
+
+/// What a held block's output costs in RAM: nothing when it is on caller
+/// memory.
+fn in_ram(lent: bool, unpacked_len: usize) -> u64 {
+    if lent { 0 } else { unpacked_len as u64 }
 }
 
 /// What one turn of the state machine did.
@@ -1044,7 +1079,8 @@ mod admission_tests {
             file_offset: 0,
             unpacked_len: 64,
             res: Ok(()),
-            out: alloc::vec![0; 64],
+            out: DicBuf::Owned(alloc::vec![0; 64]),
+            lent: false,
             bytes: alloc::vec![0; 12],
             checks: None,
         }

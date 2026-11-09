@@ -19,6 +19,16 @@ fn to_io(e: Error) -> io::Error {
     e.into()
 }
 
+/// The memory-limit error for a dictionary over the window's ceiling, which
+/// the allocator is never asked for.
+fn refuse_over_ceiling(window: &WindowBacking, size: usize) -> io::Result<()> {
+    if window.admits(size) {
+        Ok(())
+    } else {
+        Err(to_io(Error::memory_limit(size as u64, window.max_len())))
+    }
+}
+
 struct Source<R> {
     inner: R,
     buf: Box<[u8]>,
@@ -89,6 +99,9 @@ impl<R: Read> LzmaReader<R> {
     ) -> io::Result<LzmaDecoder> {
         let size = props.dic_buf_size();
         let window = window.filter(|w| w.covers(size));
+        if let Some(w) = window {
+            refuse_over_ceiling(w, size)?;
+        }
         let mut required = Self::memory_required(props);
         if window.is_some() {
             required -= size as u64;
@@ -404,7 +417,8 @@ impl<R: Read> Lzma2Reader<R> {
         let prop = Lzma2Decoder::capped_props(dict_prop, u32::MAX).map_err(to_io)?;
         let size = prop.dic_buf_size();
         let window = window.filter(|w| w.covers(size));
-        if window.is_some() {
+        if let Some(w) = window {
+            refuse_over_ceiling(w, size)?;
             required -= size as u64;
         }
         if required > memory_limit {

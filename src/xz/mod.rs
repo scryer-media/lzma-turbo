@@ -133,12 +133,26 @@ pub struct XzOptions {
     /// and a failed check is reported at the block's end. Ignored by
     /// [`XzReader`], which always works that way.
     pub verified_output: bool,
-    /// Caller memory for a block dictionary over the backing's in-RAM limit.
-    /// [`XzReader`] puts such a dictionary on the backing's allocator, where
-    /// it counts nothing against [`XzOptions::memory_limit`].
-    /// [`XzParallelReader`] decodes a file with such a block on one thread,
-    /// as [`XzReader`] does, unless [`XzOptions::verified_output`] is set, in
-    /// which case it ignores the backing. [`XzAdaptiveDecoder`] ignores it.
+    /// Caller memory for a block dictionary over the backing's in-RAM limit,
+    /// where it counts nothing against [`XzOptions::memory_limit`]. Every xz
+    /// decoder takes it, and none of them changes the thread count for it:
+    ///
+    /// - [`XzReader`], and a one-thread [`XzParallelReader`] without
+    ///   [`XzOptions::verified_output`], decode in each block's dictionary
+    ///   and ask the allocator for one window at a time, dropped at the
+    ///   block's end.
+    /// - [`XzParallelReader`] holding whole blocks (more than one thread, or
+    ///   [`XzOptions::verified_output`]) and [`XzAdaptiveDecoder`]'s workers
+    ///   decode each block into a buffer of the block's size; a block over
+    ///   the in-RAM limit has its worker ask the allocator for its own
+    ///   window, so up to one window per thread is alive at once. Each is
+    ///   dropped once its block has been handed over.
+    /// - [`XzAdaptiveDecoder`] chasing a block on the caller's thread puts
+    ///   its dictionary on the allocator as [`XzReader`] does.
+    ///
+    /// An allocator refusal fails the decode with
+    /// [`XzErrorKind::WindowAlloc`]; a buffer over the backing's ceiling
+    /// fails it with [`XzErrorKind::MemoryLimit`] without asking.
     pub window: Option<crate::WindowBacking>,
 }
 

@@ -105,6 +105,16 @@ impl BlockDecoder {
             }
             None => None,
         };
+        // A dictionary over the window's ceiling is refused here, before the
+        // allocator is asked.
+        if let Some((w, _, size)) = caller
+            && !w.admits(size)
+        {
+            return Err(XzErrorKind::MemoryLimit {
+                needed: size as u64,
+                limit: w.max_len(),
+            });
+        }
         if caller.is_none() && dict > limits.memory_limit {
             return Err(XzErrorKind::MemoryLimit {
                 needed: dict,

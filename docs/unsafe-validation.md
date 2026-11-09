@@ -70,9 +70,12 @@ updates its entry in the same commit; a new surface lands with one.
   `src/buffer.rs`: the slice views over a `WindowMemory`'s pointer and the
   `Send`/`Sync` impls of `CallerWindow`. The `window::tests::` cases decode
   raw LZMA and LZMA2 on heap windows filled with non-zero garbage and
-  compare with owned dictionaries, natively and in the Miri kernel job;
-  `tests/window.rs` does the same for the xz readers natively. The decode
-  loops receive the same base pointer shape as with a `Vec`.
+  compare with owned dictionaries, natively and in the Miri kernel job, and
+  check that a length over `isize::MAX`, asked for or returned, is refused
+  before any slice is built. `tests/window.rs` does the same for the xz
+  readers natively, including the threaded ones, whose workers each decode
+  a block on their own lent window and move it back across threads. The
+  decode loops receive the same base pointer shape as with a `Vec`.
 - Shared finder storage and borrowed direct-input lifetime/ownership in
   `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
   `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,

@@ -2,13 +2,20 @@
 //! dictionary and once on caller memory filled with garbage. The two must
 //! agree byte for byte, and fail or finish together: a decoder that read a
 //! dictionary byte it had not written would tell them apart.
+//!
+//! The same bytes are then encoded as a small-block `.xz` file and decoded
+//! by two threads, each block on its worker's own garbage-filled window; the
+//! output must be the input.
 #![no_main]
 
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 use std::sync::Arc;
 
 use libfuzzer_sys::fuzz_target;
-use lzma_turbo::{Lzma2Reader, WindowAllocator, WindowBacking, WindowMemory};
+use lzma_turbo::xz::{CheckType, XzOptions, XzParallelReader};
+use lzma_turbo::{
+    Lzma2Reader, LzmaEncProps, WindowAllocator, WindowBacking, WindowMemory, encode_xz,
+};
 
 struct Garbage(Box<[u8]>);
 
@@ -28,7 +35,9 @@ struct Heap(u8);
 impl WindowAllocator for Heap {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
         let fill = self.0;
-        let buf = (0..len).map(|i| (i as u8).wrapping_mul(151) ^ fill).collect();
+        let buf = (0..len)
+            .map(|i| (i as u8).wrapping_mul(151) ^ fill)
+            .collect();
         Ok(Box::new(Garbage(buf)))
     }
 }
@@ -69,4 +78,16 @@ fuzz_target!(|data: &[u8]| {
     let caller = Lzma2Reader::with_window(input, dict_prop, u64::MAX, window)
         .expect("a heap window never fails");
     assert_eq!(drain(owned, step), drain(caller, step));
+
+    // Kept small: the encode and the two threads are per input.
+    if input.len() > 1 << 16 {
+        return;
+    }
+    let props = LzmaEncProps::new().with_level(1).with_dict_size(4096);
+    let block = 1024u64 << (data[1] % 4);
+    let packed = encode_xz(input, &props, CheckType::Crc32, block).expect("encode");
+    let window = WindowBacking::new(Arc::new(Heap(data[1])), 0);
+    let opts = XzOptions::default().with_threads(2).with_window(window);
+    let reader = XzParallelReader::with_options(Cursor::new(&packed), opts).expect("our own file");
+    assert_eq!(drain(reader, step), (input.to_vec(), true));
 });

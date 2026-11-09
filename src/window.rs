@@ -7,12 +7,14 @@
 //! rather not hold that in RAM can back it with memory of its own, a mapped
 //! scratch file for example, through a [`WindowAllocator`].
 //!
-//! [`WindowBacking`] pairs the allocator with an in-RAM limit. A dictionary
-//! at or under the limit is allocated by the decoder exactly as without one;
-//! only a dictionary over it is asked of the allocator. The readers that take
-//! one are [`crate::LzmaReader`], [`crate::Lzma2Reader`] and, through
-//! `XzOptions::with_window`, the xz readers. A decode whose dictionary is on
-//! caller memory runs on one thread.
+//! [`WindowBacking`] pairs the allocator with an in-RAM limit and a ceiling.
+//! A dictionary at or under the limit is allocated by the decoder exactly as
+//! without one; a dictionary over it is asked of the allocator, unless it is
+//! also over the ceiling, which refuses it with the memory-limit error. The
+//! readers that take one are [`crate::LzmaReader`], [`crate::Lzma2Reader`]
+//! and, through `XzOptions::with_window`, the xz readers. A threaded xz
+//! decode keeps the thread count the caller set and asks the allocator once
+//! per block in flight.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -23,35 +25,33 @@ use std::io;
 /// Memory a [`WindowAllocator`] lends a decoder for its dictionary.
 ///
 /// The decoder calls [`WindowMemory::as_mut_ptr`] and [`WindowMemory::len`]
-/// once, when it receives the value, and reads and writes through that
-/// pointer until it drops the value. It never calls either again.
-///
-/// The contents need not be zero: the decoder reads no byte of the window it
-/// has not written since the stream (or, in LZMA2 and xz, the dictionary
-/// reset) began. They must be initialized, though, as every byte of a mapped
-/// file or of a `vec![x; n]` is.
+/// once each, when it receives the value, and reads and writes through that
+/// pointer until it drops the value.
 ///
 /// # Safety
 ///
-/// An implementation must guarantee all of the following, from the first
-/// call to [`WindowMemory::as_mut_ptr`] until the value is dropped:
+/// An implementation must guarantee all of the following, from the call to
+/// [`WindowMemory::as_mut_ptr`] until the value is dropped:
 ///
-/// - the pointer is non-null and valid for reads and writes of `len()` bytes,
-///   and those bytes are initialized;
-/// - the address does not change: the memory is not moved, unmapped,
-///   remapped or freed while the value lives;
-/// - nothing else reads or writes those bytes: the decoder has exclusive
-///   access, as it would to a `&mut [u8]`.
+/// - the pointer is non-null and valid for reads and writes of `len()`
+///   bytes, which is at least the `len` [`WindowAllocator::allocate`] was
+///   asked for; the decoder uses exactly the first `len` asked for;
+/// - those bytes are initialized, to any value: they need not be zero;
+/// - the address is stable until drop, including when the `Box` holding
+///   the value moves: the memory is not moved, unmapped, remapped or freed;
+/// - the memory is exclusive to the decoder until drop: nothing else reads
+///   or writes it, as with a `&mut [u8]`.
 ///
 /// Dropping the value releases the memory; the decoder does not touch it
-/// afterwards.
+/// afterwards. The decoder reads no byte it has not written since the
+/// stream (or, in LZMA2 and xz, the dictionary reset) began, which is why
+/// the contents may be any initialized value.
 pub unsafe trait WindowMemory: Send {
     /// The start of the memory. Called once.
     fn as_mut_ptr(&mut self) -> *mut u8;
 
-    /// How many bytes [`WindowMemory::as_mut_ptr`] points at. At least what
-    /// [`WindowAllocator::allocate`] was asked for; the decoder uses only
-    /// that many.
+    /// How many bytes [`WindowMemory::as_mut_ptr`] points at: at least the
+    /// `len` asked for. Called once.
     fn len(&self) -> usize;
 
     /// Whether [`WindowMemory::len`] is zero.
@@ -62,10 +62,21 @@ pub unsafe trait WindowMemory: Send {
 
 /// A source of caller memory for decoder dictionaries.
 ///
-/// Called once for each dictionary the decoder needs that is over the
-/// [`WindowBacking`]'s in-RAM limit: once per reader for raw LZMA and LZMA2,
-/// and once per block for xz, whose blocks each start a new dictionary. The
-/// previous block's memory is dropped before the next block's is asked for.
+/// Asked once for each dictionary the decoder needs that is over the
+/// [`WindowBacking`]'s in-RAM limit and at or under its ceiling: once per
+/// reader for raw LZMA and LZMA2, and once per block for xz, whose blocks
+/// each start a new dictionary.
+///
+/// # Concurrency
+///
+/// [`WindowAllocator::allocate`] can be called concurrently, from several
+/// threads at once. A threaded xz decode (`XzParallelReader`, or
+/// `XzAdaptiveDecoder` with more than one thread) asks once per block in
+/// flight, so up to once per worker: with `n` threads, up to `n` windows
+/// can be alive at the same time, each dropped when its block has been
+/// handed to the caller. A refusal fails the decode; it never makes the
+/// decoder fall back to fewer threads or to RAM. A caller who wants one
+/// lent window at a time passes one thread.
 pub trait WindowAllocator: Send + Sync {
     /// Returns `len` bytes for a dictionary, or the error that stopped it.
     /// The error reaches the reader's caller with its `io::ErrorKind` kept.
@@ -76,23 +87,30 @@ pub trait WindowAllocator: Send + Sync {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn WindowMemory>>;
 }
 
-/// A [`WindowAllocator`] and the in-RAM limit above which it is used.
+/// A [`WindowAllocator`], the in-RAM limit above which it is used, and the
+/// ceiling on what it is asked for.
 ///
 /// A dictionary of `in_memory_limit` bytes or fewer is allocated by the
 /// decoder itself, as with no backing at all. A bigger one is asked of the
 /// allocator, and then counts nothing against the reader's memory limit,
-/// which bounds only what the decoder allocates itself.
+/// which bounds only what the decoder allocates itself. A dictionary over
+/// [`WindowBacking::max_len`] is refused with the reader's memory-limit
+/// error, and the allocator is never asked for it.
 ///
 /// The size compared, and asked of the allocator, is the dictionary buffer
-/// the decoder would allocate: the stream's dictionary size (for xz, clamped
-/// to the block's declared size), rounded up as the LZMA SDK rounds it, to a
-/// multiple of 4 KiB, 1 MiB or 4 MiB depending on its size.
+/// the decoder would allocate. For raw LZMA, LZMA2 and the sequential xz
+/// reader that is the stream's dictionary size (for xz, clamped to the
+/// block's declared size), rounded up as the LZMA SDK rounds it, to a
+/// multiple of 4 KiB, 1 MiB or 4 MiB depending on its size. A threaded xz
+/// decode holds each block whole, so its dictionary buffer is the block's
+/// uncompressed size from the index.
 pub struct WindowBacking {
     // `AssertUnwindSafe` keeps the options and readers that hold a backing
     // `UnwindSafe` and `RefUnwindSafe`, as they are without one; the decoder
     // only ever calls `allocate`, and keeps no state of the allocator's.
     allocator: AssertUnwindSafe<Arc<dyn WindowAllocator>>,
     in_memory_limit: u64,
+    max_len: u64,
 }
 
 impl Clone for WindowBacking {
@@ -100,18 +118,33 @@ impl Clone for WindowBacking {
         WindowBacking {
             allocator: AssertUnwindSafe(Arc::clone(&self.allocator)),
             in_memory_limit: self.in_memory_limit,
+            max_len: self.max_len,
         }
     }
 }
 
 impl WindowBacking {
-    /// Uses `allocator` for every dictionary over `in_memory_limit` bytes.
+    /// The default ceiling: the largest dictionary buffer an LZMA or LZMA2
+    /// stream can ask for, a 4 GiB - 1 dictionary rounded up to 4 GiB.
+    pub const DEFAULT_MAX_LEN: u64 = 1 << 32;
+
+    /// Uses `allocator` for every dictionary over `in_memory_limit` bytes and
+    /// at or under [`WindowBacking::DEFAULT_MAX_LEN`].
     #[must_use]
     pub fn new(allocator: Arc<dyn WindowAllocator>, in_memory_limit: u64) -> Self {
         WindowBacking {
             allocator: AssertUnwindSafe(allocator),
             in_memory_limit,
+            max_len: Self::DEFAULT_MAX_LEN,
         }
+    }
+
+    /// Sets the largest window the allocator is asked for. A dictionary
+    /// over it is refused with the reader's memory-limit error.
+    #[must_use]
+    pub fn with_max_len(mut self, max_len: u64) -> Self {
+        self.max_len = max_len;
+        self
     }
 
     /// The largest dictionary the decoder allocates in RAM itself.
@@ -120,13 +153,27 @@ impl WindowBacking {
         self.in_memory_limit
     }
 
+    /// The largest window the allocator is asked for.
+    #[must_use]
+    pub fn max_len(&self) -> u64 {
+        self.max_len
+    }
+
     /// Whether a dictionary buffer of `len` bytes goes to the allocator.
     pub(crate) fn covers(&self, len: usize) -> bool {
         len as u64 > self.in_memory_limit
     }
 
+    /// Whether the allocator may be asked for `len` bytes: at or under the
+    /// ceiling, and small enough to be a slice.
+    pub(crate) fn admits(&self, len: usize) -> bool {
+        len as u64 <= self.max_len && isize::try_from(len).is_ok()
+    }
+
     /// Asks the allocator for a `len`-byte dictionary and checks what it
-    /// gave back against the [`WindowMemory`] contract it can check.
+    /// gave back against the [`WindowMemory`] contract it can check. A `len`
+    /// the backing does not admit is refused without asking; callers check
+    /// [`WindowBacking::admits`] first to report the memory-limit error.
     pub(crate) fn allocate(&self, len: usize) -> io::Result<CallerWindow> {
         let failed = |source: io::Error| {
             io::Error::new(
@@ -137,13 +184,21 @@ impl WindowBacking {
                 },
             )
         };
+        if !self.admits(len) {
+            return Err(failed(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "window over the backing's ceiling",
+            )));
+        }
         let mut mem = self.allocator.allocate(len).map_err(failed)?;
         let ptr = mem.as_mut_ptr();
         let got = mem.len();
-        if ptr.is_null() || got < len {
+        // A length over `isize::MAX` cannot describe real memory; refused
+        // before any slice is built, and `mem` is dropped on the way out.
+        if ptr.is_null() || got < len || isize::try_from(got).is_err() {
             return Err(failed(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "window allocator returned less memory than asked for",
+                "window allocator returned a length that does not fit what was asked",
             )));
         }
         Ok(CallerWindow {
@@ -158,6 +213,7 @@ impl fmt::Debug for WindowBacking {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WindowBacking")
             .field("in_memory_limit", &self.in_memory_limit)
+            .field("max_len", &self.max_len)
             .finish_non_exhaustive()
     }
 }
@@ -244,6 +300,8 @@ mod tests {
     struct HeapWindow {
         buf: Box<[u8]>,
         drops: Arc<AtomicUsize>,
+        /// A length to claim instead of the buffer's.
+        claim: Option<usize>,
     }
 
     // SAFETY: a boxed slice is initialized, never moved by moving the box,
@@ -253,7 +311,7 @@ mod tests {
             self.buf.as_mut_ptr()
         }
         fn len(&self) -> usize {
-            self.buf.len()
+            self.claim.unwrap_or(self.buf.len())
         }
     }
 
@@ -271,6 +329,8 @@ mod tests {
         drops: Arc<AtomicUsize>,
         fail: Option<io::ErrorKind>,
         short: bool,
+        /// Claims a length over `isize::MAX` for the memory it returns.
+        huge: bool,
     }
 
     impl WindowAllocator for Heap {
@@ -288,6 +348,7 @@ mod tests {
             Ok(Box::new(HeapWindow {
                 buf,
                 drops: Arc::clone(&self.drops),
+                claim: self.huge.then_some(usize::MAX),
             }))
         }
     }
@@ -317,7 +378,7 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 17;
             x ^= x << 5;
-            if x % 3 == 0 && v.len() > 4000 {
+            if x.is_multiple_of(3) && v.len() > 4000 {
                 let back = v.len() - 4000;
                 let run: Vec<u8> = v[back..back + 40].to_vec();
                 v.extend_from_slice(&run);
@@ -493,5 +554,53 @@ mod tests {
         assert!(reader.read_to_end(&mut Vec::new()).is_err());
         drop(reader);
         assert_eq!((heap.asked().len(), heap.drops()), (2, 2));
+    }
+
+    #[test]
+    fn a_dictionary_over_the_ceiling_is_refused_without_asking() {
+        let data = sample();
+        let (prop, packed) = encode_lzma2(&data, &props()).unwrap();
+        let heap = Arc::new(Heap::default());
+        let capped = || backing(&heap, 0).with_max_len(4095);
+        assert_eq!(backing(&heap, 0).max_len(), WindowBacking::DEFAULT_MAX_LEN);
+        let err = Lzma2Reader::with_window(packed.as_slice(), prop, u64::MAX, capped())
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        let lzma = encode_lzma_alone(&data, &props()).unwrap();
+        let err = LzmaReader::with_window(lzma.as_slice(), u64::MAX, capped())
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(heap.asked().is_empty());
+
+        // At the ceiling it is asked.
+        let at = backing(&heap, 0).with_max_len(4096);
+        let reader = Lzma2Reader::with_window(packed.as_slice(), prop, u64::MAX, at).unwrap();
+        assert_eq!(read_all(reader).unwrap(), data);
+        assert_eq!(heap.asked(), [4096]);
+    }
+
+    #[test]
+    fn a_length_over_isize_max_is_refused_and_released() {
+        // Asked for: refused before the allocator is.
+        let heap = Arc::new(Heap::default());
+        let unbounded = backing(&heap, 0).with_max_len(u64::MAX);
+        let too_long = isize::MAX as usize + 1;
+        assert!(!unbounded.admits(too_long));
+        assert!(unbounded.allocate(too_long).is_err());
+        assert!(heap.asked().is_empty());
+
+        // Returned: refused before any slice is built, and released.
+        let (prop, packed) = encode_lzma2(&sample(), &props()).unwrap();
+        let heap = Arc::new(Heap {
+            huge: true,
+            ..Heap::default()
+        });
+        let err = Lzma2Reader::with_window(packed.as_slice(), prop, u64::MAX, backing(&heap, 0))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!((heap.asked().len(), heap.drops()), (1, 1));
     }
 }
