@@ -74,14 +74,14 @@ impl DicBuf {
     }
 
     /// Whether this is memory a caller lent.
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "xz"))]
     pub(crate) fn is_lent(&self) -> bool {
         matches!(self, DicBuf::Caller(_))
     }
 
     /// Keeps an owned buffer in `spare` for the next block; drops caller
     /// memory, which goes back to its allocator.
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "xz"))]
     pub(crate) fn recycle_into(self, spare: &mut Vec<Vec<u8>>) {
         if let DicBuf::Owned(v) = self {
             spare.push(v);
