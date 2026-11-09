@@ -110,7 +110,7 @@ lzma-turbo-bench merge     [--out merged.md] host-a/report.json host-b/report.js
 | `decode/lzma1/{p256,1g}` | `p256.bin.lzma`, `payload.bin.lzma` | `LzmaReader` | `7zz t -mmt=1`, `xz -dc -T1 --format=lzma`, `7lzma d`, lzma-rust2 `LzmaReader`, liblzma, lzma-rs |
 | `decode/xz/p256` | `p256.bin.xz` | `XzReader` | `xz -dc -T1`, `7zz t -mmt=1`, lzma-rust2 `XzReader`, liblzma one thread, lzma-rs |
 | `decode/lzma2-raw/p256` | `p256.bin.xz` | `Lzma2Reader` on the bare stream | `xz -dc -T1` |
-| `decode/xz-multi/p256x3` | `multi.xz` | `XzReader` | `xz -dc -T1`, lzma-rust2 `XzReader`, liblzma one thread |
+| `decode/xz-multi/p256x3` | `multi.xz` | `XzReader` | `xz -dc -T1` |
 | `decode/7z-st/{p256,1g}` | `p256.st.7z`, `st.7z` | `Lzma2Reader` | `7zz t -mmt=1`, lzma-rust2 `Lzma2Reader`, lzma-rs |
 | `decode/7z-st-fallback/{p256,1g}/tall` | same | `Lzma2ParallelDecoder`, every CPU (must fall back to one thread) | `7zz t -mmt=<all>` |
 | `decode/7z-mt/{p256,1g}/t<N>` | `p256.mt.7z`, `mt.7z` | `Lzma2ParallelDecoder` | `7zz t -mmt=N`, lzma-rust2 `Lzma2ReaderMt` |

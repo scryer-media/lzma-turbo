@@ -47,33 +47,39 @@ it, so `io::Error::downcast` gives it back.
 
 ## Speed
 
-Measured with lzma-turbo 0.10.1 against xz 5.8.4 and 7-Zip 26.04 on two idle
-machines, 2026-10-18. Each number is the reference's time or memory divided
+Measured with lzma-turbo 0.10.3 against xz 5.8.4, 7-Zip 26.04 and the Rust
+libraries lzma-rust2 0.20.1, liblzma 0.4.8 and lzma-rs 0.3.0 on two idle
+machines, 2026-11-08. Each number is the reference's time or memory divided
 by lzma-turbo's, averaged (geometric mean) over every test that reference
-runs, so above 1.00 means lzma-turbo was faster or used less memory.
+runs, so above 1.00 means lzma-turbo was faster or used less memory. The
+Rust-library decode columns cover single-threaded decoding.
 
-| CPU | threads | vs xz: decode | encode | peak memory | vs 7-Zip: decode | peak memory |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Sapphire Rapids | 16 | 1.10 | 1.85 | 0.89 | 1.00 | 1.10 |
-| Graviton4 | 16 | 1.81 | 1.82 | 0.89 | 1.00 | 1.10 |
+| CPU | threads | vs xz: decode | encode | peak memory | vs 7-Zip: decode | peak memory | vs lzma-rust2: decode | encode | vs liblzma: decode | encode | vs lzma-rs: decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sapphire Rapids | 16 | 1.10 | 1.87 | 0.86 | 1.00 | 1.08 | 1.46 | 2.54 | 1.08 | 2.53 | 2.83 |
+| Graviton4 | 16 | 1.82 | 1.94 | 0.88 | 1.00 | 1.09 | 1.53 | 2.48 | 1.91 | 2.44 | 3.01 |
 
-- Decoding matches 7-Zip's speed. Against xz it is level to 1.18x on
-  Sapphire Rapids (3.2x through the 64-byte delta filter) and 1.4 to 1.9x
+- Decoding matches 7-Zip's speed. Against xz it is level to 1.16x on
+  Sapphire Rapids (3.3x through the 64-byte delta filter) and 1.4 to 1.9x
   on Graviton4.
-- Compressing is 1.37 to 3.0x faster than xz at every preset, thread count
-  and filter, and the output is the same size.
-- Slower than xz: decoding through the arm, arm64, armthumb and sparc branch
-  filters on Sapphire Rapids (0.987 to 0.998). Slower than 7-Zip: the
-  all-threads `.7z` decode (0.98 to 0.99) and LZMA1 decoding on Sapphire
-  Rapids (0.997).
-- Memory: lzma-turbo uses less than 7-Zip on every test, and about 0.9x of
-  xz's on single-threaded decoding and 0.7 to 0.95x when compressing on one thread.
-  It uses less than xz when compressing on two or more threads and when
-  decoding in parallel on every thread.
+- Compressing is 1.4 to 3.0x faster than xz, lzma-rust2 and liblzma at
+  every preset, thread count and filter, and the output is the same size.
+- Against the Rust libraries, single-threaded decoding is 1.4 to 1.7x faster
+  than lzma-rust2 and 2.6 to 3.7x faster than lzma-rs. liblzma decodes at
+  xz's speed. lzma-rust2's multi-threaded `.xz` reader runs at its
+  single-thread speed, so with 16 threads lzma-turbo decodes those files 11
+  to 19x faster.
+- Slower than xz: decoding through the armthumb and sparc branch filters on
+  Sapphire Rapids (0.991 and 0.992). Slower than 7-Zip: the all-threads
+  `.7z` decode (0.986 to 0.991) and LZMA1 decoding (0.997 to 0.999).
+- Memory: lzma-turbo uses less than 7-Zip on every test, and 0.83 to 0.95x
+  of xz's on single-threaded decoding and 0.67 to 0.95x when compressing on
+  one thread. It uses less than xz when compressing on two or more threads
+  and when decoding in parallel on every thread.
 
-Every test on every machine, CPU time and the comparisons with lzma-rust2 and
-liblzma are in [docs/benchmarks.md](docs/benchmarks.md). To measure your own
-machine, use [`bench/lzma-turbo-bench`](bench/lzma-turbo-bench).
+Every test on every machine, CPU time and memory against each library are in
+[docs/benchmarks.md](docs/benchmarks.md). To measure your own machine, use
+[`bench/lzma-turbo-bench`](bench/lzma-turbo-bench).
 
 ## What it does
 
