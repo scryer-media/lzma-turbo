@@ -187,15 +187,42 @@ fn decode_at_keeps_the_runs_before_a_damaged_one() {
 }
 
 /// A source that remembers which threads read from it.
+///
+/// A worker's read of a whole run waits, up to a timeout, until a second
+/// worker has read anything. Without that the test depends on scheduling: on
+/// a slow runner one worker can claim and finish every run before the others
+/// are running, which is correct but proves nothing about who reads. The run
+/// is read outside the lock that hands out runs, so a held worker never stops
+/// another from claiming the next one.
 struct Witness<'a> {
     data: &'a [u8],
     readers: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    joined: std::sync::Condvar,
+}
+
+fn workers(readers: &std::collections::BTreeSet<String>) -> usize {
+    readers
+        .iter()
+        .filter(|n| n.starts_with("lzma2-at-"))
+        .count()
 }
 
 impl lzma_turbo::ReadAt for Witness<'_> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
         let name = std::thread::current().name().unwrap_or("").to_owned();
-        self.readers.lock().expect("lock").insert(name);
+        let is_worker = name.starts_with("lzma2-at-");
+        let mut readers = self.readers.lock().expect("lock");
+        readers.insert(name);
+        self.joined.notify_all();
+        // Header scans read 64 bytes; anything longer is a run's payload.
+        if is_worker && buf.len() > 64 {
+            let (_readers, _) = self
+                .joined
+                .wait_timeout_while(readers, std::time::Duration::from_secs(10), |r| {
+                    workers(r) < 2
+                })
+                .expect("lock");
+        }
         self.data.read_at(buf, offset)
     }
 }
@@ -206,6 +233,7 @@ fn decode_at_reads_runs_from_its_workers() {
     let w = Witness {
         data: &packed,
         readers: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        joined: std::sync::Condvar::new(),
     };
     let mut out = Vec::new();
     dec(prop, 4, u64::MAX)
@@ -213,11 +241,10 @@ fn decode_at_reads_runs_from_its_workers() {
         .expect("decodes");
     assert_eq!(out, plain);
     let readers = w.readers.into_inner().expect("lock");
-    let workers = readers
-        .iter()
-        .filter(|n| n.starts_with("lzma2-at-"))
-        .count();
-    assert!(workers >= 2, "runs were read by the workers: {readers:?}");
+    assert!(
+        workers(&readers) >= 2,
+        "runs were read by the workers: {readers:?}"
+    );
 }
 
 #[test]
