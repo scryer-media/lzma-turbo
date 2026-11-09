@@ -9,6 +9,7 @@ use crate::error::{Error, FinishMode, Status};
 use crate::lzma::{LzmaDecoder, LzmaProps};
 use crate::lzma_alone::{LZMA_ALONE_HEADER_SIZE, LzmaAloneHeader};
 use crate::lzma2::Lzma2Decoder;
+use crate::window::WindowBacking;
 
 /// Input buffer size for the adapters. Large enough that the per-call overhead
 /// of the decoder entry point disappears against the work it does.
@@ -78,12 +79,28 @@ impl<R: Read> LzmaReader<R> {
             + IN_BUF_SIZE as u64
     }
 
-    fn check_memory(props: LzmaProps, memory_limit: u64) -> io::Result<()> {
-        let required = Self::memory_required(props);
+    /// Checks the budget, counting the dictionary only when it is in RAM,
+    /// then builds the decoder: on the window's memory when the window
+    /// covers the dictionary, on its own allocation otherwise.
+    fn decoder(
+        props: LzmaProps,
+        memory_limit: u64,
+        window: Option<&WindowBacking>,
+    ) -> io::Result<LzmaDecoder> {
+        let size = props.dic_buf_size();
+        let window = window.filter(|w| w.covers(size));
+        let mut required = Self::memory_required(props);
+        if window.is_some() {
+            required -= size as u64;
+        }
         if required > memory_limit {
             return Err(to_io(Error::memory_limit(required, memory_limit)));
         }
-        Ok(())
+        match window {
+            Some(w) => LzmaDecoder::with_caller_dic(props, w.allocate(size)?),
+            None => LzmaDecoder::new(props),
+        }
+        .map_err(to_io)
     }
 
     /// Reads a 13-byte `.lzma` header from `inner` and prepares to decode the
@@ -103,7 +120,22 @@ impl<R: Read> LzmaReader<R> {
     ///
     /// # Errors
     /// Returns an error for an invalid header, an exceeded budget or allocation failure.
-    pub fn with_memory_limit(mut inner: R, memory_limit: u64) -> io::Result<Self> {
+    pub fn with_memory_limit(inner: R, memory_limit: u64) -> io::Result<Self> {
+        Self::open(inner, memory_limit, None)
+    }
+
+    /// As [`Self::with_memory_limit`], with a dictionary over the window's
+    /// in-RAM limit on the window's allocator. The dictionary then counts
+    /// nothing against `memory_limit`.
+    ///
+    /// # Errors
+    /// As [`Self::with_memory_limit`], and the allocator's error if it
+    /// cannot provide the dictionary.
+    pub fn with_window(inner: R, memory_limit: u64, window: WindowBacking) -> io::Result<Self> {
+        Self::open(inner, memory_limit, Some(&window))
+    }
+
+    fn open(mut inner: R, memory_limit: u64, window: Option<&WindowBacking>) -> io::Result<Self> {
         let mut header = [0u8; LZMA_ALONE_HEADER_SIZE];
         // The source ending inside the header is a truncated stream; an error
         // the source raises is its own, whatever its kind.
@@ -117,11 +149,10 @@ impl<R: Read> LzmaReader<R> {
             }
         }
         let header = LzmaAloneHeader::parse(&header).map_err(to_io)?;
-        Self::check_memory(header.props, memory_limit)?;
-        let src = Source::new(inner);
+        let dec = Self::decoder(header.props, memory_limit, window)?;
         Ok(LzmaReader {
-            src,
-            dec: LzmaDecoder::new(header.props).map_err(to_io)?,
+            src: Source::new(inner),
+            dec,
             remaining: header.uncompressed_size,
             size_reached: header.uncompressed_size == Some(0),
             done: false,
@@ -155,10 +186,37 @@ impl<R: Read> LzmaReader<R> {
         uncompressed_size: Option<u64>,
         memory_limit: u64,
     ) -> io::Result<Self> {
-        Self::check_memory(props, memory_limit)?;
+        Self::with_props_in(inner, props, uncompressed_size, memory_limit, None)
+    }
+
+    /// As [`Self::with_props_and_memory_limit`], with a dictionary over the
+    /// window's in-RAM limit on the window's allocator. The dictionary then
+    /// counts nothing against `memory_limit`.
+    ///
+    /// # Errors
+    /// As [`Self::with_props_and_memory_limit`], and the allocator's error if
+    /// it cannot provide the dictionary.
+    pub fn with_props_and_window(
+        inner: R,
+        props: LzmaProps,
+        uncompressed_size: Option<u64>,
+        memory_limit: u64,
+        window: WindowBacking,
+    ) -> io::Result<Self> {
+        Self::with_props_in(inner, props, uncompressed_size, memory_limit, Some(&window))
+    }
+
+    fn with_props_in(
+        inner: R,
+        props: LzmaProps,
+        uncompressed_size: Option<u64>,
+        memory_limit: u64,
+        window: Option<&WindowBacking>,
+    ) -> io::Result<Self> {
+        let dec = Self::decoder(props, memory_limit, window)?;
         Ok(LzmaReader {
             src: Source::new(inner),
-            dec: LzmaDecoder::new(props).map_err(to_io)?,
+            dec,
             remaining: uncompressed_size,
             size_reached: uncompressed_size == Some(0),
             done: false,
@@ -317,13 +375,49 @@ impl<R: Read> Lzma2Reader<R> {
     /// # Errors
     /// Returns an error for invalid properties, an exceeded budget or allocation failure.
     pub fn with_memory_limit(inner: R, dict_prop: u8, memory_limit: u64) -> io::Result<Self> {
-        let required = Self::memory_required(dict_prop)?;
+        Self::open(inner, dict_prop, memory_limit, None)
+    }
+
+    /// As [`Self::with_memory_limit`], with a dictionary over the window's
+    /// in-RAM limit on the window's allocator. The dictionary then counts
+    /// nothing against `memory_limit`.
+    ///
+    /// # Errors
+    /// As [`Self::with_memory_limit`], and the allocator's error if it
+    /// cannot provide the dictionary.
+    pub fn with_window(
+        inner: R,
+        dict_prop: u8,
+        memory_limit: u64,
+        window: WindowBacking,
+    ) -> io::Result<Self> {
+        Self::open(inner, dict_prop, memory_limit, Some(&window))
+    }
+
+    fn open(
+        inner: R,
+        dict_prop: u8,
+        memory_limit: u64,
+        window: Option<&WindowBacking>,
+    ) -> io::Result<Self> {
+        let mut required = Self::memory_required(dict_prop)?;
+        let prop = Lzma2Decoder::capped_props(dict_prop, u32::MAX).map_err(to_io)?;
+        let size = prop.dic_buf_size();
+        let window = window.filter(|w| w.covers(size));
+        if window.is_some() {
+            required -= size as u64;
+        }
         if required > memory_limit {
             return Err(to_io(Error::memory_limit(required, memory_limit)));
         }
+        let dec = match window {
+            Some(w) => Lzma2Decoder::with_caller_dic(prop, w.allocate(size)?),
+            None => Lzma2Decoder::new(dict_prop),
+        }
+        .map_err(to_io)?;
         Ok(Lzma2Reader {
             src: Source::new(inner),
-            dec: Lzma2Decoder::new(dict_prop).map_err(to_io)?,
+            dec,
             done: false,
         })
     }

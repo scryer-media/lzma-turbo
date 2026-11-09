@@ -709,6 +709,7 @@ jobs:
         lzma2::scan::tests::
         reader::borrowed_read_tests::
         reader::limit_tests::
+        window::tests::
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

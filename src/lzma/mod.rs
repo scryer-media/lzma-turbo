@@ -46,7 +46,7 @@ fn lzma_dec_write_rem(p: &mut LzmaDec, limit: usize) {
         p.remain_len -= len;
         let dic_buf_size = p.dic_buf_size;
         let rep0 = p.reps[0] as usize;
-        let dic = &mut p.dic;
+        let dic: &mut [u8] = &mut p.dic;
         loop {
             dic[dic_pos] = dic[dic_pos.wrapping_sub(rep0).wrapping_add(if dic_pos < rep0 {
                 dic_buf_size
@@ -381,6 +381,18 @@ impl LzmaDecoder {
     pub fn new(props: LzmaProps) -> Result<Self, Error> {
         Ok(LzmaDecoder {
             p: LzmaDec::new(props)?,
+        })
+    }
+
+    /// As [`LzmaDecoder::new`], with the dictionary on caller memory of
+    /// exactly `props.dic_buf_size()` bytes.
+    #[cfg(feature = "std")]
+    pub(crate) fn with_caller_dic(
+        props: LzmaProps,
+        dic: crate::window::CallerWindow,
+    ) -> Result<Self, Error> {
+        Ok(LzmaDecoder {
+            p: LzmaDec::with_caller_dic(props, dic)?,
         })
     }
 

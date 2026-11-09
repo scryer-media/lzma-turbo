@@ -33,6 +33,72 @@ pub(crate) fn zeroed_vec<T: Zeroable>(len: usize) -> Result<Vec<T>, Error> {
     Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
 }
 
+/// The decoder's dictionary: its own zeroed allocation, or memory a caller
+/// lent it through [`crate::window::WindowAllocator`].
+///
+/// Either way it is used through the same two shapes the decoder always
+/// used: a raw base pointer for the fast loops, and a byte slice for the
+/// rest.
+pub(crate) enum DicBuf {
+    Owned(Vec<u8>),
+    #[cfg(feature = "std")]
+    Caller(crate::window::CallerWindow),
+}
+
+impl Default for DicBuf {
+    fn default() -> Self {
+        DicBuf::Owned(Vec::new())
+    }
+}
+
+impl DicBuf {
+    /// The base pointer the decode loops index from. `Vec::as_mut_ptr`
+    /// rather than a slice's, so no reference is made on the way.
+    #[inline(always)]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            DicBuf::Owned(v) => v.as_mut_ptr(),
+            #[cfg(feature = "std")]
+            DicBuf::Caller(c) => c.as_mut_ptr(),
+        }
+    }
+
+    /// Gives back an owned buffer, leaving an empty one. Caller memory is
+    /// released and an empty `Vec` returned in its place: only the threaded
+    /// decoders hand buffers back, and they never run on caller memory.
+    #[cfg(feature = "std")]
+    pub(crate) fn take_vec(&mut self) -> Vec<u8> {
+        match core::mem::take(self) {
+            DicBuf::Owned(v) => v,
+            DicBuf::Caller(_) => Vec::new(),
+        }
+    }
+}
+
+impl core::ops::Deref for DicBuf {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        match self {
+            DicBuf::Owned(v) => v,
+            #[cfg(feature = "std")]
+            DicBuf::Caller(c) => c.as_slice(),
+        }
+    }
+}
+
+impl core::ops::DerefMut for DicBuf {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            DicBuf::Owned(v) => v,
+            #[cfg(feature = "std")]
+            DicBuf::Caller(c) => c.as_mut_slice(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A zeroed allocation of every [`super::Zeroable`] type is the length

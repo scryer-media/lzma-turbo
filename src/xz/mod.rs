@@ -133,6 +133,13 @@ pub struct XzOptions {
     /// and a failed check is reported at the block's end. Ignored by
     /// [`XzReader`], which always works that way.
     pub verified_output: bool,
+    /// Caller memory for a block dictionary over the backing's in-RAM limit.
+    /// [`XzReader`] puts such a dictionary on the backing's allocator, where
+    /// it counts nothing against [`XzOptions::memory_limit`].
+    /// [`XzParallelReader`] decodes a file with such a block on one thread,
+    /// as [`XzReader`] does, unless [`XzOptions::verified_output`] is set, in
+    /// which case it ignores the backing. [`XzAdaptiveDecoder`] ignores it.
+    pub window: Option<crate::WindowBacking>,
 }
 
 impl Default for XzOptions {
@@ -147,6 +154,7 @@ impl Default for XzOptions {
             concatenated: true,
             plan: ChecksumPlan::none(),
             verified_output: false,
+            window: None,
         }
     }
 }
@@ -191,6 +199,13 @@ impl XzOptions {
     #[must_use]
     pub fn with_plan(mut self, plan: ChecksumPlan) -> Self {
         self.plan = plan;
+        self
+    }
+
+    /// Sets [`XzOptions::window`].
+    #[must_use]
+    pub fn with_window(mut self, window: crate::WindowBacking) -> Self {
+        self.window = Some(window);
         self
     }
 

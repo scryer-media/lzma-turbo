@@ -162,7 +162,17 @@ impl<R: Read + Seek> XzParallelReader<R> {
         // until its check passes is the caller's to ask for. A dictionary
         // bigger than the held block keeps the hold, so one thread never
         // costs more than one worker and the estimate grows with threads.
-        let serial = if threads == 1 && !opts.verified_output {
+        //
+        // A block dictionary over the window's in-RAM limit goes on the
+        // window's memory, which only that serial decode uses, so a file with
+        // one decodes on one thread whatever the thread count.
+        let windowed = match &opts.window {
+            Some(window) if !opts.verified_output => windowed_cost(&mut src, &blocks, window),
+            _ => None,
+        };
+        let serial = if windowed.is_some() {
+            windowed
+        } else if threads == 1 && !opts.verified_output {
             serial_cost(&mut src, &blocks, per_worker)
         } else {
             None
@@ -543,6 +553,38 @@ fn serial_cost<R: Read + Seek>(src: &mut R, blocks: &[Plan], cap: u64) -> Option
         }
     }
     Some(dict + fixed)
+}
+
+/// What a serial decode on `window` costs in RAM, if any block's dictionary
+/// goes on the window's memory: the input buffer, the probability table and
+/// the largest dictionary that stays in RAM. `None` when no block's
+/// dictionary is over the window's in-RAM limit, or a block header cannot be
+/// read here; the decode then plans as it would without a window, and a bad
+/// header fails where it always does.
+fn windowed_cost<R: Read + Seek>(
+    src: &mut R,
+    blocks: &[Plan],
+    window: &crate::WindowBacking,
+) -> Option<u64> {
+    let mut in_ram = 0u64;
+    let mut covered = false;
+    let mut header = [0u8; MAX_BLOCK_HEADER_SIZE];
+    for plan in blocks {
+        src.seek(SeekFrom::Start(plan.file_offset)).ok()?;
+        src.read_exact(&mut header[..1]).ok()?;
+        let size = header_size_from_first_byte(header[0])?;
+        src.read_exact(&mut header[1..size]).ok()?;
+        let parsed = BlockHeader::parse(&header[..size]).ok()?;
+        let dict = super::blockdec::dict_bytes(parsed.chain.dict_prop, parsed.uncompressed_size);
+        let cap = u32::try_from(dict).unwrap_or(u32::MAX);
+        let prop = crate::Lzma2Decoder::capped_props(parsed.chain.dict_prop, cap).ok()?;
+        if window.covers(prop.dic_buf_size()) {
+            covered = true;
+        } else {
+            in_ram = in_ram.max(dict);
+        }
+    }
+    covered.then(|| in_ram + super::reader::BUF as u64 + PROBS_BYTES)
 }
 
 /// Turns the indexes into the block list, checking the caller's caps against

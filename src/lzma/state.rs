@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 
+use crate::buffer::DicBuf;
 use crate::error::Error;
 use crate::lzma::consts::*;
 
@@ -126,7 +127,7 @@ impl LzmaProps {
 pub(crate) struct LzmaDec {
     pub(crate) prop: LzmaProps,
     pub(crate) probs: Vec<u16>,
-    pub(crate) dic: Vec<u8>,
+    pub(crate) dic: DicBuf,
     pub(crate) dic_buf_size: usize,
     pub(crate) dic_pos: usize,
     pub(crate) range: u32,
@@ -161,7 +162,26 @@ impl LzmaDec {
         Self::alloc(prop, 0)
     }
 
+    /// As [`LzmaDec::new`], with the dictionary on memory the caller lent
+    /// through a [`crate::WindowAllocator`] instead of a zeroed allocation.
+    /// `dic` holds exactly `prop.dic_buf_size()` bytes, in any state: no byte
+    /// of it is read before the decoder has written it.
+    #[cfg(feature = "std")]
+    pub(crate) fn with_caller_dic(
+        prop: LzmaProps,
+        dic: crate::window::CallerWindow,
+    ) -> Result<Self, Error> {
+        debug_assert_eq!(dic.as_slice().len(), prop.dic_buf_size());
+        Self::with_dic(prop, DicBuf::Caller(dic))
+    }
+
     fn alloc(prop: LzmaProps, dic_buf_size: usize) -> Result<Self, Error> {
+        let dic = DicBuf::Owned(crate::buffer::zeroed_vec(dic_buf_size)?);
+        Self::with_dic(prop, dic)
+    }
+
+    fn with_dic(prop: LzmaProps, dic: DicBuf) -> Result<Self, Error> {
+        let dic_buf_size = dic.len();
         let num_probs = lzma_props_get_num_probs(prop.lc, prop.lp);
 
         let mut probs = Vec::new();
@@ -169,8 +189,6 @@ impl LzmaDec {
             .try_reserve_exact(num_probs)
             .map_err(|_| Error::Alloc)?;
         probs.resize(num_probs, 0);
-
-        let dic = crate::buffer::zeroed_vec(dic_buf_size)?;
 
         let mut p = LzmaDec {
             prop,

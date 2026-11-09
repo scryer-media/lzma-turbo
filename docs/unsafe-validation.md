@@ -66,6 +66,13 @@ updates its entry in the same commit; a new surface lands with one.
   common allocator in every feature set, native and Miri. `decoder_dictionary_allocation_failure_is_recoverable` checks both
   decoder constructors under allocation refusal natively. Huge-page advice
   remains encoder-only; the decoder allocation uses only `core` and `alloc`.
+- Caller-lent dictionaries in `src/window.rs` and `DicBuf` in
+  `src/buffer.rs`: the slice views over a `WindowMemory`'s pointer and the
+  `Send`/`Sync` impls of `CallerWindow`. The `window::tests::` cases decode
+  raw LZMA and LZMA2 on heap windows filled with non-zero garbage and
+  compare with owned dictionaries, natively and in the Miri kernel job;
+  `tests/window.rs` does the same for the xz readers natively. The decode
+  loops receive the same base pointer shape as with a `Vec`.
 - Shared finder storage and borrowed direct-input lifetime/ownership in
   `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
   `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,

@@ -533,6 +533,8 @@ impl XzAdaptiveDecoder {
             &self.opts.plan,
             self.opts.verify_checks,
             limits,
+            // The adaptive decoder keeps every dictionary in RAM.
+            None,
         )
         .map_err(|k| self.err(k))?;
         self.st = Some(dec);
