@@ -101,6 +101,7 @@ fn main() {
     let mut shot_encode = false;
     let mut shot_verify = false;
     let mut shot_memory_limit = u64::MAX;
+    let mut shot_out: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -145,6 +146,11 @@ fn main() {
                 };
             }
             "--verify" => shot_verify = true,
+            "--out" => {
+                shot_out = Some(PathBuf::from(
+                    args.next().unwrap_or_else(|| fail("--out needs a file")),
+                ));
+            }
             "--memory-limit" => {
                 shot_memory_limit = args
                     .next()
@@ -191,6 +197,7 @@ fn main() {
             encode: shot_encode,
             verify: shot_verify,
             memory_limit: shot_memory_limit,
+            out: shot_out,
         };
         std::process::exit(shot::run(&shot, files.first().map(PathBuf::as_path)));
     }

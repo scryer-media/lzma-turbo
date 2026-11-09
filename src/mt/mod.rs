@@ -16,6 +16,8 @@
 //! the LZMA2-specific half plus the public API and the single-threaded tail.
 
 pub mod adaptive;
+mod at;
+pub use at::ReadAt;
 #[cfg(feature = "crc")]
 pub mod checksum;
 pub(crate) mod event;

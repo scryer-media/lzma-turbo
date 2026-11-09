@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.0 - 2026-11-09
+
+- Added `Lzma2ParallelDecoder::decode_at` and the `ReadAt` trait, for an LZMA2
+  stream at a known offset in a source that can be read at any position (a
+  file, a byte slice). Each worker reads its own run, found from the chunk
+  headers, so no thread reads the stream for the others. `decode` reads every
+  block in turn on one thread before the next block can start, and on a
+  multi-block 7z archive that serial read was the longest stage of the decode.
+  The output matches `decode` over the same stream. On a damaged stream it
+  fails with `decode`'s error, having written every run before the damage,
+  which can be more than `decode` writes. A stream it cannot split into runs,
+  or that does not fit the memory limit, goes through `decode` from where the
+  split stopped.
+- `Lzma2ParallelDecoder` allocates its input buffers already zeroed rather than
+  zeroing them afterwards, which takes a pass over every buffer off that serial
+  read stage.
+
 ## 0.10.3 - 2026-11-08
 
 - `XzParallelReader` returns its error again on every read after a
