@@ -16,7 +16,7 @@ library in the default build is AWS-LC, for SHA-256 checks; the
 
 ```toml
 [dependencies]
-lzma-turbo = "0.10"
+lzma-turbo = "0.11"
 ```
 
 ## Reading an `.xz` file
@@ -142,7 +142,7 @@ in [docs/security.md](docs/security.md).
 A build without a C compiler takes
 
 ```toml
-lzma-turbo = { version = "0.10", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
+lzma-turbo = { version = "0.11", default-features = false, features = ["std", "asm", "crc", "native-crypto"] }
 ```
 
 and is pure Rust. The LZMA and LZMA2 decoder itself uses no dependency at
@@ -161,7 +161,7 @@ WebAssembly. The API does not change, and on a native target the two
 features do nothing.
 
 ```toml
-lzma-turbo = { version = "0.10", default-features = false, features = [
+lzma-turbo = { version = "0.11", default-features = false, features = [
     "std", "asm", "crc-host", "crypto-host", "xz",
 ] }
 ```

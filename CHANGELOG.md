@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.4 - Unreleased
+## 0.11.0 - 2026-11-09
 
 - A caller can put a large dictionary on memory of its own, a mapped
   scratch file for example, instead of RAM. A `WindowAllocator` hands out
