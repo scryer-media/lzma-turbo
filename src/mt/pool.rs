@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 
+use crate::buffer::DicBuf;
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
 use crate::mt::segq::Seg;
@@ -42,8 +43,13 @@ pub(crate) struct Job {
     /// not included. They are references to the pieces of input the run spans,
     /// not a copy of them, so dispatching a run moves no bytes.
     pub(crate) packed: Vec<Seg>,
-    /// A buffer to decode into, recycled from a previous block.
-    pub(crate) out: Vec<u8>,
+    /// A buffer to decode into, recycled from a previous block: owned, or a
+    /// window lent for an earlier run.
+    pub(crate) out: DicBuf,
+    /// Where the worker gets a window for a run whose output is over the
+    /// backing's in-RAM limit and that came with no window big enough.
+    /// `None` when the output is in RAM.
+    pub(crate) window: Option<crate::WindowBacking>,
     /// What the dispatcher charged its memory accounting for this job: the two
     /// buffers above, as they were when they left. Carried by the job and
     /// handed back untouched so that what comes off the running total is
@@ -63,7 +69,7 @@ pub(crate) struct Done {
     /// The decoded block, or why it could not be decoded. Either way the
     /// buffer comes back so it can be used again.
     pub(crate) res: Result<(), Error>,
-    pub(crate) out: Vec<u8>,
+    pub(crate) out: DicBuf,
     /// The job's references to its input, returned so that the last of them
     /// is dropped where the queue can see it and give the memory back.
     pub(crate) packed: Vec<Seg>,
@@ -284,7 +290,7 @@ fn worker(
             Err(_) => {
                 // The buffer is in the old decoder or still in the job; it
                 // goes back either way.
-                let salvaged = dec.take_block_dic();
+                let salvaged = dec.take_block_buf();
                 if job.out.capacity() == 0 {
                     job.out = salvaged;
                 }
@@ -322,7 +328,7 @@ fn worker(
 
         // A run refused before its buffer reached the decoder left it in the
         // job.
-        let mut out = dec.take_block_dic();
+        let mut out = dec.take_block_buf();
         if out.capacity() == 0 {
             out = core::mem::take(&mut job.out);
         }
@@ -354,16 +360,31 @@ fn worker(
 fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
     let want = job.unpacked_len;
 
+    // A run over the backing's in-RAM limit is decoded into a window: the
+    // one it came with, or one asked for here, on the worker, as the xz
+    // pool asks for a block's. The dispatcher sends a window only when it is
+    // big enough, so a window is asked for only when the job has none.
+    if job.out.len() < want && job.window.as_ref().is_some_and(|w| w.covers(want)) {
+        // Released before the allocator is asked: a worker holds one window.
+        job.out = DicBuf::default();
+        if let Some(mem) = crate::window::lend(job.window.as_ref(), want)
+            .map_err(crate::window::Refusal::into_error)?
+        {
+            job.out = DicBuf::Caller(mem);
+        }
+    }
     // The buffer is grown, never shrunk and never re-zeroed: `dicBufSize` says
     // how much of it this run uses, so a stream of unequal runs does not pay
     // to clear the whole thing every time.
     // A refused reservation leaves the buffer in the job, to go back.
-    if job.out.len() < want {
-        let more = want - job.out.len();
-        job.out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
-        job.out.resize(want, 0u8);
+    if let DicBuf::Owned(out) = &mut job.out
+        && out.len() < want
+    {
+        let more = want - out.len();
+        out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
+        out.resize(want, 0u8);
     }
-    dec.set_block_dic(core::mem::take(&mut job.out), want);
+    dec.set_block_buf(core::mem::take(&mut job.out), want);
 
     // The run arrives as the pieces of input it spans, and it is decoded a
     // piece at a time. The block decoder keeps its state between calls, so
@@ -459,7 +480,8 @@ mod tests {
             out_offset: 0,
             unpacked_len: 0,
             packed: alloc::vec::Vec::new(),
-            out: alloc::vec::Vec::new(),
+            out: crate::buffer::DicBuf::default(),
+            window: None,
             held: 0,
             #[cfg(feature = "crc")]
             plan: crate::mt::checksum::ChecksumPlan::none(),
@@ -481,7 +503,8 @@ mod tests {
             out_offset: 0,
             unpacked_len: usize::MAX,
             packed: alloc::vec::Vec::new(),
-            out,
+            out: crate::buffer::DicBuf::Owned(out),
+            window: None,
             held: 0,
             #[cfg(feature = "crc")]
             plan: crate::mt::checksum::ChecksumPlan::none(),

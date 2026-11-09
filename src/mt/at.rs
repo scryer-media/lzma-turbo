@@ -26,6 +26,7 @@ use std::sync::{Condvar, Mutex};
 
 use super::Lzma2ParallelDecoder;
 use super::mtdec::alloc_buf;
+use crate::buffer::DicBuf;
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
 use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner};
@@ -138,12 +139,15 @@ struct Feed {
     next_index: usize,
     /// A hand-over has been issued; nothing more is claimed after it.
     closed: bool,
-    /// What one run may cost: its packed and unpacked bytes together.
+    /// What one run may cost in RAM: its packed and unpacked bytes
+    /// together, or only its packed bytes when its output is lent.
     budget: u64,
+    /// Where a run's output over the in-RAM limit is lent from.
+    window: Option<crate::WindowBacking>,
 }
 
 impl Feed {
-    fn new(start: u64, end: u64, budget: u64) -> Self {
+    fn new(start: u64, end: u64, budget: u64, window: Option<crate::WindowBacking>) -> Self {
         Feed {
             scanner: Lzma2RunScanner::new(),
             start,
@@ -153,6 +157,27 @@ impl Feed {
             next_index: 0,
             closed: false,
             budget,
+            window,
+        }
+    }
+
+    /// Whether `run` can be decoded here: what it holds in RAM is within
+    /// the budget, and a lent output is within the backing's ceiling. One
+    /// that is not is handed to the stream decoder, which needs no more than
+    /// the dictionary for it.
+    fn fits(&self, run: &Lzma2Run) -> bool {
+        let lent = usize::try_from(run.unpacked_len).ok().and_then(|len| {
+            self.window
+                .as_ref()
+                .filter(|w| w.covers(len))
+                .map(|w| w.admits(len))
+        });
+        match lent {
+            Some(admitted) => admitted && run.packed_len <= self.budget,
+            None => run
+                .packed_len
+                .checked_add(run.unpacked_len)
+                .is_some_and(|b| b <= self.budget),
         }
     }
 
@@ -167,11 +192,7 @@ impl Feed {
             if let Some(r) = self.scanner.next_run() {
                 let begins = self.start + r.in_offset;
                 self.next_start = begins + r.packed_len;
-                let fits = r
-                    .packed_len
-                    .checked_add(r.unpacked_len)
-                    .is_some_and(|b| b <= self.budget);
-                if r.has_dict_reset && fits {
+                if r.has_dict_reset && self.fits(&r) {
                     break Claim::Run(r);
                 }
                 break Claim::HandOver(begins);
@@ -224,22 +245,80 @@ impl Feed {
     }
 }
 
-/// Decodes one whole run, `packed`, into a buffer of exactly what its headers
-/// promise.
+/// Decodes one whole run, `packed`, into `buf`, the first `want` bytes of
+/// which are what its headers promise.
 ///
 /// The same checks as the pool's run decoder: the run must be consumed
 /// exactly and produce exactly its declared length, or it is corrupt.
-fn decode_one(dec: &mut Lzma2Decoder, run: &Lzma2Run, packed: &[u8]) -> Result<Vec<u8>, Error> {
-    let want = usize::try_from(run.unpacked_len).map_err(|_| Error::Alloc)?;
-    dec.set_block_dic(alloc_buf(want)?.into_vec(), want);
+fn decode_one(
+    dec: &mut Lzma2Decoder,
+    buf: DicBuf,
+    want: usize,
+    packed: &[u8],
+) -> Result<DicBuf, Error> {
+    dec.set_block_buf(buf, want);
     let res = dec.decode_block(want, packed, FinishMode::End);
     let produced = dec.dic_pos();
-    let out = dec.take_block_dic();
+    let out = dec.take_block_buf();
     let (used, _) = res?;
     if used != packed.len() || produced != want {
         return Err(Error::CorruptData);
     }
     Ok(out)
+}
+
+/// Lent run buffers whose runs have been written, for the next runs.
+///
+/// A buffer is put here only once its run is out, and taken or released
+/// before a worker asks the allocator, so the windows alive - in flight or
+/// here - never number more than the runs in flight, which is at most the
+/// worker count.
+struct Spare(Mutex<Vec<DicBuf>>);
+
+impl Spare {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<DicBuf>> {
+        match self.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+
+    /// The output buffer for a run of `want` bytes: owned below the
+    /// backing's in-RAM limit, exactly as with no backing; above it a
+    /// written run's window when one is big enough, or a new one. A window
+    /// too small is released before a new one is asked for.
+    fn take(
+        &self,
+        window: Option<&crate::WindowBacking>,
+        want: usize,
+    ) -> Result<DicBuf, crate::window::Refusal> {
+        if !window.is_some_and(|w| w.covers(want)) {
+            return Ok(DicBuf::Owned(Vec::new()));
+        }
+        if let Some(buf) = self.lock().pop()
+            && buf.len() >= want
+        {
+            return Ok(buf);
+        }
+        Ok(crate::window::lend(window, want)?.map_or_else(DicBuf::default, DicBuf::Caller))
+    }
+
+    /// Keeps a written run's window; an owned buffer is released.
+    fn give(&self, buf: DicBuf) {
+        if buf.is_lent() {
+            self.lock().push(buf);
+        }
+    }
+}
+
+/// Why a worker produced no run.
+enum Missed {
+    /// The stream is to be handed to [`Lzma2ParallelDecoder::decode`] from
+    /// this offset.
+    HandOver(u64),
+    /// The backing could not lend the run's output: the decode fails here,
+    /// after every run before it has been written.
+    Window(io::Error),
 }
 
 /// Where the workers and the writer meet: how many runs have been written,
@@ -337,14 +416,21 @@ impl Lzma2ParallelDecoder {
             return rest(offset, &mut out);
         }
 
-        let feed = Mutex::new(Feed::new(offset, end, self.plan.per_thread));
+        let feed = Mutex::new(Feed::new(
+            offset,
+            end,
+            self.plan.per_thread,
+            self.window.clone(),
+        ));
+        let spares = Spare(Mutex::new(Vec::new()));
+        let lend = self.window.as_ref();
         let window = Window {
             state: Mutex::new((0, false)),
             moved: Condvar::new(),
         };
-        // A decoded run and where the stream continues after it, or the
-        // offset to hand the stream over from.
-        type Msg = (usize, Result<(Vec<u8>, u64), u64>);
+        // A decoded run, its length and where the stream continues after
+        // it, or why there is none.
+        type Msg = (usize, Result<(DicBuf, usize, u64), Missed>);
         let (tx, rx) = channel::<Msg>();
 
         let mut written = 0u64;
@@ -352,6 +438,7 @@ impl Lzma2ParallelDecoder {
         let mut resume = offset;
         let mut hand_over: Option<u64> = None;
         let mut write_err: Option<io::Error> = None;
+        let spare = &spares;
 
         std::thread::scope(|scope| {
             for w in 0..workers {
@@ -374,19 +461,33 @@ impl Lzma2ParallelDecoder {
                                 return;
                             }
                             let msg = match claim {
-                                Claim::HandOver(at) => Err(at),
+                                Claim::HandOver(at) => Err(Missed::HandOver(at)),
                                 Claim::Run(run) => {
                                     let begins = offset + run.in_offset;
-                                    usize::try_from(run.packed_len)
-                                        .map_err(|_| Error::Alloc)
-                                        .and_then(alloc_buf)
-                                        .and_then(|mut packed| {
-                                            read_exact_at(source, &mut packed, begins)
-                                                .map_err(|_| Error::Read)?;
-                                            decode_one(&mut dec, &run, &packed)
-                                        })
-                                        .map(|buf| (buf, begins + run.packed_len))
-                                        .map_err(|_| begins)
+                                    let next = begins + run.packed_len;
+                                    match usize::try_from(run.unpacked_len) {
+                                        Err(_) => Err(Missed::HandOver(begins)),
+                                        Ok(want) => match spare.take(lend, want) {
+                                            Err(r) => Err(Missed::Window(r.into())),
+                                            Ok(buf) => usize::try_from(run.packed_len)
+                                                .map_err(|_| Error::Alloc)
+                                                .and_then(alloc_buf)
+                                                .and_then(|mut packed| {
+                                                    read_exact_at(source, &mut packed, begins)
+                                                        .map_err(|_| Error::Read)?;
+                                                    // Owned output is allocated
+                                                    // after the input, as before.
+                                                    let buf = if buf.is_lent() {
+                                                        buf
+                                                    } else {
+                                                        DicBuf::Owned(alloc_buf(want)?.into_vec())
+                                                    };
+                                                    decode_one(&mut dec, buf, want, &packed)
+                                                })
+                                                .map(|buf| (buf, want, next))
+                                                .map_err(|_| Missed::HandOver(begins)),
+                                        },
+                                    }
                                 }
                             };
                             if tx.send((i, msg)).is_err() {
@@ -407,18 +508,25 @@ impl Lzma2ParallelDecoder {
                 pending.insert(i, msg);
                 while let Some(msg) = pending.remove(&done) {
                     match msg {
-                        Ok((buf, next)) => {
-                            if let Err(e) = out.write_all(&buf) {
+                        Ok((buf, len, next)) => {
+                            if let Err(e) = out.write_all(&buf[..len]) {
                                 write_err = Some(e);
                                 break 'recv;
                             }
-                            written += buf.len() as u64;
+                            // Released, or kept for the next run, before the
+                            // next run is admitted.
+                            spare.give(buf);
+                            written += len as u64;
                             resume = next;
                             done += 1;
                             window.written(done);
                         }
-                        Err(at) => {
+                        Err(Missed::HandOver(at)) => {
                             hand_over = Some(at);
+                            break 'recv;
+                        }
+                        Err(Missed::Window(e)) => {
+                            write_err = Some(e);
                             break 'recv;
                         }
                     }
@@ -426,6 +534,9 @@ impl Lzma2ParallelDecoder {
             }
             window.stop();
         });
+        // Every worker has stopped; the kept windows go back before the
+        // stream decoder, which asks for its own, takes over.
+        drop(spares);
 
         if let Some(e) = write_err {
             return Err(e);

@@ -262,6 +262,23 @@ pub enum Error {
     /// own error stays with the stream's owner, which is where a
     /// `SeqOutStream` keeps it. `io::ErrorKind::Other`.
     Write,
+    /// A [`crate::WindowBacking`]'s allocator could not provide a dictionary
+    /// a threaded LZMA2 decoder asked of it. Carries the size asked for and
+    /// the class of the allocator's error, which is also this failure's
+    /// `io::ErrorKind`.
+    ///
+    /// Only [`crate::Lzma2AdaptiveDecoder`] reports a refusal this way, as
+    /// its errors are this type. The other decoders fail with the
+    /// allocator's own `io::Error`, as [`crate::Lzma2Reader::with_window`]
+    /// does.
+    #[cfg(feature = "std")]
+    #[non_exhaustive]
+    WindowAlloc {
+        /// Bytes asked of the allocator.
+        needed: u64,
+        /// The `io::ErrorKind` of the allocator's error.
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl Error {
@@ -276,6 +293,14 @@ impl Error {
     #[must_use]
     pub const fn memory_limit(needed: u64, limit: u64) -> Self {
         Error::MemoryLimit { needed, limit }
+    }
+
+    /// [`Error::WindowAlloc`]: the allocator refused `needed` bytes with an
+    /// error of class `kind`.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub const fn window_alloc(needed: u64, kind: std::io::ErrorKind) -> Self {
+        Error::WindowAlloc { needed, kind }
     }
 
     /// Whether the input is at fault: [`Error::CorruptData`],
@@ -298,6 +323,7 @@ impl Error {
             Error::Truncated => ErrorKind::UnexpectedEof,
             Error::Alloc | Error::MemoryLimit { .. } => ErrorKind::OutOfMemory,
             Error::Param => ErrorKind::InvalidInput,
+            Error::WindowAlloc { kind, .. } => *kind,
             Error::Cancelled | Error::InternalFailure | Error::Read | Error::Write => {
                 ErrorKind::Other
             }
@@ -329,6 +355,13 @@ impl fmt::Display for Error {
             Error::Param => "invalid LZMA coder argument",
             Error::Read => "LZMA encoder input stream failed",
             Error::Write => "LZMA encoder output stream failed",
+            #[cfg(feature = "std")]
+            Error::WindowAlloc { needed, kind } => {
+                return write!(
+                    f,
+                    "window allocator could not provide a {needed}-byte dictionary: {kind}"
+                );
+            }
         };
         f.write_str(s)
     }

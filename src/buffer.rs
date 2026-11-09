@@ -73,8 +73,28 @@ impl DicBuf {
         }
     }
 
+    /// The bytes this buffer holds: an owned buffer's capacity, which may be
+    /// more than its length, or the length of caller memory.
+    #[cfg(feature = "std")]
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            DicBuf::Owned(v) => v.capacity(),
+            DicBuf::Caller(c) => c.as_slice().len(),
+        }
+    }
+
+    /// The bytes of RAM this buffer holds: an owned buffer's capacity, and
+    /// nothing for caller memory, which no memory limit counts.
+    #[cfg(feature = "std")]
+    pub(crate) fn ram(&self) -> u64 {
+        match self {
+            DicBuf::Owned(v) => v.capacity() as u64,
+            DicBuf::Caller(_) => 0,
+        }
+    }
+
     /// Whether this is memory a caller lent.
-    #[cfg(all(feature = "std", feature = "xz"))]
+    #[cfg(feature = "std")]
     pub(crate) fn is_lent(&self) -> bool {
         matches!(self, DicBuf::Caller(_))
     }

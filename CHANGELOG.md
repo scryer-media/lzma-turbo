@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.12.0 - Unreleased
+
+- The threaded raw LZMA2 decoders take a `WindowBacking` too, so a stream
+  whose buffers are over the in-RAM limit decodes on caller memory at the
+  thread count the caller set: `Lzma2ParallelDecoder::with_window` (for both
+  `decode` and `decode_at`), `Lzma2ParallelReader::with_window` and
+  `with_checksums_and_window`, `Lzma2AdaptiveDecoder::with_window`, and the
+  positional `run::Lzma2RunDecoder::with_window`. Each worker asks the
+  allocator for one buffer over the limit and keeps it for its next block or
+  run; it goes back when the worker retires or the decoder drops.
+  `max_windows()` says how many can be alive at once: the thread count, one
+  more for the adaptive decoder's chase, and one for a run decoder. The
+  limit and the ceiling apply to each worker's buffer, which holds a block or
+  a run rather than only the dictionary; a buffer over the ceiling is never
+  asked for, and its block or run decodes on the single-threaded path, whose
+  buffer is the dictionary alone. Lent buffers count nothing against the
+  memory limit: `memory_estimate`, `Lzma2RunDecoder::memory_required_with_window`
+  and the adaptive decoder's `dispatch_cost` count only what stays in RAM,
+  so a limit that left one thread in RAM can keep more. An allocator failure
+  fails the decode with its `io::ErrorKind`, as the new
+  `Error::WindowAlloc` from the adaptive and run decoders, and is never
+  retried on fewer threads or in RAM. With no backing nothing changes.
+- `Lzma2Decoder::window_len`, `Lzma2Decoder::capped_window_len` and
+  `LzmaProps::window_len` give the dictionary size a decoder allocates, the
+  length a `WindowAllocator` is asked for.
+- Breaking: `Lzma2ParallelDecoder` is no longer `Copy`, since it can hold a
+  `WindowBacking`. It is still `Clone`.
+
 ## 0.11.0 - 2026-11-09
 
 - A caller can put a large dictionary on memory of its own, a mapped

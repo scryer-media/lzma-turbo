@@ -75,7 +75,15 @@ updates its entry in the same commit; a new surface lands with one.
   before any slice is built. `tests/window.rs` does the same for the xz
   readers natively, including the threaded ones, whose workers each decode
   a block on their own lent window and move it back across threads. The
-  decode loops receive the same base pointer shape as with a `Vec`.
+  `window::tests::` cases also decode raw LZMA2 at two threads through
+  `Lzma2ParallelDecoder` (`decode` and `decode_at`), `Lzma2ParallelReader`,
+  `Lzma2AdaptiveDecoder` and `Lzma2RunDecoder` on garbage-filled windows,
+  native and Miri: each worker writes its block or run into a lent window,
+  sends it back across threads, and reuses it for its next one, and every
+  window is released after success, refusal and a damaged stream. The
+  `decode_window` fuzz target compares the same threaded decodes on lent
+  and owned memory. The decode loops receive the same base pointer shape
+  as with a `Vec`.
 - Shared finder storage and borrowed direct-input lifetime/ownership in
   `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in
   `src/enc/lz_find_mt.rs`, native and Miri; native producer panic,
