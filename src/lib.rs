@@ -95,7 +95,9 @@ pub use mt::checksum;
 #[cfg(all(feature = "std", feature = "crc"))]
 pub use mt::checksum::{BlockChecks, Checksum, ChecksumPlan, Segment, SegmentCheck};
 #[cfg(feature = "std")]
-pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memory_estimate};
+pub use mt::{
+    Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, ReadAt, mt_memory_estimate,
+};
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 #[cfg(feature = "std")]

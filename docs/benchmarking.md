@@ -157,3 +157,8 @@ The `decode_lzma2_mt` fuzz target is stronger than that: it decodes the same
 arbitrary bytes with the single-threaded, parallel and adaptive decoders and
 requires them to agree - the same output for a stream that ends at an end
 marker, and a refusal from all three for one that does not.
+
+The `decode_lzma2_at` target puts the same arbitrary bytes at an offset inside
+a larger source and requires `Lzma2ParallelDecoder::decode_at` to write
+exactly what `decode` writes, and to accept or refuse the stream as `decode`
+does.

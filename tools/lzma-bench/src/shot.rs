@@ -36,8 +36,8 @@ use std::time::Instant;
 
 use lzma_turbo::xz::{CheckType, FilterFlags, XzOptions, XzParallelReader, XzReader};
 use lzma_turbo::{
-    DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader,
-    LzmaEncProps, LzmaReader, XzWriter,
+    BLOCK_SIZE_AUTO, DrainStatus, Lzma2AdaptiveDecoder, Lzma2Encoder, Lzma2MtOptions,
+    Lzma2ParallelDecoder, Lzma2Reader, LzmaEncProps, LzmaReader, XzWriter,
 };
 
 use crate::{Crc32, OUT_CHUNK, alloc_watch_peak, alloc_watch_reset, dict_size_from_prop};
@@ -60,6 +60,7 @@ pub const HELP: &str = "\
                    lzma2          Lzma2Reader over the LZMA2 stream of a
                                   single-block .xz or a single-folder .7z
                    lzma2-mt       Lzma2ParallelDecoder, --threads N
+                   lzma2-mt-at    Lzma2ParallelDecoder::decode_at on the file, --threads N
                    adaptive       Lzma2AdaptiveDecoder fed the stream in
                                   4 MiB pieces it takes ownership of,
                                   --threads N, optional --memory-limit B
@@ -75,6 +76,10 @@ pub const HELP: &str = "\
                    xz-par         XzParallelReader, --threads N
                    liblzma        the liblzma crate (C), --threads N
                    liblzma-lzma1  the liblzma crate over a .lzma file
+                   encode-7z      Lzma2Encoder at 7-Zip's level P with N
+                                  total threads, as `7zz a -mx=P -mmt=N`
+                                  sets it up, writing the raw stream to
+                                  --out FILE and taking the input's CRC-32
                    encode         XzWriter at --preset P, --threads N,
                                   optional --filter F
                    rust2-encode   lzma-rust2 XzWriter (XzWriterMt above one
@@ -102,6 +107,8 @@ pub struct Shot {
     pub verify: bool,
     /// The adaptive lane's memory limit.
     pub memory_limit: u64,
+    /// Where an encode shot that writes a file puts it (`encode-7z`).
+    pub out: Option<std::path::PathBuf>,
 }
 
 /// What a shot reports.
@@ -135,7 +142,7 @@ pub fn run(shot: &Shot, file: Option<&Path>) -> i32 {
                 shot.threads,
                 shot.preset,
                 shot.filter.as_deref().unwrap_or(""),
-                if shot.encode || shot.lane == "encode" {
+                if shot.encode || shot.lane == "encode" || shot.lane == "encode-7z" {
                     "encode"
                 } else {
                     "decode"
@@ -218,7 +225,10 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             })
         }
         "lzma2-mt" => {
-            let (prop, stream) = lzma2_stream(path)?;
+            // The decoder reads its input in 256 KiB pieces of its own, as
+            // 7-Zip's does, so a `BufReader` in front would only copy every
+            // byte twice inside the decode's one serial stage.
+            let (prop, stream) = lzma2_stream_unbuffered(path)?;
             let opts = Lzma2MtOptions {
                 threads: shot.threads.max(1),
                 memory_limit: u64::MAX,
@@ -228,6 +238,33 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             let base = alloc_watch_reset();
             let t0 = Instant::now();
             let bytes_out = dec.decode(stream, &mut sink).map_err(|e| e.to_string())?;
+            Ok(Line {
+                bytes_in,
+                bytes_out,
+                crc32: sink.crc.map(|mut c| c.finish()),
+                seconds: t0.elapsed().as_secs_f64(),
+                peak_alloc: alloc_watch_peak(base),
+                input_buffered: 0,
+            })
+        }
+        "lzma2-mt-at" => {
+            // The same decode from a file read at offsets: every run is read
+            // by the thread that decodes it, not one after another.
+            let (prop, stream) = lzma2_stream_unbuffered(path)?;
+            let len = stream.limit();
+            let mut file = stream.into_inner();
+            let offset = file.stream_position().map_err(|e| e.to_string())?;
+            let opts = Lzma2MtOptions {
+                threads: shot.threads.max(1),
+                memory_limit: u64::MAX,
+            };
+            let dec = Lzma2ParallelDecoder::new(prop, &opts).map_err(|e| e.to_string())?;
+            let mut sink = Sink::new(shot.verify);
+            let base = alloc_watch_reset();
+            let t0 = Instant::now();
+            let bytes_out = dec
+                .decode_at(&file, offset, len, &mut sink)
+                .map_err(|e| e.to_string())?;
             Ok(Line {
                 bytes_in,
                 bytes_out,
@@ -331,6 +368,7 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
             })
         }
         "encode" => encode(shot, path, bytes_in),
+        "encode-7z" => encode_7z(shot, path, bytes_in),
         "rust2-encode" | "liblzma-encode" => encode_reference(shot, path, bytes_in),
         "filter" => filter(shot, path, bytes_in),
         other => Err(format!("unknown shot lane {other:?}")),
@@ -700,6 +738,89 @@ fn pump(input: &mut impl Read, buf: &mut [u8], w: &mut impl Write) -> Result<(),
     }
 }
 
+/// The work `7zz a -t7z -m0=lzma2 -mx=P -mmt=N` does for one file, without
+/// the archive around it: the raw LZMA2 stream written to a file, and the
+/// input's CRC-32, which a `.7z` stores and 7-Zip takes as it reads.
+///
+/// The settings are 7-Zip's level `P`, not `xz -P`'s. 7-Zip hands LZMA2 the
+/// thread count as a total (`numTotalThreads`), leaves the block size
+/// automatic, and passes the file's size both as `reduceSize` and as the
+/// expected data size. The finder's thread count is the SDK's default, two for
+/// a binary tree outside fast mode (level 5 and up) and one otherwise, which
+/// `Lzma2EncProps_Normalize` drops back to one when the total is one.
+fn encode_7z(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
+    struct In {
+        file: File,
+        crc: Crc32,
+    }
+    impl lzma_turbo::SeqInStream for In {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, lzma_turbo::Error> {
+            let n = self.file.read(buf).map_err(|_| lzma_turbo::Error::Read)?;
+            self.crc.update(&buf[..n]);
+            Ok(n)
+        }
+    }
+    struct Out {
+        file: File,
+        written: u64,
+    }
+    impl lzma_turbo::SeqOutStream for Out {
+        fn supports_streamed_blocks(&self) -> bool {
+            true
+        }
+        fn write(&mut self, data: &[u8]) -> Result<(), lzma_turbo::Error> {
+            self.file
+                .write_all(data)
+                .map_err(|_| lzma_turbo::Error::Write)?;
+            self.written += data.len() as u64;
+            Ok(())
+        }
+    }
+
+    let out_path = shot
+        .out
+        .as_deref()
+        .ok_or("--shot encode-7z needs --out FILE")?;
+    let threads = shot.threads.max(1);
+    let finder_threads = if threads > 1 && shot.preset >= 5 {
+        2
+    } else {
+        1
+    };
+    let props = LzmaEncProps::new()
+        .with_level(shot.preset)
+        .with_reduce_size(bytes_in)
+        .with_num_threads(finder_threads);
+    let mut input = In {
+        file: File::open(path).map_err(|e| e.to_string())?,
+        crc: Crc32::new(),
+    };
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let mut out = Out {
+        file: File::create(out_path).map_err(|e| e.to_string())?,
+        written: 0,
+    };
+    let mut enc = Lzma2Encoder::new(&props).map_err(|e| e.to_string())?;
+    enc.set_block_size(BLOCK_SIZE_AUTO);
+    enc.set_total_threads(threads);
+    enc.set_data_size(bytes_in);
+    enc.encode_mt(&mut input, &mut out)
+        .map_err(|e| e.to_string())?;
+    out.file.flush().map_err(|e| e.to_string())?;
+    let crc = input.crc.finish();
+    let seconds = t0.elapsed().as_secs_f64();
+    std::hint::black_box(crc);
+    Ok(Line {
+        bytes_in,
+        bytes_out: out.written,
+        crc32: None,
+        seconds,
+        peak_alloc: alloc_watch_peak(base),
+        input_buffered: 0,
+    })
+}
+
 /// One converter over the whole file in memory: the converters are in-place
 /// and have no streaming state worth timing apart from the pass itself.
 ///
@@ -866,6 +987,7 @@ mod tests {
             encode: false,
             verify: false,
             memory_limit: u64::MAX,
+            out: None,
         }
     }
 

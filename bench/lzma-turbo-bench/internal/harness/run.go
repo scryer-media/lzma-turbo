@@ -369,10 +369,29 @@ func command(options RunOptions, scenario Scenario, contender Contender, verify 
 			arg = input
 		case "{null}":
 			arg = os.DevNull
+		case "{out}":
+			arg = outPath(options)
 		}
 		args = append(args, arg)
 	}
 	return procmeasure.Command{Path: program, Args: args, Dir: options.Paths.Fixtures, Timeout: options.Timeout}
+}
+
+// outPath is the file a contender that cannot stream its output writes to:
+// `7zz a` needs a seekable archive. It sits beside the fixtures, so both
+// sides of a row write to the same file system, and it is removed before and
+// after every run: `7zz a` would otherwise update the archive it found.
+func outPath(options RunOptions) string {
+	return filepath.Join(options.Paths.Fixtures, ".encode-out.tmp")
+}
+
+func writesOut(contender Contender) bool {
+	for _, arg := range contender.Args {
+		if arg == "{out}" {
+			return true
+		}
+	}
+	return false
 }
 
 func runOne(ctx context.Context, options RunOptions, scenario Scenario, contender Contender, null *os.File, want string, verify bool) RunRecord {
@@ -393,8 +412,19 @@ func runOne(ctx context.Context, options RunOptions, scenario Scenario, contende
 	}
 	load, _ := hostinfo.LoadAverage()
 	record := RunRecord{Scenario: scenario.ID, Contender: contender.Name, Role: contender.Role, LoadBefore: load, Command: cmd.Describe()}
+	out := ""
+	if writesOut(contender) {
+		out = outPath(options)
+		os.Remove(out)
+		defer os.Remove(out)
+	}
 	result := procmeasure.Run(ctx, cmd)
 	record.Measurement = result.Measurement
+	if out != "" && contender.Kind != KindShot && result.Failure == "" && result.ExitCode == 0 {
+		if info, err := os.Stat(out); err == nil {
+			record.BytesOut = info.Size()
+		}
+	}
 	fail := func(status, failure, reason string) RunRecord {
 		record.Status, record.Failure, record.Reason = status, failure, reason
 		if tail := strings.TrimSpace(result.Stderr); tail != "" {

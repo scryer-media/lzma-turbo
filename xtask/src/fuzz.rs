@@ -39,6 +39,7 @@ const TARGETS: &[&str] = &[
     "decode_lzma",
     "decode_lzma2",
     "decode_lzma2_mt",
+    "decode_lzma2_at",
     "decode_window",
     "decode_xz",
 ];
@@ -145,6 +146,8 @@ fn seed(root: &Path, target: &str, corpus: &Path) -> Result<(), String> {
         "decode_xz" => seed_container(root, corpus, "xz", &[0, 18]),
         "decode_lzma2" => seed_lzma2(root, corpus, false),
         "decode_lzma2_mt" => seed_lzma2(root, corpus, true),
+        // The same three-byte settings prefix as `decode_lzma2_mt`.
+        "decode_lzma2_at" => seed_lzma2(root, corpus, true),
         // The same `[shape, dict_prop, stream]` layout as `decode_lzma2`.
         "decode_window" => seed_lzma2(root, corpus, false),
         other => Err(format!("no seeds defined for {other}")),

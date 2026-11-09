@@ -343,6 +343,7 @@ var groupTitles = []struct{ group, title string }{
 	{"decode-xz-par", "Decode: multi-block .xz thread sweep (XzParallelReader)"},
 	{"encode", "Encode: .xz, one thread"},
 	{"encode-mt", "Encode: multi-threaded .xz"},
+	{"encode-7z", "Encode: LZMA2 at 7-Zip's levels, against 7zz"},
 	{"filter", "Filters in an .xz chain"},
 	{"filter-raw", "Bare converters (in-process timed region)"},
 	{"check", "Integrity checks"},
@@ -427,7 +428,7 @@ func RenderMarkdown(report *Report) string {
 			}
 		}
 		fmt.Fprintln(&b)
-		if g.group == "encode" || g.group == "encode-mt" || g.group == "filter" {
+		if g.group == "encode" || g.group == "encode-mt" || g.group == "encode-7z" || g.group == "filter" {
 			renderSizes(&b, rows)
 		}
 	}

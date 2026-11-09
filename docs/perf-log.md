@@ -521,6 +521,48 @@ compiles the reference C loop about twice as badly here as clang does on the
 Mac, so "within 3% of 7-Zip" and "2.1x the reference C decoder" are the same
 sentence on this box. Only the first is a claim about this crate.
 
+### Reading the runs in parallel: `decode_at`
+
+On a 16-thread Sapphire Rapids (`c7i.4xlarge`, Ubuntu, rustc 1.97.1, 7-Zip
+26.04's `7zz`), the 1 GiB `mt.7z` decoded at 0.90 of `7zz`'s speed, a gap the
+256 MiB rows did not show. A per-block trace found the cause in the ring's one
+serial stage. A worker reads its whole block while it holds the read token, so
+block starts are staggered by the read time: about 110 ms per block here, which
+put the last block's start 886 ms into a 3.9 s decode. Two things inflated the
+read. The bench's stream path copied every byte twice through a 1 MiB
+`BufReader`. And each fresh 256 KiB input link was zero-filled by hand before
+it was read into.
+
+Three changes, measured in one interleaved run. Each lane verified its CRC-32
+first, then ran seven rounds; the medians are in seconds. `7zz` is
+`7zz t -mmt=16`, timed as a whole process.
+
+| `mt.7z`, 1 GiB | s | 7zz ÷ ours |
+| --- | --- | --- |
+| before | 4.175 | 0.906 |
+| zeroed alloc, no copy | 4.039 | 0.936 |
+| `decode_at` | 3.388 | 1.116 |
+| `7zz` | 3.781 | |
+
+| `p256.mt.7z` | s | 7zz ÷ ours |
+| --- | --- | --- |
+| before | 3.228 | 0.987 |
+| zeroed alloc, no copy | 3.190 | 0.999 |
+| `decode_at` | 3.102 | 1.027 |
+| `7zz` | 3.187 | |
+
+Allocating the links already zeroed is the change tried and reverted above,
+when it bought nothing on an eight-thread Mac. The trace is what made it worth
+trying again. It now reuses the crate's shared `zeroed_vec`, so it adds no
+unsafe code, and at 16 threads it is worth 3% on the 1 GiB file.
+
+`decode_at` removes the serial stage instead of shortening it. Each worker
+finds its run from the chunk headers and reads it itself, so every block
+starts at once. That takes the 1 GiB file from 10% behind `7zz` to 12% ahead
+and the 256 MiB file to 3% ahead, at the same peak allocation (2.01 GB and
+503 MB). It needs a source that can be read at any offset, which a `.7z` on
+disk always is.
+
 ## xz container
 
 Measured on linux-x86_64 (Arrow Lake-H, 16 threads, gcc 15, no AVX-512) with

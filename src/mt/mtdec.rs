@@ -242,11 +242,14 @@ fn read_max(stream: &mut (dyn Read + Send), buf: &mut [u8]) -> (usize, io::Resul
     (filled, Ok(()))
 }
 
-fn alloc_buf(size: usize) -> Result<Box<[u8]>, Error> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(size).map_err(|_| Error::Alloc)?;
-    v.resize(size, 0u8);
-    Ok(v.into_boxed_slice())
+/// A zeroed buffer of `size` bytes, or [`Error::Alloc`].
+///
+/// Allocated zeroed rather than reserved and then filled: a large allocation
+/// comes from fresh pages the OS has already zeroed, so this skips a pass over
+/// every byte. That matters because the ring's input buffers are filled while
+/// the read token is held, which is the one serial stage of the decode.
+pub(crate) fn alloc_buf(size: usize) -> Result<Box<[u8]>, Error> {
+    crate::buffer::zeroed_vec::<u8>(size).map(Vec::into_boxed_slice)
 }
 
 impl<'e, C: Coder> MtDec<'e, C> {

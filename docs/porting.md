@@ -347,6 +347,7 @@ borrowing cases:
 | a borrowed source, output to a `Write` | `Lzma2ParallelDecoder::decode` | `R: Read + Send`, no `'static` - it owns its threads for one call and joins them before returning |
 | a borrowed source, output pulled | `Lzma2AdaptiveDecoder` | none: the caller feeds slices and workers get owned copies of complete runs |
 | an owned source (a file, a socket) | `Lzma2ParallelReader` | `Read + Send + 'static` |
+| a source read at any offset (a file, a slice), output to a `Write` | `Lzma2ParallelDecoder::decode_at` | `S: ReadAt + Sync` - each worker reads its own run, where `decode` reads every run on one thread |
 
 A 7z coder's input is a bounded view of the archive's source, which is neither
 `Send` nor `'static`, so it belongs in the second row - which is where the

@@ -55,6 +55,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_lzma2_at"
+path = "fuzz_targets/decode_lzma2_at.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decode_window"
 path = "fuzz_targets/decode_window.rs"
 test = false

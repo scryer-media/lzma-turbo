@@ -403,6 +403,35 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 		}
 	}
 
+	// --- encode against 7-Zip ----------------------------------------------
+	// The encoder is a port of 7-Zip's, so 7zz is its own reference: 7-Zip's
+	// level P (not xz's preset P), the thread count as 7-Zip's total, the
+	// block size automatic. lzma-turbo's raw stream is byte for byte the one
+	// inside 7zz's archive; both sides write their output to a file, because
+	// 7zz cannot stream a .7z.
+	encode7z := func(p, t int) {
+		ps, n := strconv.Itoa(p), resolve(t)
+		ns := strconv.Itoa(n)
+		add(Scenario{ID: "encode/7z/p" + ps + "/" + threadLabel(t), Group: "encode-7z",
+			Title: fmt.Sprintf("LZMA2 encode at 7-Zip level %d, %d threads", p, n),
+			Input: "p256.bin", Source: "p256.bin", Direction: "encode", Threads: n, Preset: p, Skip: threadSkip(t),
+			Contenders: []Contender{
+				shot("lzma-turbo", RoleOurs, "--shot", "encode-7z", "--preset", ps, "--threads", ns, "--out", "{out}"),
+				{Name: "7zz", Role: RoleReference, Kind: Kind7zz,
+					Args: []string{"a", "-t7z", "-m0=lzma2", "-mx=" + ps, "-mmt=" + ns, "-bso0", "-bsp0", "{out}", "{in}"}},
+			}})
+	}
+	for _, p := range options.Presets {
+		encode7z(p, 1)
+	}
+	for _, p := range options.MTPresets {
+		for _, t := range mtThreads {
+			if resolve(t) != 1 {
+				encode7z(p, t)
+			}
+		}
+	}
+
 	// --- filters ----------------------------------------------------------
 	type filterCase struct{ name, decodeInput, source string }
 	cases := []filterCase{
