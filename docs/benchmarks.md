@@ -171,7 +171,8 @@ and check included. It is shown but left out of the summary.
 
 ## lzma-turbo vs lzma-rust2
 
-lzma-rust2's `XzReaderMt` decodes every `.xz` file here at its
+lzma-turbo decodes on several threads; lzma-rust2 in practice decodes on
+one. Its `XzReaderMt` decodes every `.xz` file here at its
 single-thread speed (8.3 s on Sapphire Rapids, 7.7 s on Graviton4, at one
 thread and at all 16), so the `decode/xz-par` all-thread rows set
 lzma-turbo's parallel decoder against one lzma-rust2 thread; lzma-turbo's

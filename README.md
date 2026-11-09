@@ -51,8 +51,13 @@ Measured with lzma-turbo 0.10.3 against xz 5.8.4, 7-Zip 26.04 and the Rust
 libraries lzma-rust2 0.20.1, liblzma 0.4.8 and lzma-rs 0.3.0 on two idle
 machines, 2026-11-08. Each number is the reference's time or memory divided
 by lzma-turbo's, averaged (geometric mean) over every test that reference
-runs, so above 1.00 means lzma-turbo was faster or used less memory. The
-Rust-library decode columns cover single-threaded decoding.
+runs, so above 1.00 means lzma-turbo was faster or used less memory.
+
+lzma-turbo decodes on several threads; lzma-rust2 decodes on one. Its
+multi-threaded `.xz` reader runs at its single-thread speed, so the
+Rust-library decode columns compare single-threaded decoding only, where the
+two can be set side by side. With every thread, lzma-turbo decodes the same
+`.xz` files 11 to 19x faster than lzma-rust2.
 
 | CPU | threads | vs xz: decode | encode | peak memory | vs 7-Zip: decode | peak memory | vs lzma-rust2: decode | encode | vs liblzma: decode | encode | vs lzma-rs: decode |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -66,9 +71,7 @@ Rust-library decode columns cover single-threaded decoding.
   every preset, thread count and filter, and the output is the same size.
 - Against the Rust libraries, single-threaded decoding is 1.4 to 1.7x faster
   than lzma-rust2 and 2.6 to 3.7x faster than lzma-rs. liblzma decodes at
-  xz's speed. lzma-rust2's multi-threaded `.xz` reader runs at its
-  single-thread speed, so with 16 threads lzma-turbo decodes those files 11
-  to 19x faster.
+  xz's speed.
 - Slower than xz: decoding through the armthumb and sparc branch filters on
   Sapphire Rapids (0.991 and 0.992). Slower than 7-Zip: the all-threads
   `.7z` decode (0.986 to 0.991) and LZMA1 decoding (0.997 to 0.999).
