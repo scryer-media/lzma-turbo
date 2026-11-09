@@ -16,7 +16,7 @@ const (
 
 // Contender kinds: which program a run launches.
 const (
-	KindShot  = "shot"  // lzma-bench --shot (lzma-turbo, lzma-rust2, liblzma)
+	KindShot  = "shot"  // lzma-bench --shot (lzma-turbo, lzma-rust2, liblzma, lzma-rs)
 	KindXZ    = "xz"    // XZ Utils
 	Kind7zz   = "7zz"   // 7-Zip
 	Kind7lzma = "7lzma" // the LZMA SDK's command-line coder
@@ -302,13 +302,19 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 				sevenTest(1),
 				xzDecode("-T1", "--format=lzma"),
 				{Name: "7lzma", Role: RoleReference, Kind: Kind7lzma, Args: []string{"d", "{in}", "{null}"}},
+				shot("lzma-rust2", RoleReference, "--shot", "rust2-lzma1"),
+				shot("liblzma", RoleReference, "--shot", "liblzma-lzma1"),
+				shot("lzma-rs", RoleReference, "--shot", "lzmars-lzma1"),
 			}})
 	}
 
 	// --- LZMA2 in .xz, single stream --------------------------------------
 	add(Scenario{ID: "decode/xz/p256", Group: "decode-xz", Title: ".xz single-block LZMA2 decode, one thread",
 		Input: "p256.bin.xz", Source: "p256.bin", Direction: "decode", Threads: 1,
-		Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "xz"), xzDecode("-T1"), sevenTest(1)}})
+		Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "xz"), xzDecode("-T1"), sevenTest(1),
+			shot("lzma-rust2", RoleReference, "--shot", "rust2-xz"),
+			shot("liblzma", RoleReference, "--shot", "liblzma", "--threads", "1"),
+			shot("lzma-rs", RoleReference, "--shot", "lzmars-xz")}})
 	add(Scenario{ID: "decode/lzma2-raw/p256", Group: "decode-xz", Title: "the bare LZMA2 stream of p256.bin.xz (Lzma2Reader, no container)",
 		Input: "p256.bin.xz", Source: "p256.bin", Direction: "decode", Threads: 1,
 		Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "lzma2"), xzDecode("-T1")}})
@@ -320,7 +326,9 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 	for _, s := range both {
 		add(Scenario{ID: "decode/7z-st/" + s.label, Group: "decode-7z", Title: "single-stream .7z LZMA2 decode, one thread",
 			Input: s.sevenST, Source: s.source, Direction: "decode", Threads: 1, Size: s.size,
-			Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "lzma2"), sevenTest(1)}})
+			Contenders: []Contender{shot("lzma-turbo", RoleOurs, "--shot", "lzma2"), sevenTest(1),
+				shot("lzma-rust2", RoleReference, "--shot", "rust2-lzma2"),
+				shot("lzma-rs", RoleReference, "--shot", "lzmars-lzma2")}})
 		// A single stream has no independent chunks, so the parallel
 		// decoder has to fall back to one; this row prices that fallback.
 		add(Scenario{ID: "decode/7z-st-fallback/" + s.label + "/tall", Group: "decode-7z",
@@ -359,6 +367,7 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 					shot("lzma-turbo", RoleOurs, "--shot", "xz-par", "--threads", strconv.Itoa(n)),
 					xzDecode("-T" + strconv.Itoa(n)),
 					shot("liblzma", RoleReference, "--shot", "liblzma", "--threads", strconv.Itoa(n)),
+					shot("lzma-rust2", RoleReference, "--shot", "rust2-xz-mt", "--threads", strconv.Itoa(n)),
 				}})
 		}
 	}
@@ -371,6 +380,8 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 			Contenders: []Contender{
 				shot("lzma-turbo", RoleOurs, "--shot", "encode", "--preset", ps, "--threads", "1"),
 				xzEncode("-T1", "-"+ps),
+				shot("lzma-rust2", RoleReference, "--shot", "rust2-encode", "--preset", ps, "--threads", "1"),
+				shot("liblzma", RoleReference, "--shot", "liblzma-encode", "--preset", ps, "--threads", "1"),
 			}})
 	}
 	for _, p := range options.MTPresets {
@@ -386,6 +397,8 @@ func BuildMatrix(options MatrixOptions) []Scenario {
 				Contenders: []Contender{
 					shot("lzma-turbo", RoleOurs, "--shot", "encode", "--preset", ps, "--threads", strconv.Itoa(n)),
 					xzEncode("-T"+strconv.Itoa(n), "-"+ps),
+					shot("lzma-rust2", RoleReference, "--shot", "rust2-encode", "--preset", ps, "--threads", strconv.Itoa(n)),
+					shot("liblzma", RoleReference, "--shot", "liblzma-encode", "--preset", ps, "--threads", strconv.Itoa(n)),
 				}})
 		}
 	}

@@ -2,8 +2,8 @@
 
 A benchmark harness for running lzma-turbo against its oracles on any
 machine, and for merging the results from many machines into one report.
-Each measurement runs as its own process: lzma-turbo, lzma-rust2 and liblzma
-through `lzma-bench --shot`, and `xz`, `7zz` and `7lzma` directly. Every row
+Each measurement runs as its own process: lzma-turbo, lzma-rust2, liblzma and
+lzma-rs through `lzma-bench --shot`, and `xz`, `7zz` and `7lzma` directly. Every row
 therefore records that process's peak resident set, read from the kernel the
 same way for every contender, beside its wall time and CPU time.
 
@@ -41,8 +41,8 @@ On Linux and macOS a `7z` on `PATH` is usually p7zip, a fork that stopped at
 16.02, so only a binary named `7zz` is accepted there. Any oracle the host
 lacks is left out of the rows that use it, and the report lists it with the
 reason. A row with no reference left is skipped with that reason rather than
-failed. lzma-rust2 and liblzma are compiled into `lzma-bench` at the versions
-in `Cargo.lock`, so they are on every host.
+failed. lzma-rust2, liblzma and lzma-rs are compiled into `lzma-bench` at the
+versions in `Cargo.lock`, so they are on every host.
 
 ## Commands
 
@@ -68,7 +68,7 @@ lzma-turbo-bench merge     [--out merged.md] host-a/report.json host-b/report.js
     and the checkout is clean, since the report names the checkout;
   - for each oracle, its path, version banner, SHA-256 and how it was found;
   - for `xz`, the filters it supports;
-  - the `Cargo.lock` versions of lzma-rust2, liblzma, crc-turbo and aws-lc-rs.
+  - the `Cargo.lock` versions of lzma-rust2, liblzma, lzma-rs, crc-turbo and aws-lc-rs.
 - `fixtures` runs `cargo xtask fixtures`, then builds the harness's extra
   fixtures. It checks every file against `bench/fixtures/README.md` and caches
   the digests in `bench/fixtures/manifest.json`.
@@ -107,16 +107,16 @@ lzma-turbo-bench merge     [--out merged.md] host-a/report.json host-b/report.js
 
 | scenario | input | lzma-turbo | references |
 | --- | --- | --- | --- |
-| `decode/lzma1/{p256,1g}` | `p256.bin.lzma`, `payload.bin.lzma` | `LzmaReader` | `7zz t -mmt=1`, `xz -dc -T1 --format=lzma`, `7lzma d` |
-| `decode/xz/p256` | `p256.bin.xz` | `XzReader` | `xz -dc -T1`, `7zz t -mmt=1` |
+| `decode/lzma1/{p256,1g}` | `p256.bin.lzma`, `payload.bin.lzma` | `LzmaReader` | `7zz t -mmt=1`, `xz -dc -T1 --format=lzma`, `7lzma d`, lzma-rust2 `LzmaReader`, liblzma, lzma-rs |
+| `decode/xz/p256` | `p256.bin.xz` | `XzReader` | `xz -dc -T1`, `7zz t -mmt=1`, lzma-rust2 `XzReader`, liblzma one thread, lzma-rs |
 | `decode/lzma2-raw/p256` | `p256.bin.xz` | `Lzma2Reader` on the bare stream | `xz -dc -T1` |
-| `decode/xz-multi/p256x3` | `multi.xz` | `XzReader` | `xz -dc -T1` |
-| `decode/7z-st/{p256,1g}` | `p256.st.7z`, `st.7z` | `Lzma2Reader` | `7zz t -mmt=1` |
+| `decode/xz-multi/p256x3` | `multi.xz` | `XzReader` | `xz -dc -T1`, lzma-rust2 `XzReader`, liblzma one thread |
+| `decode/7z-st/{p256,1g}` | `p256.st.7z`, `st.7z` | `Lzma2Reader` | `7zz t -mmt=1`, lzma-rust2 `Lzma2Reader`, lzma-rs |
 | `decode/7z-st-fallback/{p256,1g}/tall` | same | `Lzma2ParallelDecoder`, every CPU (must fall back to one thread) | `7zz t -mmt=<all>` |
 | `decode/7z-mt/{p256,1g}/t<N>` | `p256.mt.7z`, `mt.7z` | `Lzma2ParallelDecoder` | `7zz t -mmt=N`, lzma-rust2 `Lzma2ReaderMt` |
-| `decode/xz-par/{p256.t8,p256.b16,1g.t8}/t<N>` | `p256.t8.xz`, `p256.b16.xz`, `payload.t8.xz` | `XzParallelReader` | `xz -dc -T<N>`, liblzma MT |
-| `encode/st/p<P>` | `p256.bin` | `XzWriter`, one solid block | `xz -T1 -<P>`, with the output-size ratio |
-| `encode/mt/p<P>/t<N>` | `p256.bin` | `XzWriter`, `xz -T` block size | `xz -T<N> -<P>`, with the output-size ratio |
+| `decode/xz-par/{p256.t8,p256.b16,1g.t8}/t<N>` | `p256.t8.xz`, `p256.b16.xz`, `payload.t8.xz` | `XzParallelReader` | `xz -dc -T<N>`, liblzma MT, lzma-rust2 `XzReaderMt` |
+| `encode/st/p<P>` | `p256.bin` | `XzWriter`, one solid block | `xz -T1 -<P>`, lzma-rust2 `XzWriter`, liblzma, with the output-size ratio |
+| `encode/mt/p<P>/t<N>` | `p256.bin` | `XzWriter`, `xz -T` block size | `xz -T<N> -<P>`, lzma-rust2 `XzWriterMt`, liblzma MT, at the same block size, with the output-size ratio |
 | `filter/decode/<f>` | `bcj-<f>.code.xz`, `delta.xz`, `delta64.xz` | `XzReader` | `xz -dc -T1` |
 | `filter/encode/<f>` | `codebin.bin`, `p256.bin` (delta) | `XzWriter` + filter, preset 1 | `xz -T1 --<f> --lzma2=preset=1` |
 | `filter/raw/<f>/{encode,decode}` | same | the bare converter in memory, timed region only | none: no oracle runs a bare converter |
@@ -131,7 +131,7 @@ oversubscribed, and `all` is dropped when it equals a count already in the
 sweep. Encoding a single thread at presets 1, 3, 5, 6 and 9, and the MT
 encode at presets 5 and 6, completes the defaults.
 
-Every decode that lzma-turbo, lzma-rust2 or liblzma runs is checked, in a
+Every decode that lzma-turbo or a Rust library runs is checked, in a
 run of its own before the warmups (`--verify`): the output's CRC-32 has to
 equal the source file's, or the scenario fails. That run is kept out of the
 figures; the timed runs only count their output, as `xz -dc` writing to the
@@ -161,8 +161,8 @@ lzma-turbo fails, or a run finishes without a peak RSS, the row fails.
   run time, and aws-lc-rs dispatches SHA-256 internally. The rest is
   portable Rust, so the tier difference between two hosts is in the CPU and
   in those two libraries.
-- Peak RSS covers a process's own high-water mark. lzma-rust2 and liblzma
-  run inside `lzma-bench`, so their figures include its small image.
+- Peak RSS covers a process's own high-water mark. lzma-rust2, liblzma and
+  lzma-rs run inside `lzma-bench`, so their figures include its small image.
   liblzma's C allocations do not reach the Rust heap counter, which leaves
   its "peak alloc" near zero. The bare-converter rows read their whole input
   into memory and say how much.

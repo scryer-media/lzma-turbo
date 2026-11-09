@@ -115,7 +115,7 @@ type ToolchainOptions struct {
 }
 
 // The crates the report names, from Cargo.lock.
-var lockedCrates = []string{"lzma-rust2", "liblzma", "liblzma-sys", "crc-turbo", "aws-lc-rs", "aws-lc-sys"}
+var lockedCrates = []string{"lzma-rust2", "liblzma", "liblzma-sys", "lzma-rs", "crc-turbo", "aws-lc-rs", "aws-lc-sys"}
 
 // xzFilters are the xz options probed, by the name the harness uses.
 var xzFilters = []struct{ name, option string }{

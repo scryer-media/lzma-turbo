@@ -21,3 +21,6 @@ lzma-rust2 = "0.20.1"
 crc-turbo = { version = "1.11.0", default-features = false, features = ["std"] }
 # The C library this crate exists to replace, for the `--xz` lane only.
 liblzma = { version = "0.4.8", features = ["parallel"] }
+# The other pure-Rust decoder, single-threaded, for the decode rows. Its
+# encoder writes literals only, so it has no encode row.
+lzma-rs = "0.3.0"

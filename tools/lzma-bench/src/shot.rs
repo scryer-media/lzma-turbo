@@ -64,11 +64,23 @@ pub const HELP: &str = "\
                                   4 MiB pieces it takes ownership of,
                                   --threads N, optional --memory-limit B
                    rust2-mt       lzma-rust2 Lzma2ReaderMt, --threads N
+                   rust2-lzma1    lzma-rust2 LzmaReader over a .lzma file
+                   rust2-lzma2    lzma-rust2 Lzma2Reader, the lzma2 lane's input
+                   rust2-xz       lzma-rust2 XzReader over a whole .xz file
+                   rust2-xz-mt    lzma-rust2 XzReaderMt, --threads N
+                   lzmars-lzma1   lzma-rs over a .lzma file
+                   lzmars-lzma2   lzma-rs, the lzma2 lane's input
+                   lzmars-xz      lzma-rs over a whole .xz file
                    xz             XzReader over a whole .xz file
                    xz-par         XzParallelReader, --threads N
                    liblzma        the liblzma crate (C), --threads N
+                   liblzma-lzma1  the liblzma crate over a .lzma file
                    encode         XzWriter at --preset P, --threads N,
                                   optional --filter F
+                   rust2-encode   lzma-rust2 XzWriter (XzWriterMt above one
+                                  thread) at --preset P, --threads N
+                   liblzma-encode the liblzma crate's .xz encoder at
+                                  --preset P, --threads N
                    filter         one converter over the whole file in memory,
                                   --filter F --direction encode|decode
                  F is x86, arm, armthumb, arm64, ppc, sparc, ia64, riscv,
@@ -264,7 +276,62 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
                 Ok(r)
             })
         }
+        "rust2-lzma1" => {
+            let file = open(path)?;
+            read_all(bytes_in, shot.verify, || {
+                lzma_rust2::LzmaReader::new_mem_limit(file, u32::MAX, None)
+                    .map_err(|e| e.to_string())
+            })
+        }
+        "rust2-lzma2" => {
+            let (prop, stream) = lzma2_stream(path)?;
+            let dict = dict_size_from_prop(prop);
+            read_all(bytes_in, shot.verify, || {
+                Ok(lzma_rust2::Lzma2Reader::new(stream, dict, None))
+            })
+        }
+        "rust2-xz" => {
+            let file = open(path)?;
+            read_all(bytes_in, shot.verify, || {
+                Ok(lzma_rust2::XzReader::new(file, true))
+            })
+        }
+        "rust2-xz-mt" => {
+            let file = open(path)?;
+            let threads = u32::try_from(shot.threads.max(1)).map_err(|e| e.to_string())?;
+            read_all(bytes_in, shot.verify, || {
+                lzma_rust2::XzReaderMt::new(file, true, threads).map_err(|e| e.to_string())
+            })
+        }
+        "lzmars-lzma1" => {
+            let mut file = open(path)?;
+            push_all(bytes_in, shot.verify, |sink| {
+                lzma_rs::lzma_decompress(&mut file, sink).map_err(|e| e.to_string())
+            })
+        }
+        "lzmars-lzma2" => {
+            let (_, mut stream) = lzma2_stream(path)?;
+            let mut stream = BufReader::with_capacity(IN_CHUNK, &mut stream);
+            push_all(bytes_in, shot.verify, |sink| {
+                lzma_rs::lzma2_decompress(&mut stream, sink).map_err(|e| e.to_string())
+            })
+        }
+        "lzmars-xz" => {
+            let mut file = open(path)?;
+            push_all(bytes_in, shot.verify, |sink| {
+                lzma_rs::xz_decompress(&mut file, sink).map_err(|e| e.to_string())
+            })
+        }
+        "liblzma-lzma1" => {
+            let file = open(path)?;
+            read_all(bytes_in, shot.verify, || {
+                let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
+                    .map_err(|e| e.to_string())?;
+                Ok(liblzma::read::XzDecoder::new_stream(file, stream))
+            })
+        }
         "encode" => encode(shot, path, bytes_in),
+        "rust2-encode" | "liblzma-encode" => encode_reference(shot, path, bytes_in),
         "filter" => filter(shot, path, bytes_in),
         other => Err(format!("unknown shot lane {other:?}")),
     }
@@ -411,6 +478,28 @@ fn read_all<R: Read>(
     })
 }
 
+/// [`read_all`] for a decoder that pushes its output into a writer rather
+/// than being read from: it decodes into the sink inside the timed region.
+fn push_all(
+    bytes_in: u64,
+    verify: bool,
+    decode: impl FnOnce(&mut Sink) -> Result<(), String>,
+) -> Result<Line, String> {
+    let mut sink = Sink::new(verify);
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    decode(&mut sink)?;
+    let seconds = t0.elapsed().as_secs_f64();
+    Ok(Line {
+        bytes_in,
+        bytes_out: sink.written,
+        crc32: sink.crc.map(|mut c| c.finish()),
+        seconds,
+        peak_alloc: alloc_watch_peak(base),
+        input_buffered: 0,
+    })
+}
+
 /// The raw LZMA2 stream of a single-block `.xz` or a single-folder `.7z`, as
 /// a reader positioned on its first byte, with its dictionary property byte.
 fn lzma2_stream(path: &Path) -> Result<(u8, std::io::Take<BufReader<File>>), String> {
@@ -540,6 +629,75 @@ fn encode(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
         peak_alloc: alloc_watch_peak(base),
         input_buffered: 0,
     })
+}
+
+/// The lzma-rust2 or liblzma `.xz` encoder at `xz -<P>`'s preset, streaming
+/// the input through it into a counting sink, as [`encode`] does. CRC-64 as
+/// `xz` writes. Above one thread both cut blocks at the size `xz -T<n>` and
+/// this crate's writer use, so every row compares the same block layout.
+fn encode_reference(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
+    use liblzma::stream::{Check, MtStreamBuilder, Stream};
+    use lzma_rust2::{XzOptions, XzWriter as Rust2Writer, XzWriterMt as Rust2WriterMt};
+    let dict = LzmaEncProps::xz_preset(shot.preset, false)
+        .map_err(|e| e.to_string())?
+        .normalized()
+        .dict_size;
+    let block = crate::encode::xz_mt_block_size(dict);
+    let threads = u32::try_from(shot.threads.max(1)).map_err(|e| e.to_string())?;
+    let mut input = open(path)?;
+    let mut buf = vec![0u8; IN_CHUNK];
+    let err = |e: std::io::Error| e.to_string();
+    let base = alloc_watch_reset();
+    let t0 = Instant::now();
+    let bytes_out = if shot.lane == "rust2-encode" {
+        let mut opts = XzOptions::with_preset(shot.preset);
+        opts.set_check_sum_type(lzma_rust2::CheckType::Crc64);
+        if threads > 1 {
+            opts.set_block_size(std::num::NonZeroU64::new(block));
+            let mut w = Rust2WriterMt::new(Sink::new(false), opts, threads).map_err(err)?;
+            pump(&mut input, &mut buf, &mut w)?;
+            w.finish().map_err(err)?.written
+        } else {
+            let mut w = Rust2Writer::new(Sink::new(false), opts).map_err(err)?;
+            pump(&mut input, &mut buf, &mut w)?;
+            w.finish().map_err(err)?.written
+        }
+    } else {
+        let stream = if threads > 1 {
+            MtStreamBuilder::new()
+                .threads(threads)
+                .preset(shot.preset)
+                .block_size(block)
+                .check(Check::Crc64)
+                .encoder()
+        } else {
+            Stream::new_easy_encoder(shot.preset, Check::Crc64)
+        }
+        .map_err(|e| e.to_string())?;
+        let mut w = liblzma::write::XzEncoder::new_stream(Sink::new(false), stream);
+        pump(&mut input, &mut buf, &mut w)?;
+        w.finish().map_err(err)?.written
+    };
+    let seconds = t0.elapsed().as_secs_f64();
+    Ok(Line {
+        bytes_in,
+        bytes_out,
+        crc32: None,
+        seconds,
+        peak_alloc: alloc_watch_peak(base),
+        input_buffered: 0,
+    })
+}
+
+/// Copies `input` into `w` through `buf`.
+fn pump(input: &mut impl Read, buf: &mut [u8], w: &mut impl Write) -> Result<(), String> {
+    loop {
+        let n = input.read(buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        w.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
 }
 
 /// One converter over the whole file in memory: the converters are in-place
@@ -741,16 +899,92 @@ mod tests {
         want.update(&data);
         let want = want.finish();
 
-        for lane in ["xz", "xz-par", "lzma2", "lzma2-mt", "adaptive"] {
-            let mut s = shot(lane);
-            let line = measure(&s, &input.0).expect("decode shot");
-            assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
-            assert_eq!(line.crc32, None, "{lane}: hashed without --verify");
+        for lane in [
+            "xz",
+            "xz-par",
+            "lzma2",
+            "lzma2-mt",
+            "adaptive",
+            "rust2-mt",
+            "rust2-lzma2",
+            "rust2-xz",
+            "rust2-xz-mt",
+            "lzmars-lzma2",
+            "lzmars-xz",
+            "liblzma",
+        ] {
+            assert_decodes(lane, &input.0, data.len() as u64, want);
+        }
+    }
 
-            s.verify = true;
-            let line = measure(&s, &input.0).expect("verify shot");
-            assert_eq!(line.bytes_out, data.len() as u64, "{lane}");
-            assert_eq!(line.crc32, Some(want), "{lane}: --verify");
+    /// Every LZMA1 lane decodes the same `.lzma` file to the source.
+    #[test]
+    fn every_lzma1_lane_decodes() {
+        let data = payload();
+        let props = LzmaEncProps::new().with_dict_size(1 << 16);
+        let lzma = lzma_turbo::encode_lzma_alone(&data, &props).expect("encode");
+        let input = Scratch::new("decode.lzma", &lzma);
+        let mut want = Crc32::new();
+        want.update(&data);
+        let want = want.finish();
+        for lane in ["lzma1", "rust2-lzma1", "lzmars-lzma1", "liblzma-lzma1"] {
+            assert_decodes(lane, &input.0, data.len() as u64, want);
+        }
+    }
+
+    fn assert_decodes(lane: &str, path: &Path, len: u64, want: u32) {
+        let mut s = shot(lane);
+        s.threads = 2;
+        let line = measure(&s, path).expect("decode shot");
+        assert_eq!(line.bytes_out, len, "{lane}");
+        assert_eq!(line.crc32, None, "{lane}: hashed without --verify");
+
+        s.verify = true;
+        let line = measure(&s, path).expect("verify shot");
+        assert_eq!(line.bytes_out, len, "{lane}");
+        assert_eq!(line.crc32, Some(want), "{lane}: --verify");
+    }
+
+    /// The reference encode shots count exactly what each library writes for
+    /// the same settings, on one thread and on two.
+    #[test]
+    fn the_reference_encode_shots_count_the_library_output() {
+        let data = payload();
+        let input = Scratch::new("encode-ref.bin", &data);
+        let block = crate::encode::xz_mt_block_size(
+            LzmaEncProps::xz_preset(1, false)
+                .expect("preset")
+                .normalized()
+                .dict_size,
+        );
+        for threads in [1usize, 2] {
+            let mut s = shot("rust2-encode");
+            s.threads = threads;
+            let line = measure(&s, &input.0).expect("rust2 encode");
+            let mut opts = lzma_rust2::XzOptions::with_preset(1);
+            opts.set_check_sum_type(lzma_rust2::CheckType::Crc64);
+            let want = if threads > 1 {
+                opts.set_block_size(std::num::NonZeroU64::new(block));
+                let mut w = lzma_rust2::XzWriterMt::new(Vec::new(), opts, 2).expect("writer");
+                w.write_all(&data).expect("write");
+                w.finish().expect("finish")
+            } else {
+                let mut w = lzma_rust2::XzWriter::new(Vec::new(), opts).expect("writer");
+                w.write_all(&data).expect("write");
+                w.finish().expect("finish")
+            };
+            assert_eq!(line.bytes_out, want.len() as u64, "rust2 t{threads}");
+            assert_eq!(line.crc32, None);
+
+            let mut s = shot("liblzma-encode");
+            s.threads = threads;
+            let line = measure(&s, &input.0).expect("liblzma encode");
+            let want = liblzma::encode_all(&data[..], 1).expect("liblzma");
+            if threads == 1 {
+                assert_eq!(line.bytes_out, want.len() as u64, "liblzma t1");
+            } else {
+                assert!(line.bytes_out > 0, "liblzma t2");
+            }
         }
     }
 
