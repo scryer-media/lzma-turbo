@@ -61,6 +61,8 @@ mod mt;
 mod reader;
 #[cfg(feature = "std")]
 pub mod run;
+#[cfg(feature = "std")]
+mod window;
 
 #[cfg(feature = "xz")]
 pub mod xz;
@@ -98,6 +100,8 @@ pub use mt::{
 };
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
+#[cfg(feature = "std")]
+pub use window::{WindowAllocator, WindowBacking, WindowMemory};
 #[cfg(feature = "xz")]
 pub use xz::{XzAdaptiveDecoder, XzError, XzOptions, XzParallelReader, XzReader};
 

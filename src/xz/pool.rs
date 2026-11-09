@@ -32,9 +32,11 @@ use super::block::{BlockHeader, header_size_from_first_byte};
 use super::check::{BlockCheck, RunningCheck};
 use super::error::XzErrorKind;
 use super::stream::CheckType;
+use crate::buffer::DicBuf;
 use crate::error::{FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 use crate::mt::checksum::ChecksumPlan;
+use crate::window::WindowBacking;
 
 /// One whole block on its way to a worker.
 pub(crate) struct XzJob {
@@ -60,8 +62,12 @@ pub(crate) struct XzJob {
     pub(crate) verify: bool,
     /// The caller's own segment boundaries.
     pub(crate) plan: ChecksumPlan,
-    /// An output buffer recycled from an earlier block.
-    pub(crate) out: Vec<u8>,
+    /// An output buffer recycled from an earlier block, or nothing for a
+    /// block whose buffer is lent.
+    pub(crate) out: DicBuf,
+    /// For a block whose buffer goes on caller memory, the backing the
+    /// worker asks for it; `None` keeps the block in RAM.
+    pub(crate) window: Option<WindowBacking>,
 }
 
 /// A finished block on its way back.
@@ -74,7 +80,12 @@ pub(crate) struct XzDone {
     /// Whether the block decoded, and why not if it did not. The buffers come
     /// back either way so they can be used again.
     pub(crate) res: Result<(), XzErrorKind>,
-    pub(crate) out: Vec<u8>,
+    /// The block's buffer: owned, or the caller memory it was lent, which is
+    /// released when this is dropped.
+    pub(crate) out: DicBuf,
+    /// Whether the job asked for a lent buffer, so the dispatcher's
+    /// accounting matches what it admitted whatever came of the asking.
+    pub(crate) lent: bool,
     pub(crate) bytes: Vec<u8>,
     /// What the worker checksummed, when it was asked to and the block
     /// decoded.
@@ -228,6 +239,7 @@ fn worker(rx: &Mutex<Receiver<XzJob>>, tx: &Sender<XzDone>, cancel: &AtomicBool)
                 unpacked_len: job.unpacked_len,
                 res,
                 out: core::mem::take(&mut job.out),
+                lent: job.window.is_some(),
                 bytes: core::mem::take(&mut job.bytes),
                 checks,
             })
@@ -271,7 +283,7 @@ fn decode_block_in(job: &mut XzJob, bytes: &[u8]) -> Result<Option<BlockCheck>, 
     ) {
         Ok(progress) => progress,
         Err(e) => {
-            job.out = dec.take_block_dic();
+            job.out = dec.take_block_buf();
             return Err(e.into());
         }
     };
@@ -321,14 +333,39 @@ fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, 
     // The decoder first, so that a refusal leaves the job's buffer with it.
     let want = job.unpacked_len;
     let mut dec = Lzma2Decoder::new_probs_only(header.chain.dict_prop)?;
-    if job.out.len() < want {
-        let more = want - job.out.len();
-        job.out
-            .try_reserve_exact(more)
-            .map_err(|_| XzErrorKind::Lzma(crate::Error::Alloc))?;
-        job.out.resize(want, 0u8);
-    }
-    dec.set_block_dic(core::mem::take(&mut job.out), want);
+    let buf = match &job.window {
+        // This worker's own window, asked for here and released when the
+        // block's buffer is dropped after it has been handed over. A refusal
+        // fails the block; it does not fall back to RAM.
+        Some(window) => {
+            if !window.admits(want) {
+                return Err(XzErrorKind::MemoryLimit {
+                    needed: want as u64,
+                    limit: window.max_len(),
+                });
+            }
+            let mem = window
+                .allocate(want)
+                .map_err(|e| XzErrorKind::WindowAlloc {
+                    needed: want as u64,
+                    kind: e.kind(),
+                })?;
+            DicBuf::Caller(mem)
+        }
+        None => {
+            let mut out = job.out.take_vec();
+            if out.len() < want {
+                let more = want - out.len();
+                if out.try_reserve_exact(more).is_err() {
+                    job.out = DicBuf::Owned(out);
+                    return Err(XzErrorKind::Lzma(crate::Error::Alloc));
+                }
+                out.resize(want, 0u8);
+            }
+            DicBuf::Owned(out)
+        }
+    };
+    dec.set_block_buf(buf, want);
     Ok(dec)
 }
 
@@ -347,7 +384,7 @@ fn finish_block(
     // well its sizes line up. C: `Lzma2Dec_DecodeToDic`, which only reports
     // `LZMA_STATUS_FINISHED_WITH_MARK` from `LZMA2_STATE_FINISHED`, and the
     // `XzUnpacker_Code` caller that will not close a block before it.
-    let mut out = dec.take_block_dic();
+    let mut out = dec.take_block_buf();
     // The block's boundaries came from the index, so a block that did not
     // consume exactly its compressed data, or did not produce exactly what
     // the index promised, does not match the file it came from.
@@ -457,7 +494,7 @@ pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
     let (used_total, status) = match fed {
         Ok(progress) => progress,
         Err(e) => {
-            job.out = dec.take_block_dic();
+            job.out = dec.take_block_buf();
             return Err(e);
         }
     };
@@ -508,9 +545,14 @@ mod tests {
             check: CheckType::Crc32,
             verify: true,
             plan: ChecksumPlan::none(),
-            out,
+            out: crate::buffer::DicBuf::Owned(out),
+            window: None,
         };
         (job, file)
+    }
+
+    fn capacity(job: &mut XzJob) -> usize {
+        job.out.take_vec().capacity()
     }
 
     #[test]
@@ -518,7 +560,7 @@ mod tests {
         let (mut job, _) = corrupt_job();
         let input = job.bytes.capacity();
         assert!(decode_block(&mut job).is_err());
-        assert!(job.out.capacity() >= 1 << 16, "the output buffer was lost");
+        assert!(capacity(&mut job) >= 1 << 16, "the output buffer was lost");
         assert_eq!(job.bytes.capacity(), input, "the input buffer was lost");
 
         let (mut job, file) = corrupt_job();
@@ -526,7 +568,7 @@ mod tests {
         src.set_position(job.file_offset);
         job.bytes = Vec::with_capacity(1 << 12);
         assert!(decode_block_reader(&mut job, &mut src).is_err());
-        assert!(job.out.capacity() >= 1 << 16, "the output buffer was lost");
+        assert!(capacity(&mut job) >= 1 << 16, "the output buffer was lost");
         assert!(job.bytes.capacity() >= 1 << 12, "the input buffer was lost");
     }
 }

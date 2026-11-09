@@ -71,6 +71,17 @@ pub enum XzErrorKind {
     /// The LZMA2 layer failed: corrupt or truncated data, an allocation, a
     /// cancellation. The [`Error`] is this kind's `source()`.
     Lzma(Error),
+    /// The options' [`crate::WindowAllocator`] could not provide a block's
+    /// dictionary. Carries the size asked for and the class of the
+    /// allocator's error, which is also this failure's `io::ErrorKind`.
+    #[cfg(feature = "std")]
+    #[non_exhaustive]
+    WindowAlloc {
+        /// Bytes asked of the allocator.
+        needed: u64,
+        /// The `io::ErrorKind` of the allocator's error.
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl XzErrorKind {
@@ -107,6 +118,7 @@ impl XzErrorKind {
                 ErrorKind::Unsupported
             }
             XzErrorKind::Lzma(e) => e.io_kind(),
+            XzErrorKind::WindowAlloc { kind, .. } => *kind,
             XzErrorKind::BadMagic
             | XzErrorKind::BadFooterMagic
             | XzErrorKind::BadStreamFlags
@@ -157,6 +169,11 @@ impl fmt::Display for XzErrorKind {
                 write!(f, "xz stream decodes to more than the {limit}-byte cap")
             }
             XzErrorKind::Lzma(_) => f.write_str("xz LZMA2 layer failed"),
+            #[cfg(feature = "std")]
+            XzErrorKind::WindowAlloc { needed, kind } => write!(
+                f,
+                "window allocator could not provide a {needed}-byte xz dictionary: {kind}"
+            ),
         }
     }
 }

@@ -62,6 +62,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_window"
+path = "fuzz_targets/decode_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "encode_round_trip"
 path = "fuzz_targets/encode_round_trip.rs"
 test = false

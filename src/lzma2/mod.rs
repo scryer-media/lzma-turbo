@@ -91,14 +91,37 @@ impl Lzma2Decoder {
     ///
     /// As [`Lzma2Decoder::new`].
     pub fn new_capped(dict_prop: u8, cap: u32) -> Result<Self, Error> {
+        let prop = Self::capped_props(dict_prop, cap)?;
+        let mut p = Lzma2Decoder {
+            frame: Lzma2Frame::new(),
+            decoder: LzmaDec::new(prop)?,
+        };
+        p.reset();
+        Ok(p)
+    }
+
+    /// The properties [`Lzma2Decoder::new_capped`] decodes with; their
+    /// `dic_buf_size` is the dictionary it allocates. A `cap` of `u32::MAX`
+    /// gives [`Lzma2Decoder::new`]'s.
+    pub(crate) fn capped_props(dict_prop: u8, cap: u32) -> Result<LzmaProps, Error> {
         if dict_prop > 40 {
             return Err(Error::UnsupportedProps);
         }
         let dic_size = frame::dic_size_from_prop_full(dict_prop).min(cap);
-        let prop = LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))?;
+        LzmaProps::new(LZMA2_LCLP_MAX, 0, 0, dic_size.max(LZMA_DIC_MIN))
+    }
+
+    /// As [`Lzma2Decoder::new_capped`] for `prop` from
+    /// [`Lzma2Decoder::capped_props`], with the dictionary on caller memory
+    /// of exactly `prop.dic_buf_size()` bytes.
+    #[cfg(feature = "std")]
+    pub(crate) fn with_caller_dic(
+        prop: LzmaProps,
+        dic: crate::window::CallerWindow,
+    ) -> Result<Self, Error> {
         let mut p = Lzma2Decoder {
             frame: Lzma2Frame::new(),
-            decoder: LzmaDec::new(prop)?,
+            decoder: LzmaDec::with_caller_dic(prop, dic)?,
         };
         p.reset();
         Ok(p)
@@ -366,6 +389,13 @@ impl Lzma2Decoder {
     /// plus the `Lzma2Dec_Init` that `..._Code` does on `needInit`.
     #[cfg(feature = "std")]
     pub(crate) fn set_block_dic(&mut self, buf: alloc::vec::Vec<u8>, size: usize) {
+        self.set_block_buf(crate::buffer::DicBuf::Owned(buf), size);
+    }
+
+    /// As [`Lzma2Decoder::set_block_dic`], for a buffer that may be caller
+    /// memory: a threaded xz block whose dictionary is lent.
+    #[cfg(feature = "std")]
+    pub(crate) fn set_block_buf(&mut self, buf: crate::buffer::DicBuf, size: usize) {
         debug_assert!(buf.len() >= size);
         self.decoder.dic = buf;
         self.decoder.dic_buf_size = size;
@@ -376,6 +406,12 @@ impl Lzma2Decoder {
     /// return it for the next block.
     #[cfg(feature = "std")]
     pub(crate) fn take_block_dic(&mut self) -> alloc::vec::Vec<u8> {
+        self.take_block_buf().take_vec()
+    }
+
+    /// As [`Lzma2Decoder::take_block_dic`], keeping caller memory as it is.
+    #[cfg(feature = "std")]
+    pub(crate) fn take_block_buf(&mut self) -> crate::buffer::DicBuf {
         self.decoder.dic_buf_size = 0;
         self.decoder.dic_pos = 0;
         core::mem::take(&mut self.decoder.dic)

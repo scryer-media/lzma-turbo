@@ -83,6 +83,7 @@ impl BlockDecoder {
         plan: &ChecksumPlan,
         verify: bool,
         limits: BlockLimits,
+        window: Option<&crate::WindowBacking>,
     ) -> Result<Self, XzErrorKind> {
         if let Some(n) = limits.uncompressed_size
             && n > limits.max_block_size
@@ -92,14 +93,44 @@ impl BlockDecoder {
             });
         }
         let dict = dict_bytes(chain.dict_prop, limits.uncompressed_size);
-        if dict > limits.memory_limit {
+        let cap = u32::try_from(dict).unwrap_or(u32::MAX);
+        // A dictionary over the window's in-RAM limit goes on the window's
+        // memory, and then costs nothing against the memory limit, which
+        // bounds what the decoder allocates itself.
+        let caller = match window {
+            Some(w) => {
+                let prop = Lzma2Decoder::capped_props(chain.dict_prop, cap)?;
+                let size = prop.dic_buf_size();
+                w.covers(size).then_some((w, prop, size))
+            }
+            None => None,
+        };
+        // A dictionary over the window's ceiling is refused here, before the
+        // allocator is asked.
+        if let Some((w, _, size)) = caller
+            && !w.admits(size)
+        {
+            return Err(XzErrorKind::MemoryLimit {
+                needed: size as u64,
+                limit: w.max_len(),
+            });
+        }
+        if caller.is_none() && dict > limits.memory_limit {
             return Err(XzErrorKind::MemoryLimit {
                 needed: dict,
                 limit: limits.memory_limit,
             });
         }
-        let cap = u32::try_from(dict).unwrap_or(u32::MAX);
-        let lzma2 = Lzma2Decoder::new_capped(chain.dict_prop, cap)?;
+        let lzma2 = match caller {
+            Some((w, prop, size)) => {
+                let mem = w.allocate(size).map_err(|e| XzErrorKind::WindowAlloc {
+                    needed: size as u64,
+                    kind: e.kind(),
+                })?;
+                Lzma2Decoder::with_caller_dic(prop, mem)?
+            }
+            None => Lzma2Decoder::new_capped(chain.dict_prop, cap)?,
+        };
         Ok(BlockDecoder {
             lzma2,
             converters: chain.build()?,
@@ -412,6 +443,7 @@ mod tests {
                 compressed_size: Some(packed as u64),
                 max_block_size: cap,
             },
+            None,
         )
         .unwrap()
     }
