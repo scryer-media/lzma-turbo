@@ -325,6 +325,7 @@ impl<R: Read> XzReader<R> {
             &self.opts.plan,
             self.opts.verify_checks,
             limits,
+            self.opts.window.as_ref(),
         )
         .map_err(|k| self.fail(k))?;
         self.dec = Some(dec);

@@ -61,6 +61,8 @@ mod mt;
 mod reader;
 #[cfg(feature = "std")]
 pub mod run;
+#[cfg(feature = "std")]
+mod window;
 
 #[cfg(feature = "xz")]
 pub mod xz;
@@ -96,6 +98,8 @@ pub use mt::checksum::{BlockChecks, Checksum, ChecksumPlan, Segment, SegmentChec
 pub use mt::{Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2ParallelReader, mt_memory_estimate};
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
+#[cfg(feature = "std")]
+pub use window::{WindowAllocator, WindowBacking, WindowMemory};
 #[cfg(feature = "xz")]
 pub use xz::{XzAdaptiveDecoder, XzError, XzOptions, XzParallelReader, XzReader};
 
