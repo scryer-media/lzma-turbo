@@ -68,6 +68,8 @@ pub(crate) struct XzJob {
     /// For a block whose buffer goes on caller memory, the backing the
     /// worker asks for it; `None` keeps the block in RAM.
     pub(crate) window: Option<WindowBacking>,
+    /// The allocator's own failure, when it refused this block's window.
+    pub(crate) window_err: Option<crate::WindowAllocError>,
 }
 
 /// A finished block on its way back.
@@ -90,6 +92,8 @@ pub(crate) struct XzDone {
     /// What the worker checksummed, when it was asked to and the block
     /// decoded.
     pub(crate) checks: Option<BlockCheck>,
+    /// The allocator's own failure behind an `XzErrorKind::WindowAlloc`.
+    pub(crate) window_err: Option<crate::WindowAllocError>,
 }
 
 /// Workers that decode whole xz blocks.
@@ -242,6 +246,7 @@ fn worker(rx: &Mutex<Receiver<XzJob>>, tx: &Sender<XzDone>, cancel: &AtomicBool)
                 lent: job.window.is_some(),
                 bytes: core::mem::take(&mut job.bytes),
                 checks,
+                window_err: job.window_err.take(),
             })
             .is_err()
         {
@@ -344,12 +349,17 @@ fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, 
                     limit: window.max_len(),
                 });
             }
-            let mem = window
-                .allocate(want)
-                .map_err(|e| XzErrorKind::WindowAlloc {
-                    needed: want as u64,
-                    kind: e.kind(),
-                })?;
+            let mem = match window.allocate(want) {
+                Ok(mem) => mem,
+                Err(e) => {
+                    let kind = e.kind();
+                    job.window_err = crate::WindowAllocError::from_io(e).ok();
+                    return Err(XzErrorKind::WindowAlloc {
+                        needed: want as u64,
+                        kind,
+                    });
+                }
+            };
             DicBuf::Caller(mem)
         }
         None => {
@@ -365,7 +375,7 @@ fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, 
             DicBuf::Owned(out)
         }
     };
-    dec.set_block_buf(buf, want);
+    dec.set_block_buf(buf, want).map_err(XzErrorKind::Lzma)?;
     Ok(dec)
 }
 
@@ -479,7 +489,13 @@ pub(crate) fn decode_block_reader<R: std::io::Read + std::io::Seek>(
         return Err(located(XzErrorKind::BadPadding));
     }
     src.seek(SeekFrom::Start(data_start))?;
-    let mut dec = block_decoder(job, &header).map_err(located)?;
+    let mut dec = match block_decoder(job, &header) {
+        Ok(dec) => dec,
+        Err(kind) => {
+            let at = super::error::XzError::in_block(kind, stream, block, offset);
+            return Err(super::error::to_io(at, job.window_err.take()));
+        }
+    };
     // Both recycled buffers go back to the job whatever happens.
     let mut input = core::mem::take(&mut job.bytes);
     let fed = feed_block(
@@ -547,6 +563,7 @@ mod tests {
             plan: ChecksumPlan::none(),
             out: crate::buffer::DicBuf::Owned(out),
             window: None,
+            window_err: None,
         };
         (job, file)
     }

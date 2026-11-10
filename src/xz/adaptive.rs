@@ -105,6 +105,11 @@ pub struct XzAdaptiveDecoder {
     checks: Vec<BlockCheck>,
     input_done: bool,
     cancelled: bool,
+    /// The allocator's own failure behind the last
+    /// [`XzErrorKind::WindowAlloc`] returned, for
+    /// [`XzAdaptiveDecoder::take_window_error`]. `AssertUnwindSafe` keeps the
+    /// decoder's auto traits, as an `io::Error` would not.
+    window_err: core::panic::AssertUnwindSafe<Option<crate::WindowAllocError>>,
 }
 
 impl XzAdaptiveDecoder {
@@ -153,6 +158,7 @@ impl XzAdaptiveDecoder {
             checks: Vec::new(),
             input_done: false,
             cancelled: false,
+            window_err: core::panic::AssertUnwindSafe(None),
         }
     }
 
@@ -198,6 +204,27 @@ impl XzAdaptiveDecoder {
                 .as_ref()
                 .map_or(0, |(buf, len, _)| in_ram(buf.is_lent(), *len)),
         )
+    }
+
+    /// The allocator's own failure behind the [`XzErrorKind::WindowAlloc`]
+    /// the decoder last returned, once, with its location as
+    /// [`crate::WindowAllocError::xz_error`]; `None` when no allocator has
+    /// failed it, or when it has been taken.
+    pub fn take_window_error(&mut self) -> Option<crate::WindowAllocError> {
+        self.window_err.0.take()
+    }
+
+    /// Keeps the allocator's failure behind `error` for
+    /// [`XzAdaptiveDecoder::take_window_error`], and returns `error`.
+    fn window_failed(
+        &mut self,
+        error: XzError,
+        window: Option<crate::WindowAllocError>,
+    ) -> XzError {
+        self.window_err.0 = window
+            .filter(|_| matches!(error.kind, XzErrorKind::WindowAlloc { .. }))
+            .map(|w| w.located(error));
+        error
     }
 
     /// Total output handed to the caller so far.
@@ -533,6 +560,7 @@ impl XzAdaptiveDecoder {
             compressed_size: header.compressed_size,
             max_block_size: self.block_cap(),
         };
+        let mut window_err = None;
         let dec = BlockDecoder::new(
             &header.chain,
             self.flags.check,
@@ -541,8 +569,12 @@ impl XzAdaptiveDecoder {
             self.opts.verify_checks,
             limits,
             self.opts.window.as_ref(),
+            &mut window_err,
         )
-        .map_err(|k| self.err(k))?;
+        .map_err(|k| {
+            let error = self.err(k);
+            self.window_failed(error, window_err.take())
+        })?;
         self.st = Some(dec);
         self.st_header_size = header_size;
         self.consume(header_size);
@@ -665,6 +697,7 @@ impl XzAdaptiveDecoder {
             plan,
             out,
             window,
+            window_err: None,
         };
         let sent = pool.dispatch(job);
         sent.map_err(|k| self.err(k))?;
@@ -976,16 +1009,13 @@ impl XzAdaptiveDecoder {
                 lent: _,
                 bytes,
                 checks,
+                window_err,
             } = done;
             self.spare_in.push(bytes);
             if let Err(kind) = res {
                 out.recycle_into(&mut self.spare_out);
-                return Err(XzError::in_block(
-                    kind,
-                    stream,
-                    block_in_stream,
-                    file_offset,
-                ));
+                let error = XzError::in_block(kind, stream, block_in_stream, file_offset);
+                return Err(self.window_failed(error, window_err));
             }
             let take = unpacked_len.min(*left);
             sink(self.emitted, &out[..take]);
@@ -1083,6 +1113,7 @@ mod admission_tests {
             lent: false,
             bytes: alloc::vec![0; 12],
             checks: None,
+            window_err: None,
         }
     }
 

@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.12.0 - Unreleased
+
+- The threaded raw LZMA2 decoders take a `WindowBacking` too, so a stream
+  whose buffers are over the in-RAM limit decodes on caller memory at the
+  thread count the caller set: `Lzma2ParallelDecoder::with_window` (for both
+  `decode` and `decode_at`), `Lzma2ParallelReader::with_window` and
+  `with_checksums_and_window`, `Lzma2AdaptiveDecoder::with_window`, and the
+  positional `run::Lzma2RunDecoder::with_window`. Each worker asks the
+  allocator for one buffer over the limit and keeps it for its next block or
+  run; it goes back when the worker retires or the decoder drops.
+  `max_windows()` says how many can be alive at once: the thread count, one
+  more for the adaptive decoder's chase, and one for a run decoder. The
+  limit and the ceiling apply to each worker's buffer, which holds a block or
+  a run rather than only the dictionary.
+- What a worker may be lent is bounded by the dictionary:
+  `Lzma2Decoder::max_worker_window_len`, four times the dictionary held to
+  between 1 MiB and 256 MiB, or the dictionary when larger (256 MiB for a
+  64 MiB or 256 MiB dictionary, 1 GiB for 1 GiB, 1.5 GiB for 1.5 GiB; each
+  of 7-Zip's threaded blocks fits). A block or run longer than that, or over
+  the ceiling, is never asked for: it decodes on the single-threaded path,
+  whose buffer is the dictionary alone, and `decode_at` gives back every
+  window it holds before handing the stream over. The bytes lent at once
+  are at most `max_windows()` times the bound.
+- Lent buffers count nothing against the memory limit: `memory_estimate`,
+  `Lzma2RunDecoder::memory_required_with_window` and the adaptive decoder's
+  `dispatch_cost` count only what stays in RAM, so a limit that left one
+  thread in RAM can keep more. `memory_required_with_window` refuses a ring
+  over the ceiling as `with_window` does. The adaptive decoder's new
+  `in_flight_ram_bytes` leaves lent output out; `in_flight_bytes` keeps its
+  meaning, the work in the decoder, lent or not.
+- `Lzma2ParallelReader` hands its output across in pieces of at most 1 MiB
+  instead of copying whole blocks, so the reader's own heap is at most
+  5 MiB, with or without a backing; before, it held up to five block copies
+  (up to 1.25 GiB for 256 MiB blocks) that nothing counted. The new
+  `Lzma2ParallelReader::memory_estimate` is the decoder's estimate plus
+  those 5 MiB. Throughput is unchanged: 256 MiB with 32 MiB blocks reads in
+  the same time at two and four threads, with 64 MiB less peak memory.
+- An allocator failure fails the decode with its `io::ErrorKind` and is
+  never retried on fewer threads or in RAM. The new `WindowAllocError`
+  carries the allocator's own error: `WindowAllocError::from_io` takes it out
+  of the `io::Error` from `decode`, `decode_at`, the reader and
+  `Lzma2RunDecoder::with_window`, and `Lzma2AdaptiveDecoder::take_window_error`
+  hands it back after the adaptive decoder fails with the new
+  `Error::WindowAlloc`. A panic in the allocator fails the decode the same
+  way, as an `Other` error, instead of unwinding through the decoder's
+  threads. With no backing nothing changes.
+- The xz decoders hand back the allocator's own error too, so every decoder
+  that takes a `WindowBacking` does: `XzReader` and `XzParallelReader`
+  inside the `io::Error` they return, for `WindowAllocError::from_io`, and
+  `XzAdaptiveDecoder::take_window_error` after an
+  `XzErrorKind::WindowAlloc`. `WindowAllocError::xz_error` gives the located
+  `XzError`. Breaking: for that one failure the `io::Error` from the xz
+  readers now carries a `WindowAllocError` rather than an `XzError`; its
+  `io::ErrorKind` is unchanged, and a failed reader still returns the
+  `XzError` on every later read.
+- A block buffer shorter than its block is now an `InternalFailure` error in
+  every build, not a debug assertion.
+- `Lzma2Decoder::window_len`, `Lzma2Decoder::capped_window_len` and
+  `LzmaProps::window_len` give the dictionary size a decoder allocates, the
+  length a `WindowAllocator` is asked for.
+- Breaking: `Lzma2ParallelDecoder` is no longer `Copy`, since it can hold a
+  `WindowBacking`. It is still `Clone`.
+
 ## 0.11.0 - 2026-11-09
 
 - A caller can put a large dictionary on memory of its own, a mapped

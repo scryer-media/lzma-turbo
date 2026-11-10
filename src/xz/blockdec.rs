@@ -76,6 +76,9 @@ impl BlockDecoder {
     /// [`XzErrorKind::MemoryLimit`] if the dictionary does not fit,
     /// [`XzErrorKind::TooMuchOutput`] if the header declares more output than
     /// `max_block_size`, and the LZMA2 errors for an impossible property byte.
+    /// [`XzErrorKind::WindowAlloc`] when the window's allocator fails, with
+    /// the allocator's own failure put in `window_err`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         chain: &FilterChain,
         check: CheckType,
@@ -84,6 +87,7 @@ impl BlockDecoder {
         verify: bool,
         limits: BlockLimits,
         window: Option<&crate::WindowBacking>,
+        window_err: &mut Option<crate::WindowAllocError>,
     ) -> Result<Self, XzErrorKind> {
         if let Some(n) = limits.uncompressed_size
             && n > limits.max_block_size
@@ -123,9 +127,13 @@ impl BlockDecoder {
         }
         let lzma2 = match caller {
             Some((w, prop, size)) => {
-                let mem = w.allocate(size).map_err(|e| XzErrorKind::WindowAlloc {
-                    needed: size as u64,
-                    kind: e.kind(),
+                let mem = w.allocate(size).map_err(|e| {
+                    let kind = e.kind();
+                    *window_err = crate::WindowAllocError::from_io(e).ok();
+                    XzErrorKind::WindowAlloc {
+                        needed: size as u64,
+                        kind,
+                    }
                 })?;
                 Lzma2Decoder::with_caller_dic(prop, mem)?
             }
@@ -444,6 +452,7 @@ mod tests {
                 max_block_size: cap,
             },
             None,
+            &mut None,
         )
         .unwrap()
     }

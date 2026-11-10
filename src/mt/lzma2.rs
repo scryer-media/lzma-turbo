@@ -4,10 +4,10 @@
 //! C: the `Lzma2DecMt_MtCallback_*` functions and `CLzma2DecMtThread` in
 //! `C/Lzma2DecMt.c`.
 
-use alloc::vec::Vec;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::buffer::DicBuf;
 use crate::error::{Error, FinishMode};
 use crate::lzma2::Lzma2Decoder;
 use crate::lzma2::parse::{Lzma2Parser, ParseStatus};
@@ -50,6 +50,41 @@ pub(crate) struct Lzma2CoderProps {
     pub(crate) plan: ChecksumPlan,
     #[cfg(feature = "crc")]
     pub(crate) checks: Option<ChecksumSink>,
+    /// Where a block buffer over the backing's in-RAM limit comes from.
+    /// `None` keeps every block buffer in RAM.
+    pub(crate) window: Option<crate::WindowBacking>,
+}
+
+/// A block buffer of at least `need` bytes in place of `buf`, which is too
+/// small.
+///
+/// Over the backing's in-RAM limit the buffer is caller memory: `buf` is
+/// released first, so a worker never holds two, and a size over the
+/// backing's ceiling is refused before the allocator is asked. A refusal by
+/// the allocator is its own `io::Error`, as [`crate::Lzma2Reader::with_window`]
+/// reports it, and fails the decode rather than handing the stream to the
+/// single-threaded tail the way a failed allocation of RAM does. Under the
+/// limit, or with no backing, an owned buffer grows as it always has.
+fn grow_block_buf(
+    buf: DicBuf,
+    need: usize,
+    window: Option<&crate::WindowBacking>,
+) -> Result<DicBuf, MtError> {
+    let mut buf = buf;
+    if window.is_some_and(|w| w.covers(need)) {
+        // Released before the allocator is asked, so a worker never holds
+        // two buffers.
+        buf = DicBuf::default();
+    }
+    if let Some(mem) = crate::window::lend(window, need).map_err(|r| MtError::Io(r.into()))? {
+        return Ok(DicBuf::Caller(mem));
+    }
+    let mut v = buf.take_vec();
+    let more = need - v.len();
+    v.try_reserve_exact(more)
+        .map_err(|_| MtError::Lzma(Error::Alloc))?;
+    v.resize(need, 0u8);
+    Ok(DicBuf::Owned(v))
 }
 
 /// C: `CLzma2DecMtThread`.
@@ -64,8 +99,10 @@ pub(crate) struct Lzma2Coder {
     parser: Lzma2Parser,
 
     /// C: `t->outBuf` / `t->outBufSize`. Owned here between blocks and lent to
-    /// `dec` as its dictionary while a block is being decoded.
-    out_buf: Vec<u8>,
+    /// `dec` as its dictionary while a block is being decoded. Caller memory
+    /// when a block needed more than the backing's in-RAM limit; it is then
+    /// kept for the worker's later blocks and released with the worker.
+    out_buf: DicBuf,
 
     /// C: `t->state`.
     state: ParseState,
@@ -106,7 +143,7 @@ impl Lzma2Coder {
             props,
             dec,
             parser: Lzma2Parser::new(),
-            out_buf: Vec::new(),
+            out_buf: DicBuf::default(),
             state: ParseState::Continue,
             parse_status: ParseStatus::NotSpecified,
             in_pre_size: 0,
@@ -124,7 +161,7 @@ impl Lzma2Coder {
 
     /// Reclaims the block buffer the decoder was lent, if it still has it.
     fn reclaim_out_buf(&mut self) {
-        let b = self.dec.take_block_dic();
+        let b = self.dec.take_block_buf();
         if !b.is_empty() {
             self.out_buf = b;
         }
@@ -298,7 +335,7 @@ impl Coder for Lzma2Coder {
         // windows-msvc by the corrupt-run differential test, which is the
         // shape that makes `MtDec` retry.
         if self.out_buf.is_empty() {
-            self.out_buf = self.dec.take_block_dic();
+            self.out_buf = self.dec.take_block_buf();
         }
 
         // C frees and reallocates when the buffer is too small. The port grows
@@ -306,16 +343,17 @@ impl Coder for Lzma2Coder {
         // uses, so a stream of blocks of differing sizes does not re-zero the
         // whole buffer every time.
         if self.out_buf.len() < self.out_pre_size {
-            let more = self.out_pre_size - self.out_buf.len();
-            self.out_buf
-                .try_reserve_exact(more)
-                .map_err(|_| MtError::Lzma(Error::Alloc))?;
-            self.out_buf.resize(self.out_pre_size, 0u8);
+            self.out_buf = grow_block_buf(
+                core::mem::take(&mut self.out_buf),
+                self.out_pre_size,
+                self.props.window.as_ref(),
+            )?;
         }
 
         let buf = core::mem::take(&mut self.out_buf);
-        self.dec.set_block_dic(buf, self.out_pre_size);
-        Ok(())
+        self.dec
+            .set_block_buf(buf, self.out_pre_size)
+            .map_err(MtError::Lzma)
     }
 
     /// C: `Lzma2DecMt_MtCallback_Code`.

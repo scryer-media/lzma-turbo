@@ -43,6 +43,7 @@ use checksum::{BlockChecks, ChecksumPlan, Segmenter};
 use crate::error::{Error, FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 use crate::lzma2::frame::dic_size_from_prop_full;
+use crate::window::WindowBacking;
 
 use lzma2::{Lzma2Coder, Lzma2CoderProps};
 use mtdec::{MtDec, ReplayBuf};
@@ -81,6 +82,41 @@ fn expected_block_size(dict_size: u32) -> u64 {
     block_size += K_MIN_SIZE - 1;
     block_size &= !(K_MIN_SIZE - 1);
     block_size
+}
+
+impl Lzma2Decoder {
+    /// The most bytes a threaded decoder asks a [`WindowAllocator`] for at
+    /// once, for one worker or for its single-threaded path, for a stream
+    /// whose dictionary-size property is `dict_prop`.
+    ///
+    /// It is the larger of the block 7-Zip's LZMA2 encoder makes for that
+    /// dictionary (four times the dictionary, held to between 1 MiB and
+    /// 256 MiB, and never less than the dictionary, rounded up to a whole
+    /// MiB) and the dictionary buffer itself, [`Lzma2Decoder::window_len`].
+    /// A worker decodes a block or run into a lent window only when it is at
+    /// most this long; a longer run is decoded on the single-threaded path,
+    /// whose buffer is the dictionary. So with a [`WindowBacking`], every
+    /// window [`Lzma2ParallelDecoder`], [`Lzma2ParallelReader`],
+    /// [`crate::Lzma2AdaptiveDecoder`] and [`crate::run::Lzma2RunDecoder`]
+    /// ask for is at most this long, and the bytes lent at once are at most
+    /// their `max_windows()` times this (one window for the run decoder),
+    /// whatever the stream holds.
+    ///
+    /// For a 7z or `xz`-style stream whose dictionary is 64 MiB that is
+    /// 256 MiB; for 256 MiB, 256 MiB; for 1 GiB, 1 GiB; and for 1.5 GiB,
+    /// 1.5 GiB. 7-Zip's threaded encoder cuts blocks of exactly the first
+    /// figure, so each of its blocks fits a worker's window.
+    ///
+    /// [`WindowAllocator`]: crate::WindowAllocator
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedProps`] if `dict_prop > 40`.
+    pub fn max_worker_window_len(dict_prop: u8) -> Result<usize, Error> {
+        let window = Self::window_len(dict_prop)?;
+        let block = expected_block_size(dic_size_from_prop_full(dict_prop));
+        Ok(usize::try_from(block).unwrap_or(usize::MAX).max(window))
+    }
 }
 
 /// How a multi-threaded decode is to be run.
@@ -128,11 +164,13 @@ pub(crate) type ChecksumSink = Arc<Mutex<Vec<BlockChecks>>>;
 struct Plan {
     threads: usize,
     out_block_max: usize,
+    /// What one worker holds in RAM. A block buffer over a backing's in-RAM
+    /// limit is lent, so with a backing only the limit's worth of it counts.
     per_thread: u64,
     st_only: bool,
 }
 
-fn plan(dict_prop: u8, options: &Lzma2MtOptions) -> Plan {
+fn plan(dict_prop: u8, options: &Lzma2MtOptions, window: Option<&WindowBacking>) -> Plan {
     let dict_size = dic_size_from_prop_full(dict_prop);
     let expected = expected_block_size(dict_size);
     let in_block_max = expected + expected / 16;
@@ -149,7 +187,21 @@ fn plan(dict_prop: u8, options: &Lzma2MtOptions) -> Plan {
         };
     }
 
-    let per_thread = expected + in_block_max + OVERHEAD_SIZE;
+    // A block over the backing's ceiling could not be lent, so with a
+    // backing blocks are cut no larger than it: a run that does not fit goes
+    // to the single-threaded tail, whose buffer is only the dictionary.
+    let out_block_max = match window {
+        Some(w) if w.covers(expected as usize) => expected.min(w.max_len()),
+        _ => expected,
+    };
+    // A worker's block buffer is at most `out_block_max` bytes. One over the
+    // backing's in-RAM limit is lent, so what stays in RAM is at most the
+    // limit; with no backing it is all of it, as 7-Zip counts it.
+    let out_ram = match window {
+        Some(w) if w.covers(out_block_max as usize) => out_block_max.min(w.in_memory_limit()),
+        _ => out_block_max,
+    };
+    let per_thread = out_ram + in_block_max + OVERHEAD_SIZE;
     let ok_threads = options.memory_limit / per_thread;
     let mut threads = options.threads as u64;
     if threads > ok_threads {
@@ -160,7 +212,7 @@ fn plan(dict_prop: u8, options: &Lzma2MtOptions) -> Plan {
     }
     Plan {
         threads: threads as usize,
-        out_block_max: expected as usize,
+        out_block_max: out_block_max as usize,
         per_thread,
         st_only: threads <= 1,
     }
@@ -171,10 +223,11 @@ fn plan(dict_prop: u8, options: &Lzma2MtOptions) -> Plan {
 /// Holds no decoder state: it is the plan, and each call to
 /// [`Lzma2ParallelDecoder::decode`] runs a ring of threads that exists only
 /// for the duration of that call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Lzma2ParallelDecoder {
     dict_prop: u8,
     plan: Plan,
+    window: Option<WindowBacking>,
 }
 
 impl Lzma2ParallelDecoder {
@@ -190,8 +243,72 @@ impl Lzma2ParallelDecoder {
         }
         Ok(Lzma2ParallelDecoder {
             dict_prop,
-            plan: plan(dict_prop, options),
+            plan: plan(dict_prop, options, None),
+            window: None,
         })
+    }
+
+    /// As [`Lzma2ParallelDecoder::new`], with every dictionary buffer over
+    /// the window's in-RAM limit on the window's allocator.
+    ///
+    /// Those buffers count nothing against `options.memory_limit`, so the
+    /// thread count is reduced only for what stays in RAM, and
+    /// [`Lzma2ParallelDecoder::memory_estimate`] reports only that. Each
+    /// worker of [`Lzma2ParallelDecoder::decode`] holds one block buffer for
+    /// its whole life and asks for a window only when its next block needs
+    /// more than the buffer it has; [`Lzma2ParallelDecoder::decode_at`]
+    /// holds one per run in flight and reuses a written run's for the next.
+    /// A block or run longer than [`Lzma2Decoder::max_worker_window_len`]
+    /// goes to no worker: `decode` gives it to the single-threaded path,
+    /// and `decode_at` hands the rest of the stream to `decode`, after
+    /// releasing every window it holds. The single-threaded tail asks for
+    /// its dictionary only after the workers' windows are released. At most
+    /// [`Lzma2ParallelDecoder::max_windows`] are alive at once.
+    ///
+    /// A buffer over [`WindowBacking::max_len`] fails the decode with the
+    /// memory-limit error, and an allocator's refusal fails it with the
+    /// allocator's error, as [`crate::Lzma2Reader::with_window`] reports
+    /// both. Neither drops the decode to fewer threads or to RAM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedProps`] if `dict_prop > 40`.
+    pub fn with_window(
+        dict_prop: u8,
+        options: &Lzma2MtOptions,
+        window: WindowBacking,
+    ) -> Result<Self, Error> {
+        if dict_prop > 40 {
+            return Err(Error::UnsupportedProps);
+        }
+        Ok(Lzma2ParallelDecoder {
+            dict_prop,
+            plan: plan(dict_prop, options, Some(&window)),
+            window: Some(window),
+        })
+    }
+
+    /// The most windows the backing can have lent to one decode at once:
+    /// one per thread for the threaded pass, or one for a decode that runs
+    /// single-threaded. Zero with no backing, or when no buffer this decode
+    /// can allocate is over the in-RAM limit. Each window is at most
+    /// [`Lzma2Decoder::max_worker_window_len`] and at most
+    /// [`WindowBacking::max_len`] bytes, so the bytes lent at once are at
+    /// most this times the smaller of the two.
+    #[must_use]
+    pub fn max_windows(&self) -> usize {
+        let Some(w) = self.window.as_ref() else {
+            return 0;
+        };
+        // The single-threaded tail's dictionary, lent only after the
+        // threaded pass has released every window of its own.
+        let tail = Lzma2Decoder::window_len(self.dict_prop).is_ok_and(|len| w.covers(len));
+        if self.plan.st_only {
+            return usize::from(tail);
+        }
+        // Any worker may hold one: a block, or a `decode_at` run, of up to
+        // `max_worker_window_len` bytes.
+        self.plan.threads
     }
 
     /// How many threads the plan will use. One means the single-threaded
@@ -203,8 +320,16 @@ impl Lzma2ParallelDecoder {
 
     /// An upper bound on the bytes this decode will allocate.
     #[must_use]
+    ///
+    /// Memory lent through a [`WindowBacking`] is not counted: this is what
+    /// the decode holds in RAM.
     pub fn memory_estimate(&self) -> u64 {
-        memory_estimate(self.dict_prop, self.plan.threads, self.plan.per_thread)
+        memory_estimate(
+            self.dict_prop,
+            self.plan.threads,
+            self.plan.per_thread,
+            self.window.as_ref(),
+        )
     }
 
     /// Decodes `input` to `out` and returns the number of bytes written.
@@ -285,6 +410,7 @@ impl Lzma2ParallelDecoder {
             let mut written = 0u64;
             return decode_st(
                 self.dict_prop,
+                self.window.as_ref(),
                 input,
                 out,
                 VecDeque::new(),
@@ -308,6 +434,7 @@ impl Lzma2ParallelDecoder {
             plan: plan.clone(),
             #[cfg(feature = "crc")]
             checks: sink.cloned(),
+            window: self.window.clone(),
         };
         let make = || Lzma2Coder::new(props.clone());
 
@@ -336,6 +463,7 @@ impl Lzma2ParallelDecoder {
         // read but did not decode.
         decode_st(
             self.dict_prop,
+            self.window.as_ref(),
             input,
             out,
             replay,
@@ -350,13 +478,22 @@ impl Lzma2ParallelDecoder {
     }
 }
 
-/// An upper bound on the memory a decode with this plan will allocate.
-fn memory_estimate(dict_prop: u8, threads: usize, per_thread: u64) -> u64 {
+/// An upper bound on the memory a decode with this plan will allocate in RAM.
+fn memory_estimate(
+    dict_prop: u8,
+    threads: usize,
+    per_thread: u64,
+    window: Option<&WindowBacking>,
+) -> u64 {
     let dict_size = u64::from(dic_size_from_prop_full(dict_prop));
+    // The tail's dictionary is lent when the backing covers it.
+    let lent =
+        window.is_some_and(|w| Lzma2Decoder::window_len(dict_prop).is_ok_and(|len| w.covers(len)));
+    let dict_ram = if lent { 0 } else { dict_size };
     // The single-threaded tail can run after the threaded pass, and its
     // dictionary and input buffer are additional to whatever the threaded pass
     // is still holding for replay.
-    let st = dict_size + IN_BUF_SIZE_ST as u64;
+    let st = dict_ram + IN_BUF_SIZE_ST as u64;
     if threads <= 1 {
         st
     } else {
@@ -366,6 +503,10 @@ fn memory_estimate(dict_prop: u8, threads: usize, per_thread: u64) -> u64 {
 
 /// An upper bound on the memory [`Lzma2ParallelDecoder`] would allocate for
 /// these options, without building one.
+///
+/// With a [`WindowBacking`], build the decoder with
+/// [`Lzma2ParallelDecoder::with_window`] and ask its
+/// [`Lzma2ParallelDecoder::memory_estimate`], which counts only RAM.
 ///
 /// # Errors
 ///
@@ -448,6 +589,7 @@ impl StSource<'_> {
 #[allow(clippy::too_many_arguments)]
 fn decode_st(
     dict_prop: u8,
+    window: Option<&WindowBacking>,
     stream: &mut (dyn Read + Send),
     out: &mut (dyn Write + Send),
     replay: VecDeque<ReplayBuf>,
@@ -456,7 +598,7 @@ fn decode_st(
     #[cfg(feature = "crc")] plan: &ChecksumPlan,
     #[cfg(feature = "crc")] sink: Option<&ChecksumSink>,
 ) -> io::Result<u64> {
-    let mut dec = Lzma2Decoder::new(dict_prop).map_err(to_io)?;
+    let mut dec = tail_decoder(dict_prop, window)?;
 
     // The single-threaded path checksums too, so that a stream with no
     // dictionary resets - or the tail of one the threaded pass could not
@@ -538,6 +680,18 @@ fn decode_st(
     }
 }
 
+/// The single-threaded decoder, its dictionary lent when the backing covers
+/// it, exactly as [`crate::Lzma2Reader::with_window`] builds it, with its
+/// errors.
+fn tail_decoder(dict_prop: u8, window: Option<&WindowBacking>) -> io::Result<Lzma2Decoder> {
+    let prop = Lzma2Decoder::capped_props(dict_prop, u32::MAX).map_err(to_io)?;
+    match crate::window::lend(window, prop.dic_buf_size())? {
+        Some(mem) => Lzma2Decoder::with_caller_dic(prop, mem),
+        None => Lzma2Decoder::new(dict_prop),
+    }
+    .map_err(to_io)
+}
+
 fn to_io(e: Error) -> io::Error {
     e.into()
 }
@@ -549,8 +703,18 @@ fn to_io(e: Error) -> io::Error {
 /// Block of decoded output on its way from the decoding threads to the reader.
 type Block = io::Result<Vec<u8>>;
 
-/// The `Write` end of the channel the reader pulls from. Blocks are moved, not
-/// copied: [`Lzma2ParallelReader`] hands the buffers back for reuse.
+/// The most bytes of output one piece on the reader's channel holds.
+const READER_PIECE: usize = OUT_STEP_ST;
+
+/// The pieces the reader and its coordinator can hold at once: the one the
+/// reader is reading, the one on the channel, the one the coordinator is
+/// sending, and the two spares on their way back.
+const READER_PIECES: u64 = 5;
+
+/// The `Write` end of the channel the reader pulls from. A block is copied
+/// across in pieces of at most [`READER_PIECE`] bytes, so the reader never
+/// holds a block-sized copy, whatever the block's size or where it lives;
+/// [`Lzma2ParallelReader`] hands the pieces back for reuse.
 struct ChannelSink {
     tx: SyncSender<Block>,
     spare: Receiver<Vec<u8>>,
@@ -558,12 +722,13 @@ struct ChannelSink {
 
 impl Write for ChannelSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let buf = &buf[..buf.len().min(READER_PIECE)];
         let mut v = match self.spare.try_recv() {
             Ok(mut v) => {
                 v.clear();
                 v
             }
-            Err(_) => Vec::new(),
+            Err(_) => Vec::with_capacity(buf.len()),
         };
         v.extend_from_slice(buf);
         self.tx
@@ -579,8 +744,9 @@ impl Write for ChannelSink {
 
 /// Streaming multi-threaded LZMA2 decoder over any [`Read`].
 ///
-/// The ring of threads runs behind the reader and hands whole blocks across;
-/// dropping the reader stops them and joins them.
+/// The ring of threads runs behind the reader and hands its output across in
+/// pieces of at most 1 MiB; dropping the reader stops them and joins them.
+/// [`Lzma2ParallelReader::memory_estimate`] bounds what it holds in RAM.
 ///
 /// # Why `R: Read + Send + 'static`
 ///
@@ -610,6 +776,7 @@ pub struct Lzma2ParallelReader<R: Read + Send + 'static> {
     cur: Vec<u8>,
     pos: usize,
     done: bool,
+    estimate: u64,
     _marker: core::marker::PhantomData<R>,
 }
 
@@ -621,10 +788,33 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
     /// Fails if the property byte is out of range or the coordinating thread
     /// cannot be spawned.
     pub fn new(inner: R, dict_prop: u8, options: &Lzma2MtOptions) -> io::Result<Self> {
+        let dec = Lzma2ParallelDecoder::new(dict_prop, options).map_err(to_io)?;
         #[cfg(feature = "crc")]
-        return Self::build(inner, dict_prop, options, &ChecksumPlan::none());
+        return Self::build(inner, dec, &ChecksumPlan::none());
         #[cfg(not(feature = "crc"))]
-        return Self::build(inner, dict_prop, options);
+        return Self::build(inner, dec);
+    }
+
+    /// As [`Lzma2ParallelReader::new`], with every dictionary buffer over the
+    /// window's in-RAM limit on the window's allocator, as
+    /// [`Lzma2ParallelDecoder::with_window`] describes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2ParallelReader::new`]. A window the decode cannot get fails
+    /// the read that needed it, with the error
+    /// [`Lzma2ParallelDecoder::with_window`] describes.
+    pub fn with_window(
+        inner: R,
+        dict_prop: u8,
+        options: &Lzma2MtOptions,
+        window: WindowBacking,
+    ) -> io::Result<Self> {
+        let dec = Lzma2ParallelDecoder::with_window(dict_prop, options, window).map_err(to_io)?;
+        #[cfg(feature = "crc")]
+        return Self::build(inner, dec, &ChecksumPlan::none());
+        #[cfg(not(feature = "crc"))]
+        return Self::build(inner, dec);
     }
 
     /// Builds a reader that also checksums each block in the worker that
@@ -641,7 +831,35 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
         options: &Lzma2MtOptions,
         plan: &ChecksumPlan,
     ) -> io::Result<Self> {
-        Self::build(inner, dict_prop, options, plan)
+        let dec = Lzma2ParallelDecoder::new(dict_prop, options).map_err(to_io)?;
+        Self::build(inner, dec, plan)
+    }
+
+    /// [`Lzma2ParallelReader::with_checksums`] and
+    /// [`Lzma2ParallelReader::with_window`] together.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lzma2ParallelReader::with_window`].
+    #[cfg(feature = "crc")]
+    pub fn with_checksums_and_window(
+        inner: R,
+        dict_prop: u8,
+        options: &Lzma2MtOptions,
+        plan: &ChecksumPlan,
+        window: WindowBacking,
+    ) -> io::Result<Self> {
+        let dec = Lzma2ParallelDecoder::with_window(dict_prop, options, window).map_err(to_io)?;
+        Self::build(inner, dec, plan)
+    }
+
+    /// An upper bound on the bytes the reader and the decode behind it hold
+    /// in RAM: [`Lzma2ParallelDecoder::memory_estimate`] for its options and
+    /// window, plus the 5 MiB of output pieces on their way to the caller.
+    /// Memory lent through a [`WindowBacking`] is not counted.
+    #[must_use]
+    pub fn memory_estimate(&self) -> u64 {
+        self.estimate
     }
 
     /// Everything checksummed since the last call, in output order.
@@ -672,15 +890,16 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
 
     fn build(
         inner: R,
-        dict_prop: u8,
-        options: &Lzma2MtOptions,
+        dec: Lzma2ParallelDecoder,
         #[cfg(feature = "crc")] plan: &ChecksumPlan,
     ) -> io::Result<Self> {
-        let dec = Lzma2ParallelDecoder::new(dict_prop, options).map_err(to_io)?;
         // One block in flight on the channel, plus the one the reader holds:
         // the same bound the ring itself uses, one unit of lookahead.
         let (tx, rx) = sync_channel::<Block>(1);
         let (spare_tx, spare) = sync_channel::<Vec<u8>>(2);
+        let estimate = dec
+            .memory_estimate()
+            .saturating_add(READER_PIECES * READER_PIECE as u64);
         let err_tx = tx.clone();
         #[cfg(feature = "crc")]
         let checks: Option<ChecksumSink> = if plan.is_none() {
@@ -721,6 +940,7 @@ impl<R: Read + Send + 'static> Lzma2ParallelReader<R> {
             cur: Vec::new(),
             pos: 0,
             done: false,
+            estimate,
             _marker: core::marker::PhantomData,
         })
     }

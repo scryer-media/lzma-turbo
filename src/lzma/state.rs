@@ -92,6 +92,16 @@ impl LzmaProps {
         self.dict_size
     }
 
+    /// The bytes of the dictionary buffer a decoder with these properties
+    /// allocates: [`LzmaProps::dict_size`] rounded up as the LZMA SDK rounds
+    /// it, to a multiple of 4 KiB, 1 MiB or 4 MiB depending on its size. It
+    /// is the length a [`crate::WindowBacking`] compares with its in-RAM
+    /// limit and asks its allocator for.
+    #[must_use]
+    pub fn window_len(&self) -> usize {
+        self.dic_buf_size()
+    }
+
     /// C: the `LZMA2_STATE_PROP` case of `Lzma2Dec_UpdateState`, which writes
     /// `lc`/`lp`/`pb` straight into `p->decoder.prop`.
     pub(crate) fn set_lclppb(&mut self, lc: u8, lp: u8, pb: u8) {

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "crc")]
 use crate::checksum::{BlockChecks, ChecksumPlan, Segmenter};
-use crate::{Error, FinishMode, Lzma2Decoder, Lzma2Run, Progress, Status};
+use crate::{Error, FinishMode, Lzma2Decoder, Lzma2Run, Progress, Status, WindowBacking};
 
 const STEP: usize = 256 << 10;
 const STATE_BYTES: u64 = 64 << 10;
@@ -69,6 +69,38 @@ impl Lzma2RunDecoder {
         Ok(props.dic_buf_size() as u64 + STATE_BYTES)
     }
 
+    /// As [`Lzma2RunDecoder::memory_required`], for a decoder built with
+    /// [`Lzma2RunDecoder::with_window`]: the ring counts nothing when the
+    /// window lends it, which it does when the ring is over the window's
+    /// in-RAM limit. The ring's length is
+    /// [`Lzma2Decoder::capped_window_len`] of the run's unpacked length.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedProps` for an invalid dictionary property, and
+    /// [`Error::MemoryLimit`] for a ring the window would lend but that is
+    /// over [`WindowBacking::max_len`], which
+    /// [`Lzma2RunDecoder::with_window`] refuses the same way.
+    pub fn memory_required_with_window(
+        dict_prop: u8,
+        unpacked_len: u64,
+        window: &WindowBacking,
+    ) -> Result<u64, Error> {
+        let ring = Self::ring_len(dict_prop, unpacked_len)?;
+        let all = Self::memory_required(dict_prop, unpacked_len)?;
+        if !window.covers(ring) {
+            return Ok(all);
+        }
+        if !window.admits(ring) {
+            return Err(Error::memory_limit(ring as u64, window.max_len()));
+        }
+        Ok(all - ring as u64)
+    }
+
+    /// The ring's length: the dictionary capped at the run's length.
+    fn ring_len(dict_prop: u8, unpacked_len: u64) -> Result<usize, Error> {
+        Lzma2Decoder::capped_window_len(dict_prop, unpacked_len.min(u64::from(u32::MAX)) as u32)
+    }
+
     /// Additional segment storage for a checksum plan over this exact run.
     /// The plan's shared split-point allocation belongs to the caller.
     ///
@@ -106,6 +138,52 @@ impl Lzma2RunDecoder {
     /// failure returns `Alloc`. The descriptor's lengths are still verified
     /// against the actual decoded stream before completion.
     pub fn new(index: u64, dict_prop: u8, run: Lzma2Run, memory_limit: u64) -> Result<Self, Error> {
+        let (cap, _, required) = Self::admit(index, dict_prop, run, memory_limit, None)?;
+        let decoder = Lzma2Decoder::new_capped(dict_prop, cap)?;
+        Ok(Self::assemble(decoder, index, run, memory_limit - required))
+    }
+
+    /// As [`Lzma2RunDecoder::new`], with the ring on the window's allocator
+    /// when it is over the window's in-RAM limit. The ring then counts
+    /// nothing against `memory_limit`, as
+    /// [`Lzma2RunDecoder::memory_required_with_window`] reports. The window
+    /// is asked once, here, and released when the decoder is dropped.
+    ///
+    /// # Errors
+    /// [`Lzma2RunDecoder::new`]'s errors, as the `io::Error` of their class
+    /// with the [`Error`] inside. A ring over [`WindowBacking::max_len`] is
+    /// refused with [`Error::MemoryLimit`] without asking the allocator. An
+    /// allocator's refusal is the allocator's own error kind, with a
+    /// [`crate::WindowAllocError`] inside that
+    /// [`crate::WindowAllocError::from_io`] takes out, as every threaded
+    /// decoder reports it.
+    pub fn with_window(
+        index: u64,
+        dict_prop: u8,
+        run: Lzma2Run,
+        memory_limit: u64,
+        window: WindowBacking,
+    ) -> io::Result<Self> {
+        let (cap, ring, required) =
+            Self::admit(index, dict_prop, run, memory_limit, Some(&window))?;
+        let decoder = match crate::window::lend(Some(&window), ring)? {
+            Some(mem) => {
+                Lzma2Decoder::with_caller_dic(Lzma2Decoder::capped_props(dict_prop, cap)?, mem)?
+            }
+            None => Lzma2Decoder::new_capped(dict_prop, cap)?,
+        };
+        Ok(Self::assemble(decoder, index, run, memory_limit - required))
+    }
+
+    /// Checks `run` and the memory it needs: the dictionary cap, the ring's
+    /// length, and what it holds in RAM.
+    fn admit(
+        index: u64,
+        dict_prop: u8,
+        run: Lzma2Run,
+        memory_limit: u64,
+        window: Option<&WindowBacking>,
+    ) -> Result<(u32, usize, u64), Error> {
         if !run.has_dict_reset
             || run.packed_len == 0
             || run.unpacked_len == 0
@@ -117,12 +195,21 @@ impl Lzma2RunDecoder {
                 out_offset: run.out_offset,
             });
         }
-        if Self::memory_required(dict_prop, run.unpacked_len)? > memory_limit {
+        let cap = run.unpacked_len.min(u32::MAX as u64) as u32;
+        let ring = Self::ring_len(dict_prop, run.unpacked_len)?;
+        let required = match window {
+            Some(w) => Self::memory_required_with_window(dict_prop, run.unpacked_len, w)?,
+            None => Self::memory_required(dict_prop, run.unpacked_len)?,
+        };
+        if required > memory_limit {
             return Err(Error::Alloc);
         }
-        let decoder =
-            Lzma2Decoder::new_capped(dict_prop, run.unpacked_len.min(u32::MAX as u64) as u32)?;
-        Ok(Self {
+        Ok((cap, ring, required))
+    }
+
+    #[cfg_attr(not(feature = "crc"), allow(unused_variables))]
+    fn assemble(decoder: Lzma2Decoder, index: u64, run: Lzma2Run, memory_room: u64) -> Self {
+        Self {
             decoder,
             run,
             index,
@@ -130,10 +217,10 @@ impl Lzma2RunDecoder {
             unpacked: 0,
             poisoned: false,
             #[cfg(feature = "crc")]
-            memory_room: memory_limit - Self::memory_required(dict_prop, run.unpacked_len)?,
+            memory_room,
             #[cfg(feature = "crc")]
             checks: Segmenter::new(&ChecksumPlan::none(), run.out_offset),
-        })
+        }
     }
 
     /// Configures checksums before decoding any input.

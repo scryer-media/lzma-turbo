@@ -13,7 +13,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use lzma_turbo::xz::{
     CheckType, XzAdaptiveDecoder, XzError, XzErrorKind, XzOptions, XzParallelReader, XzReader,
 };
-use lzma_turbo::{LzmaEncProps, WindowAllocator, WindowBacking, WindowMemory, encode_xz};
+use lzma_turbo::{
+    LzmaEncProps, WindowAllocError, WindowAllocator, WindowBacking, WindowMemory, encode_xz,
+};
 
 struct HeapWindow {
     buf: Box<[u8]>,
@@ -103,11 +105,38 @@ impl Heap {
     }
 }
 
+/// The kind of the located error an xz reader returned: its payload, or,
+/// for a window the allocator refused, the allocator failure's location.
 fn xz_kind(err: &io::Error) -> XzErrorKind {
-    err.get_ref()
-        .and_then(|e| e.downcast_ref::<XzError>())
+    let inner = err.get_ref().expect("a payload");
+    inner
+        .downcast_ref::<XzError>()
+        .copied()
+        .or_else(|| inner.downcast_ref::<WindowAllocError>()?.xz_error())
         .expect("an XzError")
         .kind
+}
+
+/// `err` holds the allocator's own failure, located in the file.
+fn allocator_error(err: io::Error, what: &str) -> WindowAllocError {
+    assert_eq!(err.kind(), io::ErrorKind::StorageFull, "{what}: {err}");
+    let w = WindowAllocError::from_io(err).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(
+        w.allocator_error().kind(),
+        io::ErrorKind::StorageFull,
+        "{what}"
+    );
+    assert_eq!(
+        w.allocator_error().to_string(),
+        "scratch disk full",
+        "{what}"
+    );
+    let at = w.xz_error().expect("located");
+    assert!(
+        matches!(at.kind, XzErrorKind::WindowAlloc { .. }),
+        "{what}: {at}"
+    );
+    w
 }
 
 fn backing(heap: &Arc<Heap>, in_memory_limit: u64) -> WindowBacking {
@@ -430,6 +459,7 @@ fn a_refused_second_window_fails_the_threaded_decode() {
         ),
         "{err}"
     );
+    assert_eq!(allocator_error(err, "parallel").needed(), 100_000);
     // Whatever was delivered before the failure is the file's start, and
     // the reader stays failed.
     assert!(out.len() <= 100_000 && data.starts_with(&out));
@@ -458,8 +488,75 @@ fn a_refused_second_window_fails_the_threaded_decode() {
         ),
         "{err}"
     );
+    let w = dec.take_window_error().expect("the allocator's error");
+    assert_eq!(w.xz_error(), Some(err));
+    assert_eq!(w.allocator_error().to_string(), "scratch disk full");
+    assert!(dec.take_window_error().is_none());
     drop(dec);
     assert_eq!(heap.live(), 0);
+}
+
+/// Every xz decoder that takes a window hands back the allocator's own
+/// error when it refuses one, located in the file: the readers inside the
+/// `io::Error` they return, the adaptive decoder from `take_window_error`.
+/// On one thread and on two, and every window goes back.
+#[test]
+fn every_xz_decoder_hands_back_the_allocators_error() {
+    let data = sample(300_000, 59);
+    let packed = xz(&data, 100_000);
+    let failing = || {
+        Arc::new(Heap {
+            fail: true,
+            ..Heap::default()
+        })
+    };
+
+    let heap = failing();
+    let opts = XzOptions::default().with_window(backing(&heap, 0));
+    let mut reader = XzReader::with_options(packed.as_slice(), opts);
+    allocator_error(read_all(&mut reader).unwrap_err(), "XzReader");
+    drop(reader);
+    assert_eq!(heap.live(), 0);
+
+    for threads in [1, 2] {
+        let what = format!("XzParallelReader, {threads} threads");
+        let heap = failing();
+        let opts = XzOptions::default()
+            .with_threads(threads)
+            .with_window(backing(&heap, 0));
+        let mut reader = XzParallelReader::with_options(Cursor::new(&packed), opts).unwrap();
+        allocator_error(read_all(&mut reader).unwrap_err(), &what);
+        // The reader stays failed, with the located error.
+        let again = reader.read(&mut [0; 16]).unwrap_err();
+        assert!(
+            matches!(xz_kind(&again), XzErrorKind::WindowAlloc { .. }),
+            "{what}"
+        );
+        drop(reader);
+        assert_eq!(heap.live(), 0, "{what}");
+
+        let what = format!("XzAdaptiveDecoder, {threads} threads");
+        let heap = failing();
+        let mut dec = XzAdaptiveDecoder::new(
+            XzOptions::default()
+                .with_threads(threads)
+                .with_window(backing(&heap, 0)),
+        );
+        let err = adaptive(&mut dec, &packed).unwrap_err();
+        assert!(
+            matches!(err.kind, XzErrorKind::WindowAlloc { .. }),
+            "{what}: {err}"
+        );
+        let w = dec.take_window_error().expect("the allocator's error");
+        assert_eq!(w.xz_error(), Some(err), "{what}");
+        assert_eq!(
+            w.allocator_error().to_string(),
+            "scratch disk full",
+            "{what}"
+        );
+        drop(dec);
+        assert_eq!(heap.live(), 0, "{what}");
+    }
 }
 
 #[test]

@@ -100,6 +100,31 @@ impl Lzma2Decoder {
         Ok(p)
     }
 
+    /// The bytes of the dictionary buffer [`Lzma2Decoder::new`] allocates for
+    /// `dict_prop`: the declared dictionary, rounded up as the LZMA SDK
+    /// rounds it. It is the length a [`crate::WindowBacking`] compares with
+    /// its in-RAM limit and asks its allocator for, for
+    /// [`crate::Lzma2Reader::with_window`] and for the single-threaded tail of
+    /// the threaded decoders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedProps`] if `dict_prop > 40`.
+    pub fn window_len(dict_prop: u8) -> Result<usize, Error> {
+        Ok(Self::capped_props(dict_prop, u32::MAX)?.dic_buf_size())
+    }
+
+    /// As [`Lzma2Decoder::window_len`], for a dictionary capped at `cap`
+    /// bytes as [`Lzma2Decoder::new_capped`] caps it. For a run decoder,
+    /// `cap` is the run's unpacked length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedProps`] if `dict_prop > 40`.
+    pub fn capped_window_len(dict_prop: u8, cap: u32) -> Result<usize, Error> {
+        Ok(Self::capped_props(dict_prop, cap)?.dic_buf_size())
+    }
+
     /// The properties [`Lzma2Decoder::new_capped`] decodes with; their
     /// `dic_buf_size` is the dictionary it allocates. A `cap` of `u32::MAX`
     /// gives [`Lzma2Decoder::new`]'s.
@@ -362,7 +387,7 @@ impl Lzma2Decoder {
 impl Lzma2Decoder {
     /// C: `Lzma2Dec_AllocateProbs`. Builds a decoder with the probability
     /// table but no dictionary of its own; the caller supplies one per block
-    /// with [`Lzma2Decoder::set_block_dic`].
+    /// with [`Lzma2Decoder::set_block_buf`].
     #[cfg(feature = "std")]
     pub(crate) fn new_probs_only(dict_prop: u8) -> Result<Self, Error> {
         if dict_prop > 40 {
@@ -379,37 +404,39 @@ impl Lzma2Decoder {
     }
 
     /// Installs `buf` as this decoder's dictionary for one block and declares
-    /// the block `size` bytes long, then re-initialises the decoder.
+    /// the block `size` bytes long, then re-initialises the decoder. `buf`
+    /// is owned, or caller memory a threaded decoder was lent for the block.
     ///
     /// `buf.len()` may exceed `size`: the buffer is reused across blocks and
     /// only ever grows, and the decoder reads and writes strictly below
     /// `dic_buf_size`.
     ///
+    /// A `buf` shorter than `size` is refused with
+    /// [`Error::InternalFailure`]: it is installed for no block, with a block
+    /// size of zero, so [`Lzma2Decoder::take_block_buf`] still hands it back.
+    /// Checked once per block, in every build.
+    ///
     /// C: the three assignments at the end of `Lzma2DecMt_MtCallback_PreCode`
     /// plus the `Lzma2Dec_Init` that `..._Code` does on `needInit`.
     #[cfg(feature = "std")]
-    pub(crate) fn set_block_dic(&mut self, buf: alloc::vec::Vec<u8>, size: usize) {
-        self.set_block_buf(crate::buffer::DicBuf::Owned(buf), size);
-    }
-
-    /// As [`Lzma2Decoder::set_block_dic`], for a buffer that may be caller
-    /// memory: a threaded xz block whose dictionary is lent.
-    #[cfg(feature = "std")]
-    pub(crate) fn set_block_buf(&mut self, buf: crate::buffer::DicBuf, size: usize) {
-        debug_assert!(buf.len() >= size);
+    pub(crate) fn set_block_buf(
+        &mut self,
+        buf: crate::buffer::DicBuf,
+        size: usize,
+    ) -> Result<(), Error> {
+        let fits = buf.len() >= size;
         self.decoder.dic = buf;
-        self.decoder.dic_buf_size = size;
+        self.decoder.dic_buf_size = if fits { size } else { 0 };
+        self.decoder.dic_pos = 0;
+        if !fits {
+            return Err(Error::InternalFailure);
+        }
         self.reset();
+        Ok(())
     }
 
-    /// Hands the block buffer back, so the caller can write it out and then
-    /// return it for the next block.
-    #[cfg(feature = "std")]
-    pub(crate) fn take_block_dic(&mut self) -> alloc::vec::Vec<u8> {
-        self.take_block_buf().take_vec()
-    }
-
-    /// As [`Lzma2Decoder::take_block_dic`], keeping caller memory as it is.
+    /// Hands the block buffer back, owned or caller memory, so the caller can
+    /// write it out and then return it for the next block.
     #[cfg(feature = "std")]
     pub(crate) fn take_block_buf(&mut self) -> crate::buffer::DicBuf {
         self.decoder.dic_buf_size = 0;
