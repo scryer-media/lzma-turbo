@@ -70,7 +70,8 @@ struct Plan {
 /// the window is dropped once the block has been read out. The thread count
 /// is the caller's, so up to [`XzParallelReader::threads`] windows are alive
 /// at once; an allocator refusal fails the decode with
-/// [`XzErrorKind::WindowAlloc`]. A block over the backing's ceiling is
+/// [`XzErrorKind::WindowAlloc`], the allocator's own error inside, as
+/// [`XzOptions::window`] describes. A block over the backing's ceiling is
 /// refused here with [`XzErrorKind::MemoryLimit`].
 ///
 /// # Example
@@ -380,6 +381,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
             plan: self.opts.plan.clone(),
             out,
             window,
+            window_err: None,
         };
         self.pool
             .dispatch(job)
@@ -429,6 +431,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 plan: self.opts.plan.clone(),
                 out,
                 window,
+                window_err: None,
             };
             let src = self.src.as_mut().expect("read by the serial decode");
             let checks = match super::pool::decode_block_reader(&mut job, src) {
@@ -436,10 +439,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 Err(error) => {
                     // As in the worker path, malformed blocks stop delivery.
                     // A source I/O error remains retryable with a fresh seek.
-                    self.failed = error
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<XzError>())
-                        .copied();
+                    self.failed = super::error::located(&error);
                     return Err(error);
                 }
             };
@@ -456,6 +456,7 @@ impl<R: Read + Seek> XzParallelReader<R> {
                 lent: job.window.is_some(),
                 bytes: job.bytes,
                 checks,
+                window_err: None,
             })?;
             return Ok(true);
         }
@@ -501,13 +502,14 @@ impl<R: Read + Seek> XzParallelReader<R> {
             lent: _,
             bytes,
             checks,
+            window_err,
         } = done;
         self.spare_in.push(bytes);
         if let Err(kind) = res {
             out.recycle_into(&mut self.spare_out);
             let error = XzError::in_block(kind, stream, block_in_stream, file_offset);
             self.failed = Some(error);
-            return Err(io::Error::from(error));
+            return Err(super::error::to_io(error, window_err));
         }
         if let Some(c) = checks
             && !self.opts.plan.is_none()
@@ -537,10 +539,7 @@ impl<R: Read + Seek> Read for XzParallelReader<R> {
                 Err(error) => {
                     // As with whole blocks, a malformed stream stops delivery
                     // and a source I/O error may be retried.
-                    self.failed = error
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<XzError>())
-                        .copied();
+                    self.failed = super::error::located(&error);
                     Err(error)
                 }
             };
@@ -1047,6 +1046,7 @@ mod tests {
                     lent: false,
                     bytes: Vec::new(),
                     checks: None,
+                    window_err: None,
                 },
             );
         }

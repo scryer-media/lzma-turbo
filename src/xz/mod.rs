@@ -151,8 +151,14 @@ pub struct XzOptions {
     ///   its dictionary on the allocator as [`XzReader`] does.
     ///
     /// An allocator refusal fails the decode with
-    /// [`XzErrorKind::WindowAlloc`]; a buffer over the backing's ceiling
-    /// fails it with [`XzErrorKind::MemoryLimit`] without asking.
+    /// [`XzErrorKind::WindowAlloc`], and the allocator's own error comes back
+    /// as a [`crate::WindowAllocError`]: inside the `io::Error` the readers
+    /// return, for [`crate::WindowAllocError::from_io`], and from
+    /// [`XzAdaptiveDecoder::take_window_error`]. Its
+    /// [`crate::WindowAllocError::xz_error`] is the located [`XzError`] the
+    /// readers' `io::Error` would otherwise carry. A buffer over the
+    /// backing's ceiling fails the decode with [`XzErrorKind::MemoryLimit`]
+    /// without asking.
     pub window: Option<crate::WindowBacking>,
 }
 

@@ -264,13 +264,23 @@ impl<R: Read> XzReader<R> {
 
     /// A located format error, as an `io::Error` carrying the [`XzError`].
     fn fail(&self, kind: impl Into<XzErrorKind>) -> io::Error {
+        self.fail_with(kind, None)
+    }
+
+    /// As [`XzReader::fail`], with the allocator's own failure inside in
+    /// place of the [`XzError`] for a window the allocator refused.
+    fn fail_with(
+        &self,
+        kind: impl Into<XzErrorKind>,
+        window: Option<crate::WindowAllocError>,
+    ) -> io::Error {
         let e = match self.state {
             State::Block | State::BlockTail => {
                 XzError::in_block(kind, self.stream, self.block_no, self.src.offset)
             }
             _ => XzError::at(kind, self.stream, self.src.offset),
         };
-        io::Error::from(e)
+        super::error::to_io(e, window)
     }
 
     // -- the state machine -------------------------------------------------
@@ -318,6 +328,7 @@ impl<R: Read> XzReader<R> {
             compressed_size: header.compressed_size,
             max_block_size: self.block_cap(),
         };
+        let mut window_err = None;
         let dec = BlockDecoder::new(
             &header.chain,
             self.flags.check,
@@ -326,8 +337,9 @@ impl<R: Read> XzReader<R> {
             self.opts.verify_checks,
             limits,
             self.opts.window.as_ref(),
+            &mut window_err,
         )
-        .map_err(|k| self.fail(k))?;
+        .map_err(|k| self.fail_with(k, window_err.take()))?;
         self.dec = Some(dec);
         self.state = State::Block;
         Ok(())

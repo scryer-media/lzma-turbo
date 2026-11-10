@@ -83,5 +83,30 @@ impl From<XzError> for std::io::Error {
     }
 }
 
+/// `error` as an `io::Error`, with the allocator's own failure inside in
+/// place of the [`XzError`] when there is one: the shape every decoder that
+/// takes a window returns, for [`crate::WindowAllocError::from_io`]. The
+/// [`XzError`] is then [`crate::WindowAllocError::xz_error`].
+#[cfg(feature = "std")]
+pub(crate) fn to_io(error: XzError, window: Option<crate::WindowAllocError>) -> std::io::Error {
+    match window {
+        Some(w) if matches!(error.kind, XzErrorKind::WindowAlloc { .. }) => {
+            std::io::Error::new(error.kind.io_kind(), w.located(error))
+        }
+        _ => error.into(),
+    }
+}
+
+/// The [`XzError`] an xz decoder's `io::Error` carries, either as its payload
+/// or inside the allocator failure [`to_io`] put there.
+#[cfg(feature = "std")]
+pub(crate) fn located(error: &std::io::Error) -> Option<XzError> {
+    let inner = error.get_ref()?;
+    inner
+        .downcast_ref::<XzError>()
+        .copied()
+        .or_else(|| inner.downcast_ref::<crate::WindowAllocError>()?.xz_error())
+}
+
 /// The result type the xz layer works in.
 pub type XzResult<T> = Result<T, XzError>;

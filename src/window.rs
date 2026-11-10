@@ -222,6 +222,8 @@ impl WindowBacking {
                 WindowAllocError {
                     needed: len as u64,
                     source,
+                    #[cfg(feature = "xz")]
+                    xz: None,
                 },
             )
         };
@@ -342,17 +344,25 @@ impl fmt::Debug for WindowBacking {
 
 /// A [`WindowAllocator`]'s failure, with the size it was asked for.
 ///
-/// A decoder that returns an `io::Error` returns this inside it, with the
-/// allocator's `io::ErrorKind`; [`WindowAllocError::from_io`] takes it out.
-/// [`crate::Lzma2AdaptiveDecoder`], whose errors are [`crate::Error`], hands
-/// it back from `take_window_error` after it fails with
-/// [`crate::Error::WindowAlloc`]. Memory the allocator returned short, null
-/// or too long for a slice, and a panic in the allocator, are reported the
-/// same way, with an `InvalidInput` and an `Other` error as the source.
+/// Every decoder that takes a [`WindowBacking`] hands this back when the
+/// allocator fails it. One that returns an `io::Error` returns this inside
+/// it, with the allocator's `io::ErrorKind`, and
+/// [`WindowAllocError::from_io`] takes it out: [`crate::LzmaReader`],
+/// [`crate::Lzma2Reader`], [`crate::Lzma2ParallelDecoder`],
+/// [`crate::Lzma2ParallelReader`], [`crate::run::Lzma2RunDecoder`], and the
+/// xz readers. One whose error is a `Copy` type hands it back from
+/// `take_window_error` after it fails: [`crate::Lzma2AdaptiveDecoder`], after
+/// [`crate::Error::WindowAlloc`], and the xz adaptive decoder, after
+/// `XzErrorKind::WindowAlloc`. Memory the allocator returned short, null or
+/// too long for a slice, and a panic in the allocator, are reported the same
+/// way, with an `InvalidInput` and an `Other` error as the source.
 #[derive(Debug)]
 pub struct WindowAllocError {
     needed: u64,
     source: io::Error,
+    /// Where in an xz file the failure was, for the xz decoders.
+    #[cfg(feature = "xz")]
+    xz: Option<crate::xz::XzError>,
 }
 
 impl WindowAllocError {
@@ -372,6 +382,22 @@ impl WindowAllocError {
     #[must_use]
     pub fn into_allocator_error(self) -> io::Error {
         self.source
+    }
+
+    /// Where in the file an xz decoder was when the allocator failed it:
+    /// the [`crate::xz::XzError`], of kind `XzErrorKind::WindowAlloc`, that
+    /// the xz decoders otherwise return. `None` from the other decoders.
+    #[cfg(feature = "xz")]
+    #[must_use]
+    pub fn xz_error(&self) -> Option<crate::xz::XzError> {
+        self.xz
+    }
+
+    /// This failure, located in an xz file.
+    #[cfg(feature = "xz")]
+    pub(crate) fn located(mut self, at: crate::xz::XzError) -> Self {
+        self.xz = Some(at);
+        self
     }
 
     /// The allocator's failure inside `e`, an error a decoder returned, or
@@ -395,6 +421,10 @@ impl WindowAllocError {
 
 impl fmt::Display for WindowAllocError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "xz")]
+        if let Some(at) = &self.xz {
+            return write!(f, "{at}: {}", self.source);
+        }
         write!(
             f,
             "window allocator could not provide a {}-byte dictionary: {}",
@@ -730,12 +760,20 @@ mod tests {
         assert!(err.to_string().contains("4096-byte dictionary"), "{err}");
         let source = std::error::Error::source(err.get_ref().unwrap()).unwrap();
         assert_eq!(source.to_string(), "no room for the window");
+        let w = WindowAllocError::from_io(err).unwrap();
+        assert_eq!(w.needed(), 4096);
+        assert_eq!(
+            w.into_allocator_error().to_string(),
+            "no room for the window"
+        );
 
         let packed = encode_lzma_alone(&sample(), &props()).unwrap();
         let err = LzmaReader::with_window(packed.as_slice(), u64::MAX, backing(&heap, 0))
             .err()
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        let w = WindowAllocError::from_io(err).unwrap();
+        assert_eq!(w.allocator_error().to_string(), "no room for the window");
     }
 
     #[test]

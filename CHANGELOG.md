@@ -35,7 +35,8 @@
   5 MiB, with or without a backing; before, it held up to five block copies
   (up to 1.25 GiB for 256 MiB blocks) that nothing counted. The new
   `Lzma2ParallelReader::memory_estimate` is the decoder's estimate plus
-  those 5 MiB.
+  those 5 MiB. Throughput is unchanged: 256 MiB with 32 MiB blocks reads in
+  the same time at two and four threads, with 64 MiB less peak memory.
 - An allocator failure fails the decode with its `io::ErrorKind` and is
   never retried on fewer threads or in RAM. The new `WindowAllocError`
   carries the allocator's own error: `WindowAllocError::from_io` takes it out
@@ -45,6 +46,15 @@
   `Error::WindowAlloc`. A panic in the allocator fails the decode the same
   way, as an `Other` error, instead of unwinding through the decoder's
   threads. With no backing nothing changes.
+- The xz decoders hand back the allocator's own error too, so every decoder
+  that takes a `WindowBacking` does: `XzReader` and `XzParallelReader`
+  inside the `io::Error` they return, for `WindowAllocError::from_io`, and
+  `XzAdaptiveDecoder::take_window_error` after an
+  `XzErrorKind::WindowAlloc`. `WindowAllocError::xz_error` gives the located
+  `XzError`. Breaking: for that one failure the `io::Error` from the xz
+  readers now carries a `WindowAllocError` rather than an `XzError`; its
+  `io::ErrorKind` is unchanged, and a failed reader still returns the
+  `XzError` on every later read.
 - A block buffer shorter than its block is now an `InternalFailure` error in
   every build, not a debug assertion.
 - `Lzma2Decoder::window_len`, `Lzma2Decoder::capped_window_len` and

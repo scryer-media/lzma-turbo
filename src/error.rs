@@ -73,7 +73,9 @@ pub enum XzErrorKind {
     Lzma(Error),
     /// The options' [`crate::WindowAllocator`] could not provide a block's
     /// dictionary. Carries the size asked for and the class of the
-    /// allocator's error, which is also this failure's `io::ErrorKind`.
+    /// allocator's error, which is also this failure's `io::ErrorKind`. The
+    /// allocator's error itself is a [`crate::WindowAllocError`], as
+    /// [`crate::xz::XzOptions::window`] describes.
     #[cfg(feature = "std")]
     #[non_exhaustive]
     WindowAlloc {
