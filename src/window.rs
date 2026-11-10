@@ -1515,16 +1515,23 @@ mod tests {
         drop(r);
         lent_within(&heap, 0, d.max_windows(), bound(prop), "reader");
 
+        // The adaptive decoder reports runs as they finish, not in stream
+        // order, so its segments are compared by offset.
+        let by_offset = |checks: Vec<crate::BlockChecks>| -> Vec<crate::Segment> {
+            let mut s = segments(checks);
+            s.sort_by_key(|seg| seg.offset);
+            s
+        };
         let mut owned = Lzma2AdaptiveDecoder::new(prop, &two()).unwrap();
         owned.set_checksum(&plan);
         assert_eq!(adaptive_mut(&mut owned, &packed).unwrap(), data);
-        let want = segments(owned.take_checks());
+        let want = by_offset(owned.take_checks());
         let heap = Arc::new(Heap::default());
         let mut a = adaptive_on(prop, backing(&heap, 0));
         a.set_checksum(&plan);
         let max = a.max_windows();
         assert_eq!(adaptive_mut(&mut a, &packed).unwrap(), data);
-        assert_eq!(segments(a.take_checks()), want);
+        assert_eq!(by_offset(a.take_checks()), want);
         drop(a);
         lent_within(&heap, 0, max, bound(prop), "adaptive");
     }
