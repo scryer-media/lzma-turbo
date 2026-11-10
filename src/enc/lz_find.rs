@@ -1997,7 +1997,7 @@ mod tests {
         // Kept for a stream that can be large, the small stream's buffers are
         // advised and not reallocated.
         let mut kept = create(small_limit);
-        let (hash, window) = (kept.hash.as_ptr(), kept.buf_base.as_ptr());
+        let (hash, window_words) = (kept.hash.as_ptr(), kept.buf_base.allocated_words());
         let allocs = kept.allocs;
         kept.create(4 << 20, 1 << 12, 32, 274, small_limit).unwrap();
         assert_eq!(kept.allocs, allocs);
@@ -2008,9 +2008,10 @@ mod tests {
         kept.create(4 << 20, 1 << 12, 32, 274, u64::MAX).unwrap();
         assert_eq!((kept.hash.as_ptr(), kept.allocs), (hash, allocs + 1));
         assert!(kept.hash.advised && kept.buf_base.advised);
-        assert_ne!(
-            kept.buf_base.as_ptr(),
-            window,
+        // The one new allocation is the window, by its length: where the
+        // allocator puts it is its own business, and may be the same address.
+        assert!(
+            kept.buf_base.allocated_words() > window_words,
             "the unbounded window is longer"
         );
 
