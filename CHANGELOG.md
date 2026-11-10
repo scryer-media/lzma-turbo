@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.12.0 - Unreleased
+## 0.12.0 - 2026-11-09
 
 - The threaded raw LZMA2 decoders take a `WindowBacking` too, so a stream
   whose buffers are over the in-RAM limit decodes on caller memory at the
