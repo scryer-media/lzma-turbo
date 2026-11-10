@@ -351,8 +351,9 @@ impl Coder for Lzma2Coder {
         }
 
         let buf = core::mem::take(&mut self.out_buf);
-        self.dec.set_block_buf(buf, self.out_pre_size);
-        Ok(())
+        self.dec
+            .set_block_buf(buf, self.out_pre_size)
+            .map_err(MtError::Lzma)
     }
 
     /// C: `Lzma2DecMt_MtCallback_Code`.

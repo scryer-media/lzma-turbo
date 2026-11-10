@@ -101,7 +101,7 @@ pub use mt::{
 #[cfg(feature = "std")]
 pub use reader::{Lzma2Reader, LzmaReader};
 #[cfg(feature = "std")]
-pub use window::{WindowAllocator, WindowBacking, WindowMemory};
+pub use window::{WindowAllocError, WindowAllocator, WindowBacking, WindowMemory};
 #[cfg(feature = "xz")]
 pub use xz::{XzAdaptiveDecoder, XzError, XzOptions, XzParallelReader, XzReader};
 

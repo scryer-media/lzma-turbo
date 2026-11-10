@@ -144,10 +144,19 @@ struct Feed {
     budget: u64,
     /// Where a run's output over the in-RAM limit is lent from.
     window: Option<crate::WindowBacking>,
+    /// The longest run whose output is lent:
+    /// [`Lzma2Decoder::max_worker_window_len`].
+    lent_max: usize,
 }
 
 impl Feed {
-    fn new(start: u64, end: u64, budget: u64, window: Option<crate::WindowBacking>) -> Self {
+    fn new(
+        start: u64,
+        end: u64,
+        budget: u64,
+        window: Option<crate::WindowBacking>,
+        lent_max: usize,
+    ) -> Self {
         Feed {
             scanner: Lzma2RunScanner::new(),
             start,
@@ -158,19 +167,22 @@ impl Feed {
             closed: false,
             budget,
             window,
+            lent_max,
         }
     }
 
     /// Whether `run` can be decoded here: what it holds in RAM is within
-    /// the budget, and a lent output is within the backing's ceiling. One
-    /// that is not is handed to the stream decoder, which needs no more than
-    /// the dictionary for it.
+    /// the budget, and a lent output is no longer than a worker's window for
+    /// this dictionary and within the backing's ceiling. One that is not is
+    /// handed to the stream decoder, which needs no more than a ring block
+    /// or the dictionary for it, so the stream's own sizes never set how
+    /// much is lent.
     fn fits(&self, run: &Lzma2Run) -> bool {
         let lent = usize::try_from(run.unpacked_len).ok().and_then(|len| {
             self.window
                 .as_ref()
                 .filter(|w| w.covers(len))
-                .map(|w| w.admits(len))
+                .map(|w| len <= self.lent_max && w.admits(len))
         });
         match lent {
             Some(admitted) => admitted && run.packed_len <= self.budget,
@@ -256,8 +268,9 @@ fn decode_one(
     want: usize,
     packed: &[u8],
 ) -> Result<DicBuf, Error> {
-    dec.set_block_buf(buf, want);
-    let res = dec.decode_block(want, packed, FinishMode::End);
+    let res = dec
+        .set_block_buf(buf, want)
+        .and_then(|()| dec.decode_block(want, packed, FinishMode::End));
     let produced = dec.dic_pos();
     let out = dec.take_block_buf();
     let (used, _) = res?;
@@ -380,7 +393,9 @@ impl Lzma2ParallelDecoder {
     /// It hands the stream to `decode` instead, with the same result, where
     /// parallel reading cannot help or cannot be bounded: a plan of one
     /// thread, or, from that run on, a run larger than the plan's per-thread
-    /// budget. A run that does not decode, or a header that does not scan, is
+    /// budget, or, with a [`crate::WindowBacking`], one longer than
+    /// [`Lzma2Decoder::max_worker_window_len`]. Every window this call holds
+    /// is released before the hand-over. A run that does not decode, or a header that does not scan, is
     /// handed over from its own start after every run before it has been
     /// written, so a damaged stream fails with the error `decode` gives for
     /// that run. Every run before it has been written by then, where `decode`
@@ -416,11 +431,14 @@ impl Lzma2ParallelDecoder {
             return rest(offset, &mut out);
         }
 
+        let lent_max =
+            Lzma2Decoder::max_worker_window_len(self.dict_prop).map_err(io::Error::from)?;
         let feed = Mutex::new(Feed::new(
             offset,
             end,
             self.plan.per_thread,
             self.window.clone(),
+            lent_max,
         ));
         let spares = Spare(Mutex::new(Vec::new()));
         let lend = self.window.as_ref();
@@ -534,8 +552,11 @@ impl Lzma2ParallelDecoder {
             }
             window.stop();
         });
-        // Every worker has stopped; the kept windows go back before the
-        // stream decoder, which asks for its own, takes over.
+        // Every worker has stopped. A run a worker finished after the writer
+        // stopped is still in the channel, its window with it: those and the
+        // kept windows go back before the stream decoder, which asks for its
+        // own, takes over.
+        drop(rx);
         drop(spares);
 
         if let Some(e) = write_err {

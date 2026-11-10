@@ -7,7 +7,9 @@
 //! through the parallel decoder's `decode` and `decode_at` and the adaptive
 //! decoder, once in RAM and once with every worker's window on garbage-filled
 //! caller memory; each pair must fail or finish together, with the same
-//! bytes.
+//! bytes. No window asked for may be longer than
+//! `Lzma2Decoder::max_worker_window_len`, and no more may be alive at once
+//! than the decoder's `max_windows()`, whatever the stream's headers say.
 //!
 //! The same bytes are then encoded as a small-block `.xz` file and decoded
 //! by two threads, each block on its worker's own garbage-filled window; the
@@ -16,12 +18,13 @@
 
 use std::io::{self, Cursor, Read};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libfuzzer_sys::fuzz_target;
 use lzma_turbo::xz::{CheckType, XzOptions, XzParallelReader};
 use lzma_turbo::{
-    DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2ParallelDecoder, Lzma2Reader,
-    LzmaEncProps, WindowAllocator, WindowBacking, WindowMemory, encode_xz,
+    DrainStatus, Lzma2AdaptiveDecoder, Lzma2Decoder, Lzma2MtOptions, Lzma2ParallelDecoder,
+    Lzma2Reader, LzmaEncProps, WindowAllocator, WindowBacking, WindowMemory, encode_xz,
 };
 
 /// The most output the threaded decodes are given; past it they fail.
@@ -49,6 +52,70 @@ impl WindowAllocator for Heap {
             .map(|i| (i as u8).wrapping_mul(151) ^ fill)
             .collect();
         Ok(Box::new(Garbage(buf)))
+    }
+}
+
+/// Garbage-filled windows that count how many are alive, the most alive at
+/// once, and the longest asked for.
+#[derive(Default)]
+struct Counted {
+    fill: u8,
+    live: Arc<AtomicUsize>,
+    peak: AtomicUsize,
+    longest: AtomicUsize,
+}
+
+struct CountedWindow(Garbage, Arc<AtomicUsize>);
+
+// SAFETY: as `Garbage`, which it forwards to.
+unsafe impl WindowMemory for CountedWindow {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Drop for CountedWindow {
+    fn drop(&mut self) {
+        self.1.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl WindowAllocator for Counted {
+    fn allocate(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
+        self.longest.fetch_max(len, Ordering::SeqCst);
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let fill = self.fill;
+        let buf = (0..len)
+            .map(|i| (i as u8).wrapping_mul(151) ^ fill)
+            .collect();
+        Ok(Box::new(CountedWindow(
+            Garbage(buf),
+            Arc::clone(&self.live),
+        )))
+    }
+}
+
+impl Counted {
+    /// Every window went back, none was longer than `bound`, and no more
+    /// than `max` were alive at once.
+    fn check(&self, bound: usize, max: usize, what: &str) {
+        assert_eq!(
+            self.live.load(Ordering::SeqCst),
+            0,
+            "{what}: a window was kept"
+        );
+        assert!(
+            self.longest.load(Ordering::SeqCst) <= bound,
+            "{what}: over the bound"
+        );
+        assert!(
+            self.peak.load(Ordering::SeqCst) <= max,
+            "{what}: over max_windows"
+        );
     }
 }
 
@@ -114,10 +181,21 @@ fn threaded(dict_prop: u8, input: &[u8], fill: u8) {
         threads: 2,
         memory_limit: 1 << 26,
     };
-    let lent = || WindowBacking::new(Arc::new(Heap(fill)), 0);
-    let (Ok(owned), Ok(caller)) = (
+    let Ok(bound) = Lzma2Decoder::max_worker_window_len(dict_prop) else {
+        return;
+    };
+    let counted = || {
+        Arc::new(Counted {
+            fill,
+            ..Counted::default()
+        })
+    };
+    let lent = |c: &Arc<Counted>| WindowBacking::new(Arc::clone(c) as Arc<dyn WindowAllocator>, 0);
+    let (ring, at) = (counted(), counted());
+    let (Ok(owned), Ok(caller), Ok(caller_at)) = (
         Lzma2ParallelDecoder::new(dict_prop, &opts),
-        Lzma2ParallelDecoder::with_window(dict_prop, &opts, lent()),
+        Lzma2ParallelDecoder::with_window(dict_prop, &opts, lent(&ring)),
+        Lzma2ParallelDecoder::with_window(dict_prop, &opts, lent(&at)),
     ) else {
         return;
     };
@@ -127,6 +205,7 @@ fn threaded(dict_prop: u8, input: &[u8], fill: u8) {
         (ok, ok.then_some(out))
     };
     assert_eq!(decode(&owned), decode(&caller), "decode");
+    ring.check(bound, caller.max_windows(), "decode");
     let decode_at = |d: &Lzma2ParallelDecoder| {
         let mut out = Vec::new();
         let ok = d
@@ -134,14 +213,18 @@ fn threaded(dict_prop: u8, input: &[u8], fill: u8) {
             .is_ok();
         (ok, ok.then_some(out))
     };
-    assert_eq!(decode_at(&owned), decode_at(&caller), "decode_at");
+    assert_eq!(decode_at(&owned), decode_at(&caller_at), "decode_at");
+    at.check(bound, caller_at.max_windows(), "decode_at");
+    let lent_adaptive = counted();
     let (Ok(owned), Ok(caller)) = (
         Lzma2AdaptiveDecoder::new(dict_prop, &opts),
-        Lzma2AdaptiveDecoder::with_window(dict_prop, &opts, lent()),
+        Lzma2AdaptiveDecoder::with_window(dict_prop, &opts, lent(&lent_adaptive)),
     ) else {
         return;
     };
+    let max = caller.max_windows();
     assert_eq!(adaptive(owned, input), adaptive(caller, input), "adaptive");
+    lent_adaptive.check(bound, max, "adaptive");
 }
 
 /// Feeds the whole stream and drains it; `None` when the decode fails.

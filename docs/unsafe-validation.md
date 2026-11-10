@@ -80,9 +80,14 @@ updates its entry in the same commit; a new surface lands with one.
   `Lzma2AdaptiveDecoder` and `Lzma2RunDecoder` on garbage-filled windows,
   native and Miri: each worker writes its block or run into a lent window,
   sends it back across threads, and reuses it for its next one, and every
-  window is released after success, refusal and a damaged stream. The
+  window is released after success, refusal on any ask, an allocator panic,
+  short or longer-than-asked memory, a failing output, a drop mid-decode
+  and a damaged stream; the test allocator counts the windows alive at once
+  and checks them against `max_windows()` and the per-window bound. The
+  cases that decode more than 100 KiB are skipped under Miri. The
   `decode_window` fuzz target compares the same threaded decodes on lent
-  and owned memory. The decode loops receive the same base pointer shape
+  and owned memory, and checks every window asked for against the bound
+  and the windows alive at once against `max_windows()`. The decode loops receive the same base pointer shape
   as with a `Vec`.
 - Shared finder storage and borrowed direct-input lifetime/ownership in
   `run_block`: `a_direct_block_is_read_as_the_copied_window_is` in

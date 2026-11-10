@@ -303,6 +303,24 @@ pub struct Lzma2AdaptiveDecoder {
     /// the in-RAM limit. They hold no RAM, so nothing above counts them;
     /// with the runs out and landed they are kept to one per thread.
     spare_lent: Vec<DicBuf>,
+    /// The longest run a worker decodes into a lent window:
+    /// [`Lzma2Decoder::max_worker_window_len`]. A longer one goes to the
+    /// chase decoder.
+    lent_max: usize,
+    /// The unpacked length of the runs out with workers whose output is lent:
+    /// part of `outstanding_unpacked` that holds no RAM.
+    outstanding_lent: u64,
+    /// The part of `ready_bytes` whose buffers are lent.
+    ready_lent: u64,
+    /// The allocator's own error for the earliest failed run, beside
+    /// `failed`; moved to `window_err` when that failure is reported.
+    /// `AssertUnwindSafe` keeps the decoder's auto traits as they are with
+    /// no backing: it is only held and handed back.
+    failed_window: core::panic::AssertUnwindSafe<Option<crate::WindowAllocError>>,
+    /// The allocator's own error behind the [`Error::WindowAlloc`] the
+    /// decoder last failed with, for
+    /// [`Lzma2AdaptiveDecoder::take_window_error`].
+    window_err: core::panic::AssertUnwindSafe<Option<crate::WindowAllocError>>,
     /// The unpacked length of the runs out with workers. Charged and refunded
     /// from the figure the job carries, so it cannot drift from the buffers it
     /// stands for.
@@ -427,6 +445,11 @@ impl Lzma2AdaptiveDecoder {
             spare_cap: 0,
             window: None,
             spare_lent: Vec::new(),
+            lent_max: 0,
+            outstanding_lent: 0,
+            ready_lent: 0,
+            failed_window: core::panic::AssertUnwindSafe(None),
+            window_err: core::panic::AssertUnwindSafe(None),
             outstanding_unpacked: 0,
             outstanding_packed: 0,
             ready_bytes: 0,
@@ -457,12 +480,16 @@ impl Lzma2AdaptiveDecoder {
     /// or [`dispatch_cost`](Self::dispatch_cost): a run whose output is lent
     /// costs only its input. A worker asks for a window for its run only when
     /// no window a delivered run left behind is big enough; at most
-    /// [`max_windows`](Self::max_windows) are alive at once. A run whose
-    /// output is over [`crate::WindowBacking::max_len`] goes to the chase
-    /// decoder, whose dictionary may be smaller; a chase dictionary over it
-    /// fails the decode with [`Error::MemoryLimit`]. An allocator's refusal
-    /// fails the decode, in order, with [`Error::WindowAlloc`]; neither drops
-    /// the decode to fewer threads or to RAM.
+    /// [`max_windows`](Self::max_windows) are alive at once, each at most
+    /// [`Lzma2Decoder::max_worker_window_len`] bytes. A run whose output is
+    /// longer than that, or over [`crate::WindowBacking::max_len`], goes to
+    /// the chase decoder, whose buffer is the dictionary; a chase dictionary
+    /// over the ceiling fails the decode with [`Error::MemoryLimit`]. An
+    /// allocator's refusal fails the decode, in order, with
+    /// [`Error::WindowAlloc`], and
+    /// [`take_window_error`](Self::take_window_error) then hands back the
+    /// allocator's own error; neither drops the decode to fewer threads or
+    /// to RAM.
     ///
     /// # Errors
     ///
@@ -473,22 +500,34 @@ impl Lzma2AdaptiveDecoder {
         window: crate::WindowBacking,
     ) -> Result<Self, Error> {
         let mut d = Self::new(dict_prop, options)?;
+        d.lent_max = Lzma2Decoder::max_worker_window_len(dict_prop)?;
         d.window = Some(window);
         Ok(d)
     }
 
     /// The most windows the backing can have lent to this decoder at once:
-    /// one per thread under the ceiling in force, and one for the chase
-    /// decoder's dictionary. Windows taken under a wider ceiling are
-    /// released as their runs are handed over. Zero with no backing. Each
-    /// window is at most [`crate::WindowBacking::max_len`] bytes.
+    /// one per thread, and one for the chase decoder's dictionary. After
+    /// [`set_threads`](Self::set_threads) lowers the thread count, the
+    /// windows of runs already out or landed are counted until those runs
+    /// are handed over. Zero with no backing. Each window is at most
+    /// [`Lzma2Decoder::max_worker_window_len`] bytes.
     #[must_use]
     pub fn max_windows(&self) -> usize {
-        if self.window.is_some() {
-            self.threads + 1
-        } else {
-            0
+        if self.window.is_none() {
+            return 0;
         }
+        let held = self.outstanding
+            + self.ready.len()
+            + usize::from(self.part.is_some())
+            + self.spare_lent.len();
+        self.threads.max(held) + 1
+    }
+
+    /// The allocator's own error behind the [`Error::WindowAlloc`] the
+    /// decoder last failed with, once; `None` after any other error, or
+    /// when it has been taken.
+    pub fn take_window_error(&mut self) -> Option<crate::WindowAllocError> {
+        self.window_err.0.take()
     }
 
     /// Whether a run of `unpacked_len` bytes is decoded into a lent window.
@@ -828,9 +867,24 @@ impl Lzma2AdaptiveDecoder {
     /// allowed to push *that* over [`Lzma2AdaptiveDecoder::memory_limit`]; a
     /// run too large to fit at all is decoded by the single-threaded path,
     /// which streams it, instead of stalling.
+    ///
+    /// A run whose output is lent through the backing of
+    /// [`Lzma2AdaptiveDecoder::with_window`] counts here at its unpacked
+    /// size all the same; [`Lzma2AdaptiveDecoder::in_flight_ram_bytes`]
+    /// leaves it out.
     #[must_use]
     pub fn in_flight_bytes(&self) -> u64 {
         self.segs.len() + self.outstanding_unpacked + self.ready_bytes
+    }
+
+    /// As [`Lzma2AdaptiveDecoder::in_flight_bytes`], less the output of runs
+    /// whose buffers are lent: the part of the work in the decoder that is
+    /// in RAM. The two are equal with no backing.
+    #[must_use]
+    pub fn in_flight_ram_bytes(&self) -> u64 {
+        self.segs.len()
+            + (self.outstanding_unpacked - self.outstanding_lent)
+            + (self.ready_bytes - self.ready_lent)
     }
 
     /// How much of the output was decoded by the chase decoder, on the thread
@@ -1542,6 +1596,7 @@ impl Lzma2AdaptiveDecoder {
         self.outstanding = 0;
         self.outstanding_bytes = 0;
         self.outstanding_unpacked = 0;
+        self.outstanding_lent = 0;
         self.outstanding_packed = 0;
         // The pool is shut down above, so nothing else holds the input any
         // more and all of it can go at once.
@@ -1862,6 +1917,9 @@ impl Lzma2AdaptiveDecoder {
         // cannot drift or go below zero: the unpacked length is the run's own,
         // and the input is charged to the queue, never to the job.
         self.outstanding_unpacked -= d.unpacked_len as u64;
+        if self.lends(d.unpacked_len as u64) {
+            self.outstanding_lent -= d.unpacked_len as u64;
+        }
         // The job's references are exactly the run's packed bytes.
         let packed: u64 = d.packed.iter().map(|s| s.bytes().len() as u64).sum();
         self.outstanding_packed -= packed;
@@ -1879,6 +1937,9 @@ impl Lzma2AdaptiveDecoder {
                 }
                 self.ready_cap += d.out.ram();
                 self.ready_bytes += d.unpacked_len as u64;
+                if d.out.is_lent() {
+                    self.ready_lent += d.unpacked_len as u64;
+                }
                 self.ready
                     .insert(d.out_offset, (d.out_offset, d.out, d.unpacked_len));
                 self.mark_peak();
@@ -1888,7 +1949,10 @@ impl Lzma2AdaptiveDecoder {
                 let located = locate(d.index, d.out_offset, e);
                 match &self.failed {
                     Some((off, _)) if *off <= d.out_offset => {}
-                    _ => self.failed = Some((d.out_offset, located)),
+                    _ => {
+                        self.failed = Some((d.out_offset, located));
+                        self.failed_window.0 = d.window_err;
+                    }
                 }
             }
         }
@@ -1911,6 +1975,9 @@ impl Lzma2AdaptiveDecoder {
                 *sent += take;
                 *left -= take;
                 self.ready_bytes -= take as u64;
+                if buf.is_lent() {
+                    self.ready_lent -= take as u64;
+                }
                 any = true;
                 if *sent == *len {
                     let (_, buf, _, _) = self.part.take().expect("just borrowed");
@@ -1933,6 +2000,9 @@ impl Lzma2AdaptiveDecoder {
             let (off, buf, len) = self.ready.remove(&key).expect("just looked it up");
             let take = len.min(*left);
             self.ready_bytes -= take as u64;
+            if buf.is_lent() {
+                self.ready_lent -= take as u64;
+            }
             sink(off, &buf[..take]);
             *left -= take;
             if off == self.emitted_out {
@@ -1961,6 +2031,7 @@ impl Lzma2AdaptiveDecoder {
             if !self.ordered || self.emitted_out >= off {
                 self.cancel();
                 self.cancelled = false;
+                self.window_err.0 = self.failed_window.0.take();
                 return Err(e);
             }
         }
@@ -2105,8 +2176,11 @@ impl Lzma2AdaptiveDecoder {
         // A lent output costs no RAM, so only the input counts; one over the
         // backing's ceiling cannot be lent, and the chase decoder, whose
         // dictionary may be smaller, takes it.
+        // Nor is one longer than a worker's window for this dictionary: the
+        // stream's own sizes never set how much is lent.
         let unlendable = self.lends(run.unpacked_len)
-            && !self.window.as_ref().is_some_and(|w| w.admits(unpacked));
+            && (unpacked > self.lent_max
+                || !self.window.as_ref().is_some_and(|w| w.admits(unpacked)));
         let size = self.out_ram(run.unpacked_len) + run.packed_len;
         if unlendable || size > self.limit() {
             stat!(self.stats.chase_too_big += 1;);
@@ -2186,6 +2260,9 @@ impl Lzma2AdaptiveDecoder {
             held,
         })?;
         self.dispatched(run, held);
+        if lent {
+            self.outstanding_lent += run.unpacked_len;
+        }
         Ok(Dispatch::Sent)
     }
 
@@ -2310,13 +2387,16 @@ impl Lzma2AdaptiveDecoder {
     }
 
     /// The chase decoder, its dictionary lent when the backing covers it.
-    fn chase_decoder(&self) -> Result<Lzma2Decoder, Error> {
+    fn chase_decoder(&mut self) -> Result<Lzma2Decoder, Error> {
         let prop = Lzma2Decoder::capped_props(self.dict_prop, u32::MAX)?;
-        match crate::window::lend(self.window.as_ref(), prop.dic_buf_size())
-            .map_err(crate::window::Refusal::into_error)?
-        {
-            Some(mem) => Lzma2Decoder::with_caller_dic(prop, mem),
-            None => Lzma2Decoder::new(self.dict_prop),
+        match crate::window::lend(self.window.as_ref(), prop.dic_buf_size()) {
+            Ok(Some(mem)) => Lzma2Decoder::with_caller_dic(prop, mem),
+            Ok(None) => Lzma2Decoder::new(self.dict_prop),
+            Err(r) => {
+                let (e, source) = r.into_parts();
+                self.window_err.0 = source;
+                Err(e)
+            }
         }
     }
 

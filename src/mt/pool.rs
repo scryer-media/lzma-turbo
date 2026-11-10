@@ -75,6 +75,8 @@ pub(crate) struct Done {
     pub(crate) packed: Vec<Seg>,
     /// What the dispatcher charged for the job, echoed back unchanged.
     pub(crate) held: u64,
+    /// The allocator's own error, when `res` is [`Error::WindowAlloc`].
+    pub(crate) window_err: Option<crate::WindowAllocError>,
     /// What the worker checksummed, if the run decoded and a plan asked for
     /// it.
     #[cfg(feature = "crc")]
@@ -270,6 +272,7 @@ fn worker(
                 out: job.out,
                 packed: job.packed,
                 held: job.held,
+                window_err: None,
                 #[cfg(feature = "crc")]
                 checks: None,
             });
@@ -283,8 +286,9 @@ fn worker(
         // A worker that dies without answering would leave its dispatcher
         // waiting for a block that is never coming, so a panic is caught,
         // reported as the internal failure it is, and the decoder rebuilt.
+        let mut window_err = None;
         let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_run(&mut dec, &mut job)
+            decode_run(&mut dec, &mut job, &mut window_err)
         })) {
             Ok(r) => r,
             Err(_) => {
@@ -306,6 +310,7 @@ fn worker(
                             out: job.out,
                             packed: job.packed,
                             held: job.held,
+                            window_err: None,
                             #[cfg(feature = "crc")]
                             checks: None,
                         });
@@ -342,6 +347,7 @@ fn worker(
                 out,
                 packed: job.packed,
                 held: job.held,
+                window_err,
                 #[cfg(feature = "crc")]
                 checks,
             })
@@ -357,7 +363,11 @@ fn worker(
 /// C: `Lzma2DecMt_MtCallback_Code`, minus the partial-block bookkeeping: the
 /// run's length is known from its headers before it is dispatched, so a
 /// worker either decodes all of it or the stream is corrupt.
-fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
+fn decode_run(
+    dec: &mut Lzma2Decoder,
+    job: &mut Job,
+    window_err: &mut Option<crate::WindowAllocError>,
+) -> Result<(), Error> {
     let want = job.unpacked_len;
 
     // A run over the backing's in-RAM limit is decoded into a window: the
@@ -367,10 +377,14 @@ fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
     if job.out.len() < want && job.window.as_ref().is_some_and(|w| w.covers(want)) {
         // Released before the allocator is asked: a worker holds one window.
         job.out = DicBuf::default();
-        if let Some(mem) = crate::window::lend(job.window.as_ref(), want)
-            .map_err(crate::window::Refusal::into_error)?
-        {
-            job.out = DicBuf::Caller(mem);
+        match crate::window::lend(job.window.as_ref(), want) {
+            Ok(Some(mem)) => job.out = DicBuf::Caller(mem),
+            Ok(None) => {}
+            Err(r) => {
+                let (e, source) = r.into_parts();
+                *window_err = source;
+                return Err(e);
+            }
         }
     }
     // The buffer is grown, never shrunk and never re-zeroed: `dicBufSize` says
@@ -384,7 +398,7 @@ fn decode_run(dec: &mut Lzma2Decoder, job: &mut Job) -> Result<(), Error> {
         out.try_reserve_exact(more).map_err(|_| Error::Alloc)?;
         out.resize(want, 0u8);
     }
-    dec.set_block_buf(core::mem::take(&mut job.out), want);
+    dec.set_block_buf(core::mem::take(&mut job.out), want)?;
 
     // The run arrives as the pieces of input it spans, and it is decoded a
     // piece at a time. The block decoder keeps its state between calls, so

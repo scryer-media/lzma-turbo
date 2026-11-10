@@ -365,7 +365,7 @@ fn block_decoder(job: &mut XzJob, header: &BlockHeader) -> Result<Lzma2Decoder, 
             DicBuf::Owned(out)
         }
     };
-    dec.set_block_buf(buf, want);
+    dec.set_block_buf(buf, want).map_err(XzErrorKind::Lzma)?;
     Ok(dec)
 }
 

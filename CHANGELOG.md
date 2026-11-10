@@ -13,15 +13,40 @@
   `max_windows()` says how many can be alive at once: the thread count, one
   more for the adaptive decoder's chase, and one for a run decoder. The
   limit and the ceiling apply to each worker's buffer, which holds a block or
-  a run rather than only the dictionary; a buffer over the ceiling is never
-  asked for, and its block or run decodes on the single-threaded path, whose
-  buffer is the dictionary alone. Lent buffers count nothing against the
-  memory limit: `memory_estimate`, `Lzma2RunDecoder::memory_required_with_window`
-  and the adaptive decoder's `dispatch_cost` count only what stays in RAM,
-  so a limit that left one thread in RAM can keep more. An allocator failure
-  fails the decode with its `io::ErrorKind`, as the new
-  `Error::WindowAlloc` from the adaptive and run decoders, and is never
-  retried on fewer threads or in RAM. With no backing nothing changes.
+  a run rather than only the dictionary.
+- What a worker may be lent is bounded by the dictionary:
+  `Lzma2Decoder::max_worker_window_len`, four times the dictionary held to
+  between 1 MiB and 256 MiB, or the dictionary when larger (256 MiB for a
+  64 MiB or 256 MiB dictionary, 1 GiB for 1 GiB, 1.5 GiB for 1.5 GiB; each
+  of 7-Zip's threaded blocks fits). A block or run longer than that, or over
+  the ceiling, is never asked for: it decodes on the single-threaded path,
+  whose buffer is the dictionary alone, and `decode_at` gives back every
+  window it holds before handing the stream over. The bytes lent at once
+  are at most `max_windows()` times the bound.
+- Lent buffers count nothing against the memory limit: `memory_estimate`,
+  `Lzma2RunDecoder::memory_required_with_window` and the adaptive decoder's
+  `dispatch_cost` count only what stays in RAM, so a limit that left one
+  thread in RAM can keep more. `memory_required_with_window` refuses a ring
+  over the ceiling as `with_window` does. The adaptive decoder's new
+  `in_flight_ram_bytes` leaves lent output out; `in_flight_bytes` keeps its
+  meaning, the work in the decoder, lent or not.
+- `Lzma2ParallelReader` hands its output across in pieces of at most 1 MiB
+  instead of copying whole blocks, so the reader's own heap is at most
+  5 MiB, with or without a backing; before, it held up to five block copies
+  (up to 1.25 GiB for 256 MiB blocks) that nothing counted. The new
+  `Lzma2ParallelReader::memory_estimate` is the decoder's estimate plus
+  those 5 MiB.
+- An allocator failure fails the decode with its `io::ErrorKind` and is
+  never retried on fewer threads or in RAM. The new `WindowAllocError`
+  carries the allocator's own error: `WindowAllocError::from_io` takes it out
+  of the `io::Error` from `decode`, `decode_at`, the reader and
+  `Lzma2RunDecoder::with_window`, and `Lzma2AdaptiveDecoder::take_window_error`
+  hands it back after the adaptive decoder fails with the new
+  `Error::WindowAlloc`. A panic in the allocator fails the decode the same
+  way, as an `Other` error, instead of unwinding through the decoder's
+  threads. With no backing nothing changes.
+- A block buffer shorter than its block is now an `InternalFailure` error in
+  every build, not a debug assertion.
 - `Lzma2Decoder::window_len`, `Lzma2Decoder::capped_window_len` and
   `LzmaProps::window_len` give the dictionary size a decoder allocates, the
   length a `WindowAllocator` is asked for.

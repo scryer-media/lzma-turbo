@@ -411,14 +411,28 @@ impl Lzma2Decoder {
     /// only ever grows, and the decoder reads and writes strictly below
     /// `dic_buf_size`.
     ///
+    /// A `buf` shorter than `size` is refused with
+    /// [`Error::InternalFailure`]: it is installed for no block, with a block
+    /// size of zero, so [`Lzma2Decoder::take_block_buf`] still hands it back.
+    /// Checked once per block, in every build.
+    ///
     /// C: the three assignments at the end of `Lzma2DecMt_MtCallback_PreCode`
     /// plus the `Lzma2Dec_Init` that `..._Code` does on `needInit`.
     #[cfg(feature = "std")]
-    pub(crate) fn set_block_buf(&mut self, buf: crate::buffer::DicBuf, size: usize) {
-        debug_assert!(buf.len() >= size);
+    pub(crate) fn set_block_buf(
+        &mut self,
+        buf: crate::buffer::DicBuf,
+        size: usize,
+    ) -> Result<(), Error> {
+        let fits = buf.len() >= size;
         self.decoder.dic = buf;
-        self.decoder.dic_buf_size = size;
+        self.decoder.dic_buf_size = if fits { size } else { 0 };
+        self.decoder.dic_pos = 0;
+        if !fits {
+            return Err(Error::InternalFailure);
+        }
         self.reset();
+        Ok(())
     }
 
     /// Hands the block buffer back, owned or caller memory, so the caller can
