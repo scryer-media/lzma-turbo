@@ -116,6 +116,13 @@ required-features = ["crc-host", "crypto-host", "xz"]
 name = "wasm_missing_hooks"
 required-features = ["crc-host", "crypto-host"]
 
+# The same question with nothing delegated: a report of what the crate
+# decodes and encodes, which CI compares between the native build and each
+# wasm target that can run a program on its own.
+[[example]]
+name = "wasm_portable_check"
+required-features = ["xz", "native-crypto"]
+
 # `tools/lzma-bench` is a workspace member rather than an example because it
 # depends on `lzma-rust2` and `liblzma` to time this crate against them, and
 # those must not appear in this crate's own graph at all.
