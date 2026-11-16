@@ -155,6 +155,12 @@ and with `--no-default-features --features std,asm,crc,native-crypto,xz` for
 the decoder, `.xz` and its checks; CI builds both. `asm` does nothing there.
 The threaded decoders need real threads and are not available.
 
+The same feature set, with `enc`, also runs on `wasm32-wasip1`,
+`wasm32-wasip2` and `wasm32-unknown-emscripten`. CI runs
+[`examples/wasm_portable_check.rs`](examples/wasm_portable_check.rs) on each,
+under wasmtime and Node: it decodes every `.xz` and `.lzma` fixture and
+encodes every source file, and its report must equal the native one.
+
 `crc-host` and `crypto-host` let the program that embeds the module compute
 the CRCs and SHA-256, which is usually much faster than computing them inside
 WebAssembly. The API does not change, and on a native target the two
