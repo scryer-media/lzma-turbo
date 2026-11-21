@@ -19,6 +19,88 @@ pub const MAX_INDEX_SIZE: u64 = 1 << 34;
 /// The smallest a record can be: two one-byte VLIs.
 const MIN_RECORD_BYTES: u64 = 2;
 
+/// What reading the indexes holds at once, charged against the caller's
+/// memory limit: the serialized index while it is held, the parsed records,
+/// the stream entries, and the block tables built from them.
+///
+/// Each limit check alone bounded one index; a file of many streams, each
+/// with an index just under the limit, held all of them. The charge runs
+/// across the whole walk, and is made before each allocation.
+#[derive(Debug)]
+pub(crate) struct MetaBudget {
+    used: u64,
+    limit: u64,
+}
+
+impl MetaBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        MetaBudget { used: 0, limit }
+    }
+
+    /// Adds `bytes` to what is held, or refuses when that would pass the
+    /// limit.
+    pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), XzErrorKind> {
+        let needed = self.used.checked_add(bytes).unwrap_or(u64::MAX);
+        if needed > self.limit {
+            return Err(XzErrorKind::MemoryLimit {
+                needed,
+                limit: self.limit,
+            });
+        }
+        self.used = needed;
+        Ok(())
+    }
+
+    /// As [`MetaBudget::charge`], for `n` values of `T`.
+    pub(crate) fn charge_items<T>(&mut self, n: usize) -> Result<(), XzErrorKind> {
+        self.charge(
+            (n as u64)
+                .checked_mul(core::mem::size_of::<T>() as u64)
+                .unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Gives back what [`MetaBudget::charge`] took for something dropped.
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.used = self.used.saturating_sub(bytes);
+    }
+
+    /// As [`MetaBudget::release`], for `n` values of `T`.
+    pub(crate) fn release_items<T>(&mut self, n: usize) {
+        self.release((n as u64).saturating_mul(core::mem::size_of::<T>() as u64));
+    }
+
+    /// The refusal for an allocation the allocator itself failed.
+    fn refused(&self) -> XzErrorKind {
+        XzErrorKind::MemoryLimit {
+            needed: self.used,
+            limit: self.limit,
+        }
+    }
+
+    /// Makes room for `additional` more values in `v`, charging by capacity:
+    /// what is about to be reserved before it is, and anything the
+    /// allocator gave beyond it afterwards.
+    pub(crate) fn reserve<T>(
+        &mut self,
+        v: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), XzErrorKind> {
+        let before = v.capacity();
+        let want = v
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| self.refused())?;
+        if want <= before {
+            return Ok(());
+        }
+        self.charge_items::<T>(want - before)?;
+        v.try_reserve_exact(want - v.len())
+            .map_err(|_| self.refused())?;
+        self.charge_items::<T>(v.capacity() - want)
+    }
+}
+
 /// One index record: what the stream says a block costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XzIndexRecord {
@@ -114,6 +196,12 @@ impl XzIndex {
     /// the VLI errors for malformed integers. The record count is bounded by
     /// the bytes actually present before a single record is allocated.
     pub fn parse(buf: &[u8]) -> Result<Self, XzErrorKind> {
+        Self::parse_charged(buf, &mut MetaBudget::new(u64::MAX))
+    }
+
+    /// As [`XzIndex::parse`], charging the record table to `budget` before
+    /// it is allocated.
+    pub(crate) fn parse_charged(buf: &[u8], budget: &mut MetaBudget) -> Result<Self, XzErrorKind> {
         if buf.len() < 8 || !buf.len().is_multiple_of(4) || buf.len() as u64 > MAX_INDEX_SIZE {
             return Err(XzErrorKind::IndexMismatch);
         }
@@ -140,10 +228,13 @@ impl XzIndex {
         if count > room {
             return Err(XzErrorKind::IndexMismatch);
         }
+        let count_items = usize::try_from(count).map_err(|_| XzErrorKind::IndexMismatch)?;
+        budget.charge_items::<XzIndexRecord>(count_items)?;
         let mut records = Vec::new();
         records
-            .try_reserve_exact(count as usize)
+            .try_reserve_exact(count_items)
             .map_err(|_| XzErrorKind::IndexMismatch)?;
+        budget.charge_items::<XzIndexRecord>(records.capacity() - count_items)?;
 
         let mut total_unpadded = 0u64;
         for _ in 0..count {
@@ -214,9 +305,29 @@ impl XzIndex {
     /// `None` on overflow.
     #[must_use]
     pub fn blocks(&self, stream_offset: u64) -> Option<Vec<XzBlockEntry>> {
+        self.blocks_into(stream_offset, Vec::with_capacity(self.records.len()))
+    }
+
+    /// As [`XzIndex::blocks`], with the table charged to `budget` and
+    /// reserved before it is filled. `Ok(None)` is the overflow `blocks`
+    /// answers `None` for.
+    pub(crate) fn blocks_charged(
+        &self,
+        stream_offset: u64,
+        budget: &mut MetaBudget,
+    ) -> Result<Option<Vec<XzBlockEntry>>, XzErrorKind> {
+        let mut out = Vec::new();
+        budget.reserve(&mut out, self.records.len())?;
+        Ok(self.blocks_into(stream_offset, out))
+    }
+
+    fn blocks_into(
+        &self,
+        stream_offset: u64,
+        mut out: Vec<XzBlockEntry>,
+    ) -> Option<Vec<XzBlockEntry>> {
         let mut file_offset = stream_offset.checked_add(STREAM_HEADER_SIZE as u64)?;
         let mut uncompressed_offset = 0u64;
-        let mut out = Vec::with_capacity(self.records.len());
         for &record in &self.records {
             out.push(XzBlockEntry {
                 file_offset,
@@ -270,6 +381,16 @@ pub fn read_stream_index_ending_at<R: std::io::Read + std::io::Seek>(
     end: u64,
     memory_limit: u64,
 ) -> XzResult<XzStreamIndex> {
+    read_stream_index_charged(reader, end, &mut MetaBudget::new(memory_limit))
+}
+
+/// As [`read_stream_index_ending_at`], with the index buffer charged to
+/// `budget` while it is held and the parsed records charged for good.
+fn read_stream_index_charged<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    end: u64,
+    budget: &mut MetaBudget,
+) -> XzResult<XzStreamIndex> {
     use std::io::SeekFrom;
 
     let at = |off: u64| XzError::at(XzErrorKind::TruncatedInput, 0, off);
@@ -285,16 +406,22 @@ pub fn read_stream_index_ending_at<R: std::io::Read + std::io::Seek>(
         .map_err(|_| at(footer_offset))?;
     let footer = StreamFooter::parse(&footer).map_err(|k| XzError::at(k, 0, footer_offset))?;
 
-    if footer.index_size > MAX_INDEX_SIZE || footer.index_size > memory_limit {
+    if footer.index_size > MAX_INDEX_SIZE {
         return Err(XzError::at(
             XzErrorKind::MemoryLimit {
                 needed: footer.index_size,
-                limit: memory_limit,
+                limit: budget.limit,
             },
             0,
             footer_offset,
         ));
     }
+    let Ok(index_len) = usize::try_from(footer.index_size) else {
+        return Err(XzError::at(budget.refused(), 0, footer_offset));
+    };
+    budget
+        .charge(footer.index_size)
+        .map_err(|k| XzError::at(k, 0, footer_offset))?;
     let index_offset = footer_offset
         .checked_sub(footer.index_size)
         .ok_or_else(|| at(footer_offset))?;
@@ -303,26 +430,28 @@ pub fn read_stream_index_ending_at<R: std::io::Read + std::io::Seek>(
     }
 
     let mut index_buf = Vec::new();
-    index_buf
-        .try_reserve_exact(footer.index_size as usize)
-        .map_err(|_| {
-            XzError::at(
-                XzErrorKind::MemoryLimit {
-                    needed: footer.index_size,
-                    limit: memory_limit,
-                },
-                0,
-                index_offset,
-            )
-        })?;
-    index_buf.resize(footer.index_size as usize, 0u8);
+    index_buf.try_reserve_exact(index_len).map_err(|_| {
+        XzError::at(
+            XzErrorKind::MemoryLimit {
+                needed: footer.index_size,
+                limit: budget.limit,
+            },
+            0,
+            index_offset,
+        )
+    })?;
+    index_buf.resize(index_len, 0u8);
     reader
         .seek(SeekFrom::Start(index_offset))
         .map_err(|_| at(index_offset))?;
     reader
         .read_exact(&mut index_buf)
         .map_err(|_| at(index_offset))?;
-    let index = XzIndex::parse(&index_buf).map_err(|k| XzError::at(k, 0, index_offset))?;
+    let index =
+        XzIndex::parse_charged(&index_buf, budget).map_err(|k| XzError::at(k, 0, index_offset))?;
+    // The serialized index is not kept.
+    drop(index_buf);
+    budget.release(footer.index_size);
 
     let blocks_size = index
         .blocks_size()
@@ -381,6 +510,15 @@ pub fn stream_table<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     memory_limit: u64,
 ) -> XzResult<Vec<XzStreamIndex>> {
+    stream_table_charged(src, &mut MetaBudget::new(memory_limit))
+}
+
+/// As [`stream_table`], with everything it holds charged to `budget`, which
+/// the caller goes on charging for what it builds from the table.
+pub(crate) fn stream_table_charged<R: std::io::Read + std::io::Seek>(
+    src: &mut R,
+    budget: &mut MetaBudget,
+) -> XzResult<Vec<XzStreamIndex>> {
     use std::io::SeekFrom;
 
     let len = src
@@ -407,7 +545,13 @@ pub fn stream_table<R: std::io::Read + std::io::Seek>(
                 break;
             }
         }
-        let idx = read_stream_index_ending_at(src, end, memory_limit)?;
+        let idx = read_stream_index_charged(src, end, budget)?;
+        if streams.len() == streams.capacity() {
+            let more = streams.capacity().max(4);
+            budget
+                .reserve(&mut streams, more)
+                .map_err(|k| XzError::at(k, 0, end))?;
+        }
         end = idx.stream_offset;
         streams.push(idx);
     }
@@ -430,14 +574,24 @@ pub fn block_table<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     memory_limit: u64,
 ) -> XzResult<Vec<XzBlockEntry>> {
-    let streams = stream_table(src, memory_limit)?;
+    let mut budget = MetaBudget::new(memory_limit);
+    let streams = stream_table_charged(src, &mut budget)?;
+    let total = streams
+        .iter()
+        .try_fold(0usize, |n, s| n.checked_add(s.index.records.len()))
+        .ok_or_else(|| XzError::at(budget.refused(), 0, 0))?;
     let mut out = Vec::new();
+    budget
+        .reserve(&mut out, total)
+        .map_err(|k| XzError::at(k, 0, 0))?;
     let mut base = 0u64;
     for s in &streams {
         let blocks = s
             .index
-            .blocks(s.stream_offset)
+            .blocks_charged(s.stream_offset, &mut budget)
+            .map_err(|k| XzError::at(k, 0, s.stream_offset))?
             .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
+        let held = blocks.capacity();
         for mut b in blocks {
             b.uncompressed_offset = b
                 .uncompressed_offset
@@ -445,6 +599,7 @@ pub fn block_table<R: std::io::Read + std::io::Seek>(
                 .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
             out.push(b);
         }
+        budget.release_items::<XzBlockEntry>(held);
         base = base
             .checked_add(s.index.uncompressed_size().unwrap_or(0))
             .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, s.stream_offset))?;
@@ -511,6 +666,99 @@ mod tests {
         let crc = crc32(&body).to_le_bytes();
         body.extend_from_slice(&crc);
         body
+    }
+
+    #[cfg(feature = "enc")]
+    fn many_streams(streams: usize, blocks: usize) -> (Vec<u8>, Vec<u8>) {
+        let data: Vec<u8> = (0..blocks * 16).map(|i| (i * 7 % 251) as u8).collect();
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        let one = crate::encode_xz(&data, &props, super::super::CheckType::Crc32, 16).unwrap();
+        let mut file = Vec::new();
+        let mut out = Vec::new();
+        for _ in 0..streams {
+            file.extend_from_slice(&one);
+            out.extend_from_slice(&data);
+        }
+        (file, out)
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn the_index_charge_runs_across_every_stream() {
+        use std::io::Cursor;
+        let (file, _) = many_streams(8, 200);
+        let one = read_stream_index_ending_at(&mut Cursor::new(&file), file.len() as u64, u64::MAX)
+            .unwrap();
+        // Each index, and each stream's records, fit the limit alone ...
+        let records = 200 * core::mem::size_of::<XzIndexRecord>() as u64;
+        let limit = one.index.index_size + records + 64;
+        assert!(
+            read_stream_index_ending_at(&mut Cursor::new(&file), file.len() as u64, limit).is_ok()
+        );
+        // ... but not eight of them at once.
+        for err in [
+            stream_table(&mut Cursor::new(&file), limit).unwrap_err(),
+            block_table(&mut Cursor::new(&file), limit).unwrap_err(),
+            crate::xz::XzParallelReader::with_options(
+                Cursor::new(&file),
+                crate::xz::XzOptions::default()
+                    .with_threads(2)
+                    .with_memory_limit(limit),
+            )
+            .err()
+            .unwrap(),
+        ] {
+            assert!(
+                matches!(err.kind, XzErrorKind::MemoryLimit { needed, limit: l } if l == limit && needed > limit),
+                "{err:?}"
+            );
+        }
+        // One index bigger than the limit is refused as it was, at its size.
+        let err = stream_table(&mut Cursor::new(&file), one.index.index_size - 1).unwrap_err();
+        assert_eq!(
+            err.kind,
+            XzErrorKind::MemoryLimit {
+                needed: one.index.index_size,
+                limit: one.index.index_size - 1
+            }
+        );
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn charged_tables_are_the_tables_they_were() {
+        use std::io::{Cursor, Read};
+        let (file, data) = many_streams(8, 200);
+        let streams = stream_table(&mut Cursor::new(&file), u64::MAX).unwrap();
+        assert_eq!(streams.len(), 8);
+        // The block table as it was built before: each stream's own, offset.
+        let mut want = Vec::new();
+        let mut base = 0;
+        for s in &streams {
+            for mut b in s.index.blocks(s.stream_offset).unwrap() {
+                b.uncompressed_offset += base;
+                want.push(b);
+            }
+            base += s.index.uncompressed_size().unwrap();
+        }
+        assert_eq!(
+            block_table(&mut Cursor::new(&file), u64::MAX).unwrap(),
+            want
+        );
+        // A limit that covers what is held still decodes.
+        let mut out = Vec::new();
+        crate::xz::XzParallelReader::with_options(
+            Cursor::new(&file),
+            crate::xz::XzOptions::default()
+                .with_threads(2)
+                .with_memory_limit(4 << 20),
+        )
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

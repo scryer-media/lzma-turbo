@@ -22,7 +22,7 @@ use super::XzOptions;
 use super::block::{BlockHeader, MAX_BLOCK_HEADER_SIZE, header_size_from_first_byte};
 use super::check::BlockCheck;
 use super::error::{XzError, XzErrorKind, XzResult};
-use super::index::{XzStreamIndex, stream_table};
+use super::index::{MetaBudget, XzStreamIndex, stream_table_charged};
 use super::pool::{XzDone, XzJob, XzPool};
 use super::reader::XzReader;
 use super::stream::CheckType;
@@ -143,8 +143,11 @@ impl<R: Read + Seek> XzParallelReader<R> {
     /// the index says the file decodes to more than the caller allows - which
     /// is known here, before anything is decoded.
     pub fn with_options(mut src: R, opts: XzOptions) -> XzResult<Self> {
-        let streams = stream_table(&mut src, opts.memory_limit)?;
-        let blocks = plan_blocks(&streams, &opts)?;
+        // The indexes and the block plan built from them are charged to one
+        // running total against the memory limit, as they are allocated.
+        let mut budget = MetaBudget::new(opts.memory_limit);
+        let streams = stream_table_charged(&mut src, &mut budget)?;
+        let blocks = plan_blocks(&streams, &opts, &mut budget)?;
 
         // A block on caller memory costs its packed bytes alone: the memory
         // limit bounds what the decoder allocates itself.
@@ -620,15 +623,27 @@ fn lent(opts: &XzOptions, unpacked_len: usize) -> bool {
 
 /// Turns the indexes into the block list, checking the caller's caps against
 /// what the index says before anything is decoded.
-fn plan_blocks(streams: &[XzStreamIndex], opts: &XzOptions) -> XzResult<Vec<Plan>> {
+fn plan_blocks(
+    streams: &[XzStreamIndex],
+    opts: &XzOptions,
+    budget: &mut MetaBudget,
+) -> XzResult<Vec<Plan>> {
+    let count = streams
+        .iter()
+        .try_fold(0usize, |n, s| n.checked_add(s.index.records.len()))
+        .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, 0, 0))?;
     let mut blocks = Vec::new();
+    budget
+        .reserve(&mut blocks, count)
+        .map_err(|k| XzError::at(k, 0, 0))?;
     let mut unpacked_offset = 0u64;
     let mut total = 0u64;
     for (stream_no, s) in streams.iter().enumerate() {
         let stream = stream_no as u64;
         let entries = s
             .index
-            .blocks(s.stream_offset)
+            .blocks_charged(s.stream_offset, budget)
+            .map_err(|k| XzError::at(k, stream, s.stream_offset))?
             .ok_or_else(|| XzError::at(XzErrorKind::IndexMismatch, stream, s.stream_offset))?;
         for (i, e) in entries.iter().enumerate() {
             let unpacked_len = usize::try_from(e.record.uncompressed_size).map_err(|_| {
@@ -677,6 +692,8 @@ fn plan_blocks(streams: &[XzStreamIndex], opts: &XzOptions) -> XzResult<Vec<Plan
             });
             unpacked_offset += e.record.uncompressed_size;
         }
+        // The located entries were only read to build the plan.
+        budget.release_items::<super::index::XzBlockEntry>(entries.capacity());
         // A stream whose check this build cannot compute is refused here for
         // the same reason the sequential reader refuses it: unchecked bytes
         // are never returned by accident.
