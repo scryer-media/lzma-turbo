@@ -247,14 +247,27 @@ fn run_index(path: &Path) {
         return;
     };
     let mut scanner = lzma_turbo::Lzma2RunScanner::new();
-    if let Err(e) = scanner.feed(payload) {
-        eprintln!("lzma-bench: {}: {e}", path.display());
-        return;
-    }
     println!();
     println!("{}: runs", path.display());
     let (mut n, mut min, mut max) = (0u64, u64::MAX, 0u64);
-    while let Some(r) = scanner.next_run() {
+    // The scanner queues a bounded number of runs and stops: feed it what it
+    // left, taking the runs out between calls, until it takes nothing more.
+    let mut rest = payload;
+    loop {
+        let took = match scanner.feed(rest) {
+            Ok(took) => took,
+            Err(e) => {
+                eprintln!("lzma-bench: {}: {e}", path.display());
+                return;
+            }
+        };
+        rest = &rest[took..];
+        let Some(r) = scanner.next_run() else {
+            if took == 0 {
+                break;
+            }
+            continue;
+        };
         if n < 8 {
             println!(
                 "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {} chunks lzma {} copy {}",
@@ -476,11 +489,7 @@ fn lzma2_payload<'a>(path: &Path, data: &'a [u8]) -> Result<(u8, &'a [u8]), Stri
     match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
         "7z" => {
             let s = sevenz::pack_stream(data).ok_or("not a single-folder LZMA2 .7z")?;
-            let end = s.offset + s.packed_len;
-            if end > data.len() as u64 {
-                return Err("7z pack stream runs past the end of the file".into());
-            }
-            Ok((s.dict_prop, &data[s.offset as usize..end as usize]))
+            Ok((s.dict_prop, sevenz::stream_bytes(data, &s)?))
         }
         _ => xz_lzma2_block(data).ok_or_else(|| "not a single-block LZMA2 .xz".into()),
     }
@@ -1142,4 +1151,102 @@ fn adaptive_decode(
         bytes: total,
         crc: crc.finalize(),
     })
+}
+
+#[cfg(test)]
+mod sevenz_tests {
+    //! Here rather than in `sevenz.rs`, which the integration tests include
+    //! too, so these run once.
+
+    use crate::sevenz::*;
+
+    const K_HEADER: u8 = 0x01;
+    const K_MAIN_STREAMS_INFO: u8 = 0x04;
+    const K_PACK_INFO: u8 = 0x06;
+    const K_UNPACK_INFO: u8 = 0x07;
+    const K_SIZE: u8 = 0x09;
+    const K_FOLDER: u8 = 0x0B;
+    const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
+    const K_END: u8 = 0x00;
+
+    /// A signature header whose next header is `size` bytes at `offset`
+    /// past it.
+    fn signature(offset: u64, size: u64) -> [u8; 32] {
+        let mut sig = [0u8; 32];
+        sig[..6].copy_from_slice(b"7z\xBC\xAF\x27\x1C");
+        sig[12..20].copy_from_slice(&offset.to_le_bytes());
+        sig[20..28].copy_from_slice(&size.to_le_bytes());
+        sig
+    }
+
+    /// The header of the one shape the walk follows: a stream at `pack_pos`
+    /// of `packed` bytes, with dictionary property 16.
+    fn header(pack_pos: u64, packed: u8) -> Vec<u8> {
+        let mut h = alloc_header_prefix();
+        // PackInfo: the position as a full eight-byte number.
+        h.push(K_PACK_INFO);
+        h.push(0xFF);
+        h.extend_from_slice(&pack_pos.to_le_bytes());
+        h.extend_from_slice(&[1, K_SIZE, packed, K_END]);
+        h.extend_from_slice(&[K_UNPACK_INFO, K_FOLDER, 1, 0, 1, 0x21, 0x21, 1, 16]);
+        h.extend_from_slice(&[K_CODERS_UNPACK_SIZE, 10]);
+        h
+    }
+
+    fn alloc_header_prefix() -> Vec<u8> {
+        vec![K_HEADER, K_MAIN_STREAMS_INFO]
+    }
+
+    #[test]
+    fn a_header_the_file_cannot_hold_is_refused_before_allocation() {
+        // Each of these is checked from the 32 signature bytes and the file's
+        // length alone; nothing of the header's size is allocated.
+        let len = 1 << 20;
+        assert!(next_header(&signature(u64::MAX - 8, 16), len).is_err());
+        assert!(next_header(&signature(0, u64::MAX), len).is_err());
+        assert!(next_header(&signature(0, MAX_NEXT_HEADER + 1), u64::MAX).is_err());
+        assert!(next_header(&signature(len - 32 - 15, 16), len).is_err());
+        assert!(next_header(&signature(u64::MAX - 31, 0), len).is_err());
+    }
+
+    #[test]
+    fn a_header_inside_the_file_is_where_it_was() {
+        let len = 1 << 20;
+        assert_eq!(next_header(&signature(100, 50), len), Ok((132, 50)));
+        assert_eq!(
+            next_header(&signature(len - 32 - 16, 16), len),
+            Ok((len - 16, 16))
+        );
+        assert_eq!(
+            next_header(&signature(0, MAX_NEXT_HEADER), u64::MAX),
+            Ok((32, MAX_NEXT_HEADER as usize))
+        );
+    }
+
+    #[test]
+    fn a_pack_position_that_overflows_is_no_archive() {
+        assert_eq!(pack_stream_in_header(&header(u64::MAX - 31, 4)), None);
+        let s = pack_stream_in_header(&header(u64::MAX - 32, 4)).expect("in range");
+        assert_eq!(s.offset, u64::MAX);
+        // And a stream at the very end of the address space has no bytes.
+        assert!(stream_bytes(&[0; 64], &s).is_err());
+    }
+
+    #[test]
+    fn a_pack_stream_inside_the_file_is_its_bytes() {
+        let s = pack_stream_in_header(&header(4, 8)).expect("parses");
+        assert_eq!((s.offset, s.packed_len, s.dict_prop), (36, 8, 16));
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(stream_bytes(&data, &s), Ok(&data[36..44]));
+        let short = PackStream {
+            packed_len: 29,
+            ..s
+        };
+        assert!(stream_bytes(&data, &short).is_err());
+        let wraps = PackStream {
+            packed_len: u64::MAX,
+            ..s
+        };
+        assert!(stream_bytes(&data, &wraps).is_err());
+    }
 }

@@ -55,9 +55,9 @@ impl RunningCheck {
             CheckType::None | CheckType::Reserved(_) => Checksum::None,
         };
         let seg = if verify && plan_kind != Checksum::None {
-            let plan = ChecksumPlan::new(plan_kind)
-                .with_split_points(splits.split_points().iter().copied());
-            Some(Segmenter::new(&plan, start))
+            // The caller's split points are already sorted and deduplicated;
+            // they are shared, not rebuilt, for every block.
+            Some(Segmenter::new(&splits.with_kind(plan_kind), start))
         } else {
             None
         };
@@ -152,5 +152,51 @@ impl RunningCheck {
             segments,
             digest,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crc::Crc64Xz;
+
+    fn plan() -> ChecksumPlan {
+        ChecksumPlan::new(Checksum::Crc32).with_split_points([40, 7, 0, 7, 100, 3])
+    }
+
+    #[test]
+    fn every_block_shares_the_callers_split_table() {
+        let plan = plan();
+        let table = plan.split_points().as_ptr();
+        for start in [0, 5, 39, 64, 1000] {
+            let running = RunningCheck::new(CheckType::Crc64, start, &plan, true);
+            let seg = running.seg.as_ref().expect("a verified CRC-64 block");
+            assert_eq!(seg.split_points().as_ptr(), table, "block at {start}");
+            assert_eq!(seg.split_points(), plan.split_points());
+        }
+    }
+
+    #[test]
+    fn shared_split_table_gives_the_same_segments_and_check() {
+        let plan = plan();
+        let data: Vec<u8> = (0..120u32).map(|i| (i * 31 % 251) as u8).collect();
+        for start in [0u64, 5, 39] {
+            // The plan the old code rebuilt for every block.
+            let rebuilt = ChecksumPlan::new(Checksum::Crc64Xz)
+                .with_split_points(plan.split_points().iter().copied());
+            let mut old = Segmenter::new(&rebuilt, start);
+            old.update(&data);
+            let old = old.finish();
+
+            let mut running = RunningCheck::new(CheckType::Crc64, start, &plan, true);
+            running.update(&data[..13]);
+            running.update(&data[13..]);
+            let mut crc = Crc64Xz::new();
+            crc.update(&data);
+            let got = running.finish(&crc.finalize().to_le_bytes()).unwrap();
+            assert_eq!(got.segments, old.segments);
+            assert_eq!(got.unpacked_offset, old.unpacked_offset);
+            assert_eq!(got.len, old.len);
+        }
     }
 }

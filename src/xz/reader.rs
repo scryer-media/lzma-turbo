@@ -173,6 +173,35 @@ pub struct XzReader<R: Read> {
     checks: Vec<BlockCheck>,
     /// Bytes of block padding and check field still to be consumed.
     tail_left: usize,
+    /// The first error `read` returned. Every later read returns one of the
+    /// same kind without touching the state machine, which that error may
+    /// have left part way through a step.
+    failed: Option<Failed>,
+}
+
+/// What is kept of the error that stopped a reader, to return it again: an
+/// `io::Error` is not `Clone`.
+enum Failed {
+    /// A format failure, located.
+    Xz(XzError),
+    /// The source's own error, by kind and message.
+    Source(io::ErrorKind, alloc::string::String),
+}
+
+impl Failed {
+    fn keep(error: &io::Error) -> Self {
+        match super::error::located(error) {
+            Some(xz) => Failed::Xz(xz),
+            None => Failed::Source(error.kind(), error.to_string()),
+        }
+    }
+
+    fn again(&self) -> io::Error {
+        match self {
+            Failed::Xz(xz) => (*xz).into(),
+            Failed::Source(kind, message) => io::Error::new(*kind, message.clone()),
+        }
+    }
 }
 
 impl<R: Read> XzReader<R> {
@@ -202,6 +231,7 @@ impl<R: Read> XzReader<R> {
             fold: IndexFold::default(),
             checks: Vec::new(),
             tail_left: 0,
+            failed: None,
         }
     }
 
@@ -540,9 +570,22 @@ impl<R: Read> XzReader<R> {
 
 impl<R: Read> Read for XzReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.again());
+        }
         if out.is_empty() {
             return Ok(0);
         }
+        let res = self.read_steps(out);
+        if let Err(error) = &res {
+            self.failed = Some(Failed::keep(error));
+        }
+        res
+    }
+}
+
+impl<R: Read> XzReader<R> {
+    fn read_steps(&mut self, out: &mut [u8]) -> io::Result<usize> {
         loop {
             match self.state {
                 State::Done => return Ok(0),
@@ -559,6 +602,98 @@ impl<R: Read> Read for XzReader<R> {
                 State::Footer => self.footer()?,
                 State::Padding => self.padding()?,
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "enc"))]
+mod tests {
+    use super::*;
+
+    fn archive(data: &[u8], block: u64) -> Vec<u8> {
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        crate::encode_xz(data, &props, CheckType::Crc64, block).unwrap()
+    }
+
+    fn sample(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i / 5) as u8).wrapping_mul(17) ^ (i % 11) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn a_check_failure_is_returned_again_and_never_panics() {
+        let data = sample(48 << 10);
+        let file = archive(&data, 16 << 10);
+        let first =
+            crate::xz::index::block_table(&mut io::Cursor::new(&file), u64::MAX).unwrap()[0];
+        let check_end = (first.file_offset + first.record.unpadded_size) as usize;
+        let mut bad = file.clone();
+        bad[check_end - 1] ^= 0xff;
+
+        let mut r = XzReader::new(io::Cursor::new(&bad));
+        let mut out = Vec::new();
+        let error = r.read_to_end(&mut out).unwrap_err();
+        let want = super::super::error::located(&error).unwrap();
+        assert_eq!(want.kind, XzErrorKind::CheckMismatch);
+        let mut buf = [0u8; 4096];
+        for _ in 0..2 {
+            let again = r.read(&mut buf).unwrap_err();
+            assert_eq!(again.kind(), error.kind());
+            assert_eq!(super::super::error::located(&again), Some(want));
+        }
+        // An empty read after the error is an error too.
+        assert!(r.read(&mut []).is_err());
+
+        // Intact, the same file reads back whole.
+        let mut out = Vec::new();
+        XzReader::new(io::Cursor::new(&file))
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// A source that fails once, at a chosen read.
+    struct FailsOnce<'a> {
+        data: &'a [u8],
+        pos: usize,
+        reads: usize,
+        fail_at: usize,
+    }
+
+    impl Read for FailsOnce<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == self.fail_at {
+                return Err(io::Error::new(io::ErrorKind::ConnectionReset, "gone"));
+            }
+            let n = out.len().min(self.data.len() - self.pos).min(1000);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_source_error_is_returned_again() {
+        let data = sample(48 << 10);
+        let file = archive(&data, 16 << 10);
+        let mut r = XzReader::new(FailsOnce {
+            data: &file,
+            pos: 0,
+            reads: 0,
+            fail_at: 3,
+        });
+        let mut out = Vec::new();
+        let error = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            let again = r.read(&mut buf).unwrap_err();
+            assert_eq!(again.kind(), io::ErrorKind::ConnectionReset);
+            assert_eq!(again.to_string(), error.to_string());
         }
     }
 }

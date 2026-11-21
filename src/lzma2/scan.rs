@@ -25,6 +25,39 @@ use crate::lzma2::frame::{
     LZMA2_CONTROL_COPY_RESET_DIC, Lzma2Frame, Lzma2State, is_uncompressed_state,
 };
 
+/// The most complete runs a scanner, or a decoder fed by one, queues ahead
+/// of the runs taken.
+///
+/// A run costs a few bytes of stream (a stored chunk with a dictionary reset
+/// and a one-byte payload is four) and a hundred bytes of [`Lzma2Run`], so a
+/// stream of tiny runs would otherwise turn every megabyte fed into tens of
+/// megabytes of queued runs. At the cap the scanner stops before the control
+/// byte that would close another run, keeps its place, and goes on from it on
+/// the next call, once runs have been taken. Four thousand runs ahead is far
+/// more than any number of threads can take at once.
+pub(crate) const MAX_RUNS_AHEAD: usize = 4096;
+
+/// Makes room in `queue` for one more run: the first time, room for
+/// [`MAX_RUNS_AHEAD`] at once, so a queue held to the cap is allocated once
+/// and never grows.
+///
+/// # Errors
+///
+/// [`Error::Alloc`] if the allocation fails.
+pub(crate) fn reserve_run(queue: &mut VecDeque<Lzma2Run>) -> Result<(), Error> {
+    if queue.len() < queue.capacity() {
+        return Ok(());
+    }
+    let want = MAX_RUNS_AHEAD.saturating_sub(queue.len()).max(1);
+    queue.try_reserve_exact(want).map_err(|_| Error::Alloc)
+}
+
+/// Whether a control byte ends the run before it: the end marker, or a chunk
+/// that resets the dictionary.
+fn starts_run(control: u8) -> bool {
+    control == 0 || control >= 0xE0 || control == LZMA2_CONTROL_COPY_RESET_DIC
+}
+
 /// One independently decodable region of an LZMA2 stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lzma2Run {
@@ -232,14 +265,19 @@ impl Lzma2RunScanner {
     /// Scans `data`, which continues the stream where the last call left off,
     /// and returns how many of its bytes were consumed.
     ///
-    /// Consumes everything unless the stream ends inside `data`. Chunk headers
-    /// split across calls are carried over, never re-read.
+    /// Consumes everything unless the stream ends inside `data`, or 4,096
+    /// complete runs are waiting to be taken: then it stops before the
+    /// control byte that would close another, and the next call, after
+    /// [`Lzma2RunScanner::next_run`] has taken some, goes on from there. Chunk
+    /// headers split across calls are carried over, never re-read.
     ///
     /// # Errors
     ///
     /// Returns [`Error::CorruptData`] for a control byte the format does not
     /// allow in that position. A scanner that has returned an error will keep
-    /// returning it.
+    /// returning it. [`Error::Alloc`] if the queue of runs cannot be
+    /// allocated; nothing of `data` is consumed past that point, and the call
+    /// can be made again.
     pub fn feed(&mut self, data: &[u8]) -> Result<usize, Error> {
         if self.failed {
             return Err(Error::CorruptData);
@@ -260,10 +298,18 @@ impl Lzma2RunScanner {
             }
 
             let b = data[pos];
-            if self.frame.state == Lzma2State::Control && !self.on_control(b) {
-                pos += 1;
-                self.in_pos += 1;
-                break;
+            if self.frame.state == Lzma2State::Control {
+                if self.open.is_some() && starts_run(b) {
+                    if self.ready.len() >= MAX_RUNS_AHEAD {
+                        break;
+                    }
+                    reserve_run(&mut self.ready)?;
+                }
+                if !self.on_control(b) {
+                    pos += 1;
+                    self.in_pos += 1;
+                    break;
+                }
             }
 
             let next = self.frame.update_state(b, &mut self.prop);
@@ -314,7 +360,7 @@ impl Lzma2RunScanner {
     /// Handles a control byte before the state machine sees it. Returns false
     /// if it ends the stream.
     fn on_control(&mut self, b: u8) -> bool {
-        let starts_run = b == 0 || b >= 0xE0 || b == LZMA2_CONTROL_COPY_RESET_DIC;
+        let starts_run = starts_run(b);
         if starts_run {
             self.close_run();
         }
@@ -466,6 +512,76 @@ mod tests {
         out.push(control);
         out.extend_from_slice(&(len - 1).to_be_bytes());
         out.extend(core::iter::repeat_n(0x55, usize::from(len)));
+    }
+
+    /// `n` runs of one stored byte each, four bytes of stream a run, and the
+    /// end marker.
+    fn tiny_runs(n: usize) -> Vec<u8> {
+        let mut s = Vec::new();
+        for _ in 0..n {
+            copy_chunk(&mut s, 0x01, 1);
+        }
+        s.push(0);
+        s
+    }
+
+    /// Feeds `s` `step` bytes at a time, taking every run after each call.
+    fn scan_all(s: &[u8], step: usize) -> (Vec<Lzma2Run>, usize) {
+        let mut scanner = Lzma2RunScanner::new();
+        let mut runs = Vec::new();
+        let mut pos = 0;
+        let mut most = 0;
+        while !scanner.finished() {
+            let end = (pos + step).min(s.len());
+            pos += scanner.feed(&s[pos..end]).expect("scan");
+            most = most.max(scanner.pending_runs());
+            while let Some(r) = scanner.next_run() {
+                runs.push(r);
+            }
+        }
+        assert_eq!(pos, s.len());
+        (runs, most)
+    }
+
+    #[test]
+    fn a_stream_of_tiny_runs_queues_no_more_than_the_cap() {
+        let n = 3 * MAX_RUNS_AHEAD + 7;
+        let s = tiny_runs(n);
+        let mut scanner = Lzma2RunScanner::new();
+        // One call queues the cap's worth of runs, walks the next one, which
+        // stays open, and stops inside the input before the control byte that
+        // would close it.
+        let used = scanner.feed(&s).expect("scan");
+        assert_eq!(scanner.pending_runs(), MAX_RUNS_AHEAD);
+        assert_eq!(used, 4 * (MAX_RUNS_AHEAD + 1));
+        assert_eq!(scanner.open_run_offset(), Some(4 * MAX_RUNS_AHEAD as u64));
+        assert_eq!(scanner.in_position(), used as u64);
+        // Fed again without taking any, it takes nothing more.
+        assert_eq!(scanner.feed(&s[used..]), Ok(0));
+        assert_eq!(scanner.pending_runs(), MAX_RUNS_AHEAD);
+
+        let (runs, most) = scan_all(&s, s.len());
+        assert_eq!(most, MAX_RUNS_AHEAD);
+        assert_eq!(runs.len(), n);
+    }
+
+    #[test]
+    fn runs_found_under_the_cap_are_the_runs_found_without_it() {
+        let n = 2 * MAX_RUNS_AHEAD + 3;
+        let s = tiny_runs(n);
+        let (whole, _) = scan_all(&s, s.len());
+        let (byte, most) = scan_all(&s, 1);
+        // A byte at a time never reaches the cap; all at once does. The runs
+        // are the same, at the same offsets.
+        assert_eq!(most, 1);
+        assert_eq!(whole, byte);
+        for (i, r) in whole.iter().enumerate() {
+            assert_eq!(r.in_offset, 4 * i as u64);
+            assert_eq!(r.packed_len, 4);
+            assert_eq!(r.out_offset, i as u64);
+            assert_eq!(r.unpacked_len, 1);
+            assert!(r.has_dict_reset);
+        }
     }
 
     #[test]

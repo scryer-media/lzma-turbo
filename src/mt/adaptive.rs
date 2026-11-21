@@ -33,12 +33,12 @@ use crate::buffer::DicBuf;
 use crate::error::{Error, FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 
-use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner};
+use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner, MAX_RUNS_AHEAD, reserve_run};
 use crate::mt::Lzma2MtOptions;
 #[cfg(feature = "crc")]
 use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
 use crate::mt::pool::{Done, Job, Pool, locate};
-use crate::mt::segq::SegQueue;
+use crate::mt::segq::{PIECE_OVERHEAD, SegQueue};
 
 /// How much of the single-threaded decoder's dictionary is filled before it is
 /// handed to the caller. C: `props.outStep_ST`.
@@ -966,6 +966,25 @@ impl Lzma2AdaptiveDecoder {
     /// piece, so a caller reading in 256 KiB pieces, as 7-Zip reads, is
     /// allowed the 256 KiB of overrun 7-Zip keeps and not a mebibyte.
     fn pair_bound(&self) -> u64 {
+        let bytes = self.pair_bytes();
+        if bytes == u64::MAX {
+            return bytes;
+        }
+        // The bound is written in bytes of runs. What holding a piece costs
+        // besides its bytes is real memory, counted against the caller's
+        // limit, but no part of a pair: it is allowed here for as many
+        // pieces as those bytes fill, and one more for a piece cut short, so
+        // that a pair per thread is not refused for the bookkeeping of the
+        // pieces it is held in. It follows the bound and not the pieces held,
+        // so the bound stays what the runs make it.
+        let piece = self.segs.piece_size().max(MIN_PIECE);
+        let pieces = bytes.div_ceil(piece).saturating_add(1);
+        bytes.saturating_add(pieces.saturating_mul(PIECE_OVERHEAD))
+    }
+
+    /// [`Self::pair_bound`] in bytes of runs alone, before the bookkeeping
+    /// of the pieces they are held in.
+    fn pair_bytes(&self) -> u64 {
         let (run_in, run_out) = self.run_pair();
         if run_in == 0 && run_out == 0 {
             return u64::MAX;
@@ -1224,7 +1243,8 @@ impl Lzma2AdaptiveDecoder {
     /// that the path that accepts never copies.
     ///
     /// The piece costs [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes) its
-    /// allocation's capacity, not its length, and is admitted by that: a short
+    /// allocation's capacity, not its length, plus a fixed amount for the
+    /// decoder's bookkeeping of a piece, and is admitted by that: a short
     /// piece in a large buffer is refused where its bytes alone would fit. A
     /// caller cutting a read short should copy a small piece into a buffer its
     /// size, or lend it with
@@ -1350,7 +1370,10 @@ impl Lzma2AdaptiveDecoder {
         // goes straight into one, so counting it twice - once where it sits
         // and again in the room the piece needs - would refuse input for
         // memory that is about to be the input.
-        let held = self.segs.held_bytes() - self.segs.spare_bytes();
+        //
+        // The piece offered costs its bookkeeping as well as its bytes, so
+        // that is counted as held before its bytes are weighed.
+        let held = self.segs.held_bytes() - self.segs.spare_bytes() + PIECE_OVERHEAD;
         let mut ceiling = self.buf_budget();
         if !self.has_work_in_hand() {
             ceiling = ceiling.max(self.buf_budget_for(1));
@@ -1831,19 +1854,40 @@ impl Lzma2AdaptiveDecoder {
 
     /// Walks whatever headers have arrived since the last call.
     fn scan(&mut self) -> Result<(), Error> {
-        if self.scanner.finished() {
+        if self.scanner.finished() && self.scanner.pending_runs() == 0 {
             return Ok(());
         }
         // The scanner keeps its own position and its own state between
         // calls, so input that arrived in four pieces is walked as four
         // pieces: a header split across a boundary is resumed, not copied
         // together first.
-        while let Some(piece) = self.segs.piece_at(self.scanner.in_position()) {
-            self.scanner.feed(piece)?;
-            while let Some(r) = self.scanner.next_run() {
-                self.pending.push_back(r);
+        //
+        // At most [`MAX_RUNS_AHEAD`] runs wait in `pending`, and as many in the
+        // scanner, which stops at that many and keeps its place: a stream of
+        // tiny runs is walked as fast as the runs are taken, not as fast as
+        // it is fed. Each call goes on from where the last stopped.
+        //
+        // The chase reads the input itself and can be past the scanner, which
+        // stopped for a full queue. A run it has already decoded is dropped
+        // here, as it arrives: left in `pending` such runs would fill it and
+        // stop the scan, and with no input at the cursor no decode step would
+        // come to retire them.
+        loop {
+            self.drop_passed_runs();
+            while self.pending.len() < MAX_RUNS_AHEAD && self.scanner.pending_runs() != 0 {
+                reserve_run(&mut self.pending)?;
+                if let Some(r) = self.scanner.next_run() {
+                    self.pending.push_back(r);
+                }
+                self.drop_passed_runs();
             }
-            if self.scanner.finished() {
+            if self.scanner.finished() || self.pending.len() >= MAX_RUNS_AHEAD {
+                break;
+            }
+            let Some(piece) = self.segs.piece_at(self.scanner.in_position()) else {
+                break;
+            };
+            if self.scanner.feed(piece)? == 0 && self.scanner.pending_runs() == 0 {
                 break;
             }
         }
@@ -1890,7 +1934,15 @@ impl Lzma2AdaptiveDecoder {
             let excess = self.segs.spare_bytes().saturating_sub(room);
             self.segs.shed_spare_down(excess);
         }
-        self.segs.retain_from(self.cursor_in);
+        // The chase can decode past where the scanner stopped for a full
+        // backlog of runs; the input from there on is the scanner's to walk
+        // yet, and is kept until it has.
+        let walked = if self.scanner.finished() {
+            self.cursor_in
+        } else {
+            self.cursor_in.min(self.scanner.in_position())
+        };
+        self.segs.retain_from(walked);
     }
 
     /// Takes finished blocks off the pool, optionally waiting for one.
@@ -2511,9 +2563,9 @@ impl Lzma2AdaptiveDecoder {
         Ok(true)
     }
 
-    /// Drops runs the single-threaded path has decoded past, and works out
-    /// whether the cursor is at a boundary.
-    fn retire_runs(&mut self) {
+    /// Drops the runs at the front of `pending` that end at or before the
+    /// cursor: the single-threaded path has decoded them.
+    fn drop_passed_runs(&mut self) {
         while let Some(front) = self.pending.front().copied() {
             if front.in_offset + front.packed_len <= self.cursor_in {
                 self.st_retired_end = front.in_offset + front.packed_len;
@@ -2524,6 +2576,12 @@ impl Lzma2AdaptiveDecoder {
                 break;
             }
         }
+    }
+
+    /// Drops runs the single-threaded path has decoded past, and works out
+    /// whether the cursor is at a boundary.
+    fn retire_runs(&mut self) {
+        self.drop_passed_runs();
         self.st_in_run = match self.pending.front() {
             Some(front) => self.cursor_in > front.in_offset,
             // Past every complete run: inside the run still arriving, at its
@@ -2902,13 +2960,13 @@ mod tests {
         hold(&mut d, &[1]);
         d.scan().unwrap();
         assert_eq!(d.pending.len(), 2);
-        let base = d.pair_bound();
+        let base = d.pair_bytes();
         let pair = d.run_pair();
         d.set_read_ahead(2);
-        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+        assert_eq!(d.pair_bytes() - base, d.pending[1].packed_len);
         assert_eq!(d.run_pair(), pair, "active output reservation is unchanged");
         d.pending[1].unpacked_len *= 10;
-        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+        assert_eq!(d.pair_bytes() - base, d.pending[1].packed_len);
     }
 
     #[test]
@@ -3124,6 +3182,125 @@ mod tests {
         assert_eq!(d.pair_bound(), bound);
     }
 
+    /// Decodes `stream` fed in one piece, checking after every drain that
+    /// no more than the cap of runs waits in the decoder or its scanner.
+    fn decode_counting_runs(stream: &[u8], threads: usize) -> (Vec<u8>, usize) {
+        let mut d = decoder(threads, u64::MAX);
+        let mut out = alloc::vec![0u8; 0];
+        let mut fed = 0;
+        let mut most = 0;
+        loop {
+            if fed < stream.len() {
+                fed += d.feed(&stream[fed..]).expect("feed");
+                if fed == stream.len() {
+                    d.end_of_input();
+                }
+            }
+            let status = d
+                .drain(|off, b| {
+                    let off = off as usize;
+                    if out.len() < off + b.len() {
+                        out.resize(off + b.len(), 0);
+                    }
+                    out[off..off + b.len()].copy_from_slice(b);
+                })
+                .expect("drain");
+            assert!(d.pending.len() <= MAX_RUNS_AHEAD);
+            assert!(d.scanner.pending_runs() <= MAX_RUNS_AHEAD);
+            most = most.max(d.pending.len());
+            if status == DrainStatus::Finished {
+                return (out, most);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_of_tiny_runs_is_scanned_as_its_runs_are_taken() {
+        // Four bytes of stream a run: a megabyte fed would be a quarter of a
+        // million runs queued at once without the cap.
+        let n = 3 * MAX_RUNS_AHEAD + 11;
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..n {
+            stream.extend_from_slice(&run(1, i as u8));
+            plain.push(i as u8);
+        }
+        stream.push(0);
+        for threads in [1, 4] {
+            let (out, most) = decode_counting_runs(&stream, threads);
+            assert_eq!(out, plain, "threads={threads}");
+            assert!(most <= MAX_RUNS_AHEAD, "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn a_chase_past_the_capped_scanner_drops_the_runs_it_decoded() {
+        // One thread, so the chase decodes every run, a whole fed piece at a
+        // step, and passes the scanner, which stops at the cap. The runs the
+        // scanner then hands over are ones the chase has already decoded:
+        // they must be dropped as they arrive, or they fill the queue, the
+        // scan stops, and with no input left at the cursor nothing retires
+        // them.
+        let n = 100_000;
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..n {
+            stream.extend_from_slice(&run(1, i as u8));
+            plain.push(i as u8);
+        }
+        stream.push(0);
+
+        let mut d = decoder(1, 8 << 20);
+        let mut out = alloc::vec![0u8; 0];
+        let mut fed = 0;
+        loop {
+            let mut took = 0;
+            if fed < stream.len() {
+                let end = stream.len().min(fed + (64 << 10));
+                took = d.feed(&stream[fed..end]).expect("feed");
+                fed += took;
+                if fed == stream.len() {
+                    d.end_of_input();
+                }
+            }
+            let status = d
+                .drain(|off, b| {
+                    let off = off as usize;
+                    if out.len() < off + b.len() {
+                        out.resize(off + b.len(), 0);
+                    }
+                    out[off..off + b.len()].copy_from_slice(b);
+                })
+                .expect("drain");
+            assert!(d.pending.len() <= MAX_RUNS_AHEAD);
+            if status == DrainStatus::Finished {
+                break;
+            }
+            assert!(
+                took != 0 || status == DrainStatus::Progress,
+                "stalled after {} bytes out, {fed} fed",
+                out.len()
+            );
+        }
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn a_stream_under_the_run_cap_decodes_the_same() {
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..5 {
+            let r = run(300_000, i);
+            stream.extend_from_slice(&r);
+            plain.extend((0..300_000).map(|j| i.wrapping_add(j as u8)));
+        }
+        stream.push(0);
+        for threads in [1, 4] {
+            let (out, _) = decode_counting_runs(&stream, threads);
+            assert_eq!(out, plain, "threads={threads}");
+        }
+    }
+
     #[test]
     fn a_pair_per_thread_held_in_whole_pieces_fits_the_bound() {
         // Two threads, 1 MiB pieces, and runs that do not line up with them:
@@ -3151,7 +3328,11 @@ mod tests {
         assert!(d.collect(true));
         let mut left = usize::MAX;
         d.emit(&mut |_, _: &[u8]| {}, &mut left);
-        assert_eq!(d.segs.held_bytes() - d.segs.spare_bytes(), 10 * MIB as u64);
+        // Ten pieces: their bytes and the bookkeeping each one costs.
+        assert_eq!(
+            d.segs.held_bytes() - d.segs.spare_bytes(),
+            10 * (MIB as u64 + PIECE_OVERHEAD)
+        );
 
         // Each thread takes one of the 4 MiB runs. That is a pair per thread,
         // which is what the bound is for, and it must not be refused for the
@@ -3173,18 +3354,24 @@ mod tests {
         }
         d.segs.retain_from(d.segs.end());
         assert_eq!(d.segs.spare_bytes(), (20 * PIECE) as u64);
+        // A parked piece is held at its bytes, its bookkeeping gone with the
+        // run it carried, while the working bound allows for bookkeeping; so
+        // what is kept is the whole pieces that fit under each line.
+        let unit = PIECE as u64;
         let working_bound = d.limit();
         d.fit_parked_input();
-        assert_eq!(d.holding(), working_bound + PIECE as u64);
+        let kept = (working_bound + PIECE as u64) / unit * unit;
+        assert_eq!(d.holding(), kept);
         let reused = d.reclaim_piece().expect("the next read has storage");
         assert_eq!(reused.capacity(), PIECE);
-        assert_eq!(d.holding(), working_bound);
+        assert_eq!(d.holding(), kept - unit);
+        assert!(d.holding() <= working_bound);
 
         // An explicit ceiling never receives the handoff allowance.
         d.set_memory_limit(working_bound - PIECE as u64);
         d.fit_parked_input();
-        assert_eq!(d.holding(), working_bound - PIECE as u64);
-        assert_eq!(d.holding(), d.memory_limit());
+        assert_eq!(d.holding(), (working_bound - PIECE as u64) / unit * unit);
+        assert!(d.holding() <= d.memory_limit());
     }
 
     #[test]
@@ -3282,7 +3469,7 @@ mod tests {
             l
         };
         let l = sums(&d);
-        assert_eq!(l.input_bytes, stream.len() as u64);
+        assert_eq!(l.input_bytes, stream.len() as u64 + PIECE_OVERHEAD);
         assert_eq!((l.runs_out, l.runs_waiting), (0, 0));
 
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
@@ -3575,7 +3762,7 @@ mod tests {
 
         let next = run(MIB, 1);
         let piece = exact(&next[MIB / 2..]);
-        let limit = d.holding() - parked + piece.capacity() as u64;
+        let limit = d.holding() - parked + piece.capacity() as u64 + PIECE_OVERHEAD;
         d.set_memory_limit(limit);
         assert!(
             d.feed_owned(piece).expect("feed").is_none(),
@@ -3613,7 +3800,7 @@ mod tests {
         assert!(parked > 0, "a piece is parked: {:?}", d.ledger());
 
         let piece = exact(&third[1..third.len() / 2]);
-        let limit = d.holding() - parked + piece.capacity() as u64;
+        let limit = d.holding() - parked + piece.capacity() as u64 + PIECE_OVERHEAD;
         d.set_memory_limit(limit);
         assert_eq!(d.memory_limit(), limit, "the pair bound is not the limit");
         assert!(

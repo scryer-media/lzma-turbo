@@ -124,17 +124,34 @@ pub(crate) struct SegQueue {
 /// having its large buffers kept soon after.
 const RECENT_PIECES: usize = 8;
 
+/// What holding one piece costs besides its bytes: its slot in the queue,
+/// the queue's handle (an `Arc` allocation: two counts and the handle's
+/// pointer), and the `Arc<Vec<u8>>` the bytes sit behind (two counts and the
+/// `Vec` header).
+///
+/// A piece's bytes alone undercount a stream fed a byte at a time by a factor
+/// of a hundred: every one-byte piece holds the same bookkeeping as a full
+/// read. Every piece is charged this on top of its bytes, owned or shared,
+/// so the limit bounds what the queue really holds.
+pub(crate) const PIECE_OVERHEAD: u64 = (core::mem::size_of::<Seg>()
+    + 2 * ARC_COUNTS
+    + core::mem::size_of::<SegData>()
+    + core::mem::size_of::<Vec<u8>>()) as u64;
+
+/// The strong and weak counts at the head of every `Arc` allocation.
+const ARC_COUNTS: usize = 2 * core::mem::size_of::<usize>();
+
 impl SegQueue {
     /// Takes a piece of input, owned outright.
     pub(crate) fn push_owned(&mut self, seg: Vec<u8>) {
-        let charge = seg.capacity() as u64;
+        let charge = seg.capacity() as u64 + PIECE_OVERHEAD;
         let range = 0..seg.len();
         self.push(Arc::new(seg), range, charge, true);
     }
 
     /// Takes a piece of input the caller is keeping a reference to.
     pub(crate) fn push_shared(&mut self, data: &Arc<Vec<u8>>, range: Range<usize>) {
-        let charge = (range.end - range.start) as u64;
+        let charge = (range.end - range.start) as u64 + PIECE_OVERHEAD;
         self.push(Arc::clone(data), range, charge, false);
     }
 
@@ -452,6 +469,36 @@ impl SegQueue {
 mod tests {
     use super::*;
 
+    const O: u64 = PIECE_OVERHEAD;
+
+    #[test]
+    fn a_stream_fed_a_byte_at_a_time_is_charged_for_its_pieces() {
+        // A thousand one-byte pieces: their bytes are a thousand, what holding
+        // them costs is a thousand pieces of bookkeeping as well.
+        let buf = Arc::new(piece(1000, 5));
+        let mut q = SegQueue::default();
+        for i in 0..1000 {
+            q.push_owned(piece(1, 1));
+            q.push_shared(&buf, i..i + 1);
+        }
+        assert_eq!(q.len(), 2000);
+        assert!(O >= core::mem::size_of::<Seg>() as u64 + 32);
+        // Owned pieces are charged their capacity, shared ones their bytes.
+        let owned_cap = piece(1, 1).capacity() as u64;
+        assert_eq!(q.held_bytes(), 1000 * (owned_cap + O) + 1000 * (1 + O));
+        // Letting go of them takes all of it off again.
+        q.retain_from(2000);
+        assert_eq!(q.held_bytes(), q.spare_bytes());
+    }
+
+    #[test]
+    fn a_whole_piece_keeps_its_bytes_and_one_overhead() {
+        let mut q = SegQueue::default();
+        q.push_owned(piece(1 << 20, 3));
+        assert_eq!(q.held_bytes(), (1 << 20) + O);
+        assert_eq!(q.piece_at(0).unwrap(), &piece(1 << 20, 3)[..]);
+    }
+
     fn piece(n: usize, byte: u8) -> Vec<u8> {
         alloc::vec![byte; n]
     }
@@ -461,22 +508,22 @@ mod tests {
         let mut q = SegQueue::default();
         q.push_owned(piece(100, 1));
         q.push_owned(piece(100, 2));
-        assert_eq!(q.held_bytes(), 200);
+        assert_eq!(q.held_bytes(), 200 + 2 * O);
         assert_eq!(q.len(), 200);
 
         // Inside the first piece: nothing can be given back yet, because the
         // rest of it is still to be read.
         q.retain_from(50);
-        assert_eq!(q.held_bytes(), 200);
-        assert_eq!(q.dead_bytes(), 50);
+        assert_eq!(q.held_bytes(), 200 + 2 * O);
+        assert_eq!(q.dead_bytes(), 50 + 2 * O);
 
         // Past the first piece: its bytes are no longer the stream's, but the
         // allocation is kept for the next piece, so it is still charged - and
         // it is not dead weight, because a copy will go into it.
         q.retain_from(100);
-        assert_eq!(q.held_bytes(), 200);
+        assert_eq!(q.held_bytes(), 200 + O);
         assert_eq!(q.spare_bytes(), 100);
-        assert_eq!(q.dead_bytes(), 0);
+        assert_eq!(q.dead_bytes(), O);
 
         q.retain_from(200);
         assert_eq!(q.held_bytes(), 100);
@@ -577,13 +624,13 @@ mod tests {
         q.push_owned(piece(100, 3));
         q.retain_from(200);
         assert_eq!(q.spare_bytes(), 200);
-        assert_eq!(q.held_bytes(), 300);
+        assert_eq!(q.held_bytes(), 300 + O);
 
         assert_eq!(q.shed_spare(), 200);
         assert_eq!(q.spare_bytes(), 0);
         // The piece still to be read is charged as it was.
-        assert_eq!(q.held_bytes(), 100);
-        assert_eq!(q.dead_bytes(), 0);
+        assert_eq!(q.held_bytes(), 100 + O);
+        assert_eq!(q.dead_bytes(), O);
         assert!(q.take_spare().is_none());
         assert_eq!(q.shed_spare(), 0);
     }
@@ -609,14 +656,14 @@ mod tests {
         let claim = q.claim(0..100).expect("wholly held");
         // The claim is a second reference to bytes already charged, not a
         // second charge.
-        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.held_bytes(), 100 + O);
         assert_eq!(claim.len(), 1);
         assert_eq!(claim[0].bytes(), &piece(100, 7)[..]);
 
         // Past the piece with the claim still out: the queue cannot give the
         // memory back, because the holder is still reading it.
         q.retain_from(100);
-        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.held_bytes(), 100 + O);
 
         drop(claim);
         q.sweep();
@@ -652,15 +699,15 @@ mod tests {
         q.push_shared(&buf, 40..100);
         // What is charged is the bytes lent, not the allocation, and lending
         // twice out of one buffer charges each range once.
-        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.held_bytes(), 100 + 2 * O);
 
         let claim = q.claim(0..40).expect("wholly held");
         q.retain_from(40);
         // The first range is out with a holder; the second is still to be read.
-        assert_eq!(q.held_bytes(), 100);
+        assert_eq!(q.held_bytes(), 100 + 2 * O);
         drop(claim);
         q.sweep();
-        assert_eq!(q.held_bytes(), 60);
+        assert_eq!(q.held_bytes(), 60 + O);
 
         q.retain_from(100);
         // Nothing of the queue's is left, though the caller's buffer lives on.
