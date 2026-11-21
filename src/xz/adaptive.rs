@@ -74,9 +74,10 @@ pub struct XzAdaptiveDecoder {
     /// The fold closed, once, when the index indicator was reached.
     fold_final: (u64, u64, u64, u64),
     index_size: u64,
-    /// How many bytes were buffered the last time the index failed to parse,
-    /// so a long index is not re-parsed on every call.
-    index_retry_at: usize,
+    /// How far the index has been parsed, kept across calls so that an
+    /// index arriving in pieces is read once, not again from its start on
+    /// every call that brings more of it.
+    index_parse: IndexParse,
 
     // The chase.
     st: Option<BlockDecoder>,
@@ -105,6 +106,10 @@ pub struct XzAdaptiveDecoder {
     checks: Vec<BlockCheck>,
     input_done: bool,
     cancelled: bool,
+    /// The first error `feed` or a drain returned. Every later call returns
+    /// it again without touching the state machine, which that error may
+    /// have left part way through a step.
+    failed: Option<XzError>,
     /// The allocator's own failure behind the last
     /// [`XzErrorKind::WindowAlloc`] returned, for
     /// [`XzAdaptiveDecoder::take_window_error`]. `AssertUnwindSafe` keeps the
@@ -139,7 +144,7 @@ impl XzAdaptiveDecoder {
             fold: IndexFold::default(),
             fold_final: (0, 0, 0, 0),
             index_size: 0,
-            index_retry_at: 0,
+            index_parse: IndexParse::new(),
             st: None,
             st_header_size: 0,
             st_out: Vec::new(),
@@ -158,6 +163,7 @@ impl XzAdaptiveDecoder {
             checks: Vec::new(),
             input_done: false,
             cancelled: false,
+            failed: None,
             window_err: core::panic::AssertUnwindSafe(None),
         }
     }
@@ -250,6 +256,22 @@ impl XzAdaptiveDecoder {
     /// [`XzErrorKind::Lzma`] carrying `Cancelled` after
     /// [`XzAdaptiveDecoder::cancel`].
     pub fn feed(&mut self, data: &[u8]) -> XzResult<usize> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let fed = self.feed_impl(data);
+        self.latch(fed)
+    }
+
+    /// Keeps the first error returned, for every later call to return.
+    fn latch<T>(&mut self, res: XzResult<T>) -> XzResult<T> {
+        if let Err(error) = &res {
+            self.failed.get_or_insert(*error);
+        }
+        res
+    }
+
+    fn feed_impl(&mut self, data: &[u8]) -> XzResult<usize> {
         if self.cancelled {
             return Err(self.err(XzErrorKind::Lzma(crate::Error::Cancelled)));
         }
@@ -312,7 +334,7 @@ impl XzAdaptiveDecoder {
     /// this therefore cannot spin - the next drain turns that state into the
     /// error it is.
     pub fn wait_for_worker(&mut self) -> bool {
-        if self.outstanding == 0 {
+        if self.outstanding == 0 || self.failed.is_some() {
             return false;
         }
         self.collect(true).unwrap_or(false)
@@ -360,7 +382,18 @@ impl XzAdaptiveDecoder {
         self.drain_impl(limit, sink)
     }
 
-    fn drain_impl<F>(&mut self, limit: usize, mut sink: F) -> XzResult<DrainStatus>
+    fn drain_impl<F>(&mut self, limit: usize, sink: F) -> XzResult<DrainStatus>
+    where
+        F: FnMut(u64, &[u8]),
+    {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let drained = self.drain_steps(limit, sink);
+        self.latch(drained)
+    }
+
+    fn drain_steps<F>(&mut self, limit: usize, mut sink: F) -> XzResult<DrainStatus>
     where
         F: FnMut(u64, &[u8]),
     {
@@ -520,7 +553,7 @@ impl XzAdaptiveDecoder {
             // arrives.
             self.fold_final = self.fold.finish();
             self.state = State::Index;
-            self.index_retry_at = 0;
+            self.index_parse = IndexParse::new();
             return Ok(Step::Did);
         };
         if self.avail().len() < header_size {
@@ -650,8 +683,14 @@ impl XzAdaptiveDecoder {
                 limit: w.max_len(),
             }));
         }
-        // One worker's cost in RAM, against the caller's limit.
-        let cost = in_ram(window.is_some(), unpacked_len) + padded;
+        // One worker's cost in RAM, against the caller's limit. A block that
+        // could not fit even alone is never a worker's: nothing finishing
+        // would make room for it, so it is chased, which decodes in the
+        // block's dictionary under the limit.
+        let cost = in_ram(window.is_some(), unpacked_len).saturating_add(padded);
+        if cost > self.opts.memory_limit {
+            return Ok(Dispatch::No);
+        }
         if held_blocks > 0 && self.held_block_bytes().saturating_add(cost) > self.opts.memory_limit
         {
             return Ok(Dispatch::Busy);
@@ -793,93 +832,128 @@ impl XzAdaptiveDecoder {
         Ok(Step::Did)
     }
 
-    /// Parses the index, which has to have arrived whole. The indicator byte
-    /// has already been consumed.
+    /// Parses the index as it arrives. The indicator byte has already been
+    /// consumed. The index is consumed only once it has been read whole, so
+    /// every error is located at its start, however the input was split.
     fn index(&mut self) -> XzResult<Step> {
-        // Every attempt re-parses from the start of the index, so only try
-        // again once more input has actually arrived.
-        if self.avail().len() <= self.index_retry_at && !self.input_done {
-            return Ok(Step::Blocked);
-        }
-        let mut crc = Crc32::new();
-        crc.update(&[0x00]);
-        let mut pos = 0usize;
-        let mut size = 1u64;
-        let body = self.avail();
-
-        let take_vli = |pos: &mut usize, size: &mut u64, crc: &mut Crc32| {
-            let (v, n) = vli::decode(body.get(*pos..).unwrap_or(&[]))?;
-            crc.update(&body[*pos..*pos + n]);
-            *pos += n;
-            *size += n as u64;
-            Ok::<u64, XzErrorKind>(v)
-        };
-
-        let count = match take_vli(&mut pos, &mut size, &mut crc) {
-            Ok(v) => v,
-            Err(XzErrorKind::TruncatedVli) => return self.incomplete_index(),
-            Err(k) => return Err(self.err(k)),
-        };
-        let (have_count, have_blocks, have_unpacked, have_digest) = self.fold_final;
-        if count != have_count {
-            return Err(self.err(XzErrorKind::IndexMismatch));
-        }
-        let mut seen = IndexFold::default();
-        for _ in 0..count {
-            let unpadded = match take_vli(&mut pos, &mut size, &mut crc) {
-                Ok(v) => v,
-                Err(XzErrorKind::TruncatedVli) => return self.incomplete_index(),
-                Err(k) => return Err(self.err(k)),
-            };
-            let uncompressed = match take_vli(&mut pos, &mut size, &mut crc) {
-                Ok(v) => v,
-                Err(XzErrorKind::TruncatedVli) => return self.incomplete_index(),
-                Err(k) => return Err(self.err(k)),
-            };
-            if unpadded < 5 {
-                return Err(self.err(XzErrorKind::IndexMismatch));
-            }
-            seen.push(unpadded, uncompressed).map_err(|k| self.err(k))?;
-            if size > MAX_INDEX_SIZE {
-                return Err(self.err(XzErrorKind::IndexMismatch));
-            }
-        }
-        let (_, seen_blocks, seen_unpacked, seen_digest) = seen.finish();
-        if seen_digest != have_digest
-            || seen_blocks != have_blocks
-            || seen_unpacked != have_unpacked
-        {
-            return Err(self.err(XzErrorKind::IndexMismatch));
-        }
-        while !size.is_multiple_of(4) {
-            let Some(&b) = body.get(pos) else {
-                return self.incomplete_index();
-            };
-            if b != 0 {
-                return Err(self.err(XzErrorKind::BadPadding));
-            }
-            crc.update(&[0]);
-            pos += 1;
-            size += 1;
-        }
-        let Some(stored) = body.get(pos..pos + 4) else {
+        let mut parse = core::mem::replace(&mut self.index_parse, IndexParse::new());
+        let res = self.parse_index(&mut parse);
+        let size = parse.size;
+        let pos = parse.pos;
+        self.index_parse = parse;
+        if !res? {
             return self.incomplete_index();
-        };
-        let stored = u32::from_le_bytes(stored.try_into().expect("4 bytes"));
-        if crc.finalize() != stored {
-            return Err(self.err(XzErrorKind::HeaderCrc));
         }
-        pos += 4;
-        size += 4;
-
         self.consume(pos);
         self.index_size = size;
         self.state = State::Footer;
         Ok(Step::Did)
     }
 
+    /// Carries the parse of the index on from where `p` stopped. Returns
+    /// whether the index is complete; false means more of it is needed. A
+    /// variable-length integer that has only partly arrived is left unread,
+    /// and read again whole on the next call.
+    fn parse_index(&self, p: &mut IndexParse) -> XzResult<bool> {
+        let body = self.avail();
+        // One integer at `p.pos`: `None` when it has not all arrived.
+        let take_vli = |p: &mut IndexParse| -> XzResult<Option<u64>> {
+            match vli::decode(body.get(p.pos..).unwrap_or(&[])) {
+                Ok((v, n)) => {
+                    p.hash(&body[p.pos..p.pos + n]);
+                    p.pos += n;
+                    p.size += n as u64;
+                    Ok(Some(v))
+                }
+                Err(XzErrorKind::TruncatedVli) => Ok(None),
+                Err(k) => Err(self.err(k)),
+            }
+        };
+        loop {
+            match p.phase {
+                IndexPhase::Count => {
+                    let Some(count) = take_vli(p)? else {
+                        return Ok(false);
+                    };
+                    if count != self.fold_final.0 {
+                        return Err(self.err(XzErrorKind::IndexMismatch));
+                    }
+                    p.records_left = count;
+                    p.phase = IndexPhase::Records;
+                }
+                IndexPhase::Records => {
+                    while p.records_left > 0 {
+                        let unpadded = match p.unpadded {
+                            Some(v) => v,
+                            None => {
+                                let Some(v) = take_vli(p)? else {
+                                    return Ok(false);
+                                };
+                                p.unpadded = Some(v);
+                                v
+                            }
+                        };
+                        let Some(uncompressed) = take_vli(p)? else {
+                            return Ok(false);
+                        };
+                        p.unpadded = None;
+                        p.records_left -= 1;
+                        #[cfg(test)]
+                        {
+                            p.records_parsed += 1;
+                        }
+                        if unpadded < 5 {
+                            return Err(self.err(XzErrorKind::IndexMismatch));
+                        }
+                        p.seen
+                            .push(unpadded, uncompressed)
+                            .map_err(|k| self.err(k))?;
+                        if p.size > MAX_INDEX_SIZE {
+                            return Err(self.err(XzErrorKind::IndexMismatch));
+                        }
+                    }
+                    let (_, have_blocks, have_unpacked, have_digest) = self.fold_final;
+                    let (_, seen_blocks, seen_unpacked, seen_digest) = p.seen.finish();
+                    if seen_digest != have_digest
+                        || seen_blocks != have_blocks
+                        || seen_unpacked != have_unpacked
+                    {
+                        return Err(self.err(XzErrorKind::IndexMismatch));
+                    }
+                    p.phase = IndexPhase::Padding;
+                }
+                IndexPhase::Padding => {
+                    while !p.size.is_multiple_of(4) {
+                        let Some(&b) = body.get(p.pos) else {
+                            return Ok(false);
+                        };
+                        if b != 0 {
+                            return Err(self.err(XzErrorKind::BadPadding));
+                        }
+                        p.hash(&[0]);
+                        p.pos += 1;
+                        p.size += 1;
+                    }
+                    p.phase = IndexPhase::Crc;
+                }
+                IndexPhase::Crc => {
+                    let Some(stored) = body.get(p.pos..p.pos + 4) else {
+                        return Ok(false);
+                    };
+                    let stored = u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]);
+                    if core::mem::take(&mut p.crc).finalize() != stored {
+                        return Err(self.err(XzErrorKind::HeaderCrc));
+                    }
+                    p.pos += 4;
+                    p.size += 4;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     /// The index has not all arrived yet.
-    fn incomplete_index(&mut self) -> XzResult<Step> {
+    fn incomplete_index(&self) -> XzResult<Step> {
         if self.input_done {
             return Err(self.err(XzErrorKind::TruncatedInput));
         }
@@ -893,7 +967,6 @@ impl XzAdaptiveDecoder {
                 limit: self.opts.memory_limit,
             }));
         }
-        self.index_retry_at = self.avail().len();
         Ok(Step::Blocked)
     }
 
@@ -1051,6 +1124,64 @@ fn in_ram(lent: bool, unpacked_len: usize) -> u64 {
     if lent { 0 } else { unpacked_len as u64 }
 }
 
+/// Which field of the index comes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPhase {
+    Count,
+    Records,
+    Padding,
+    Crc,
+}
+
+/// How far the index has been read: everything before `pos` (counted from
+/// the byte after the indicator) has been checked and hashed once.
+struct IndexParse {
+    pos: usize,
+    /// The index's CRC-32 so far, the indicator included.
+    crc: Crc32,
+    /// The index's size so far, the indicator included.
+    size: u64,
+    phase: IndexPhase,
+    records_left: u64,
+    /// A record's first field, read before its second had arrived.
+    unpadded: Option<u64>,
+    /// The records read, folded as the blocks were.
+    seen: IndexFold,
+    /// Bytes hashed and records read, so a test can count the work.
+    #[cfg(test)]
+    hashed: u64,
+    #[cfg(test)]
+    records_parsed: u64,
+}
+
+impl IndexParse {
+    fn new() -> Self {
+        let mut crc = Crc32::new();
+        crc.update(&[0x00]);
+        IndexParse {
+            pos: 0,
+            crc,
+            size: 1,
+            phase: IndexPhase::Count,
+            records_left: 0,
+            unpadded: None,
+            seen: IndexFold::default(),
+            #[cfg(test)]
+            hashed: 1,
+            #[cfg(test)]
+            records_parsed: 0,
+        }
+    }
+
+    fn hash(&mut self, bytes: &[u8]) {
+        self.crc.update(bytes);
+        #[cfg(test)]
+        {
+            self.hashed += bytes.len() as u64;
+        }
+    }
+}
+
 /// What one turn of the state machine did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -1099,6 +1230,178 @@ mod admission_tests {
         done.res.unwrap();
         assert_eq!(done.bytes.capacity(), padded);
         assert_eq!(&done.out[..4096], &[7; 4096]);
+    }
+
+    /// Feeds `file` `step` bytes at a time and drains after every feed,
+    /// collecting the output in order.
+    fn decode_all(dec: &mut XzAdaptiveDecoder, file: &[u8], step: usize) -> XzResult<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut fed = 0;
+        loop {
+            if fed < file.len() {
+                let end = file.len().min(fed + step);
+                fed += dec.feed(&file[fed..end])?;
+                if fed == file.len() {
+                    dec.end_of_input();
+                }
+            }
+            let status = dec.drain(|offset, bytes| {
+                assert_eq!(offset, out.len() as u64);
+                out.extend_from_slice(bytes);
+            })?;
+            match status {
+                DrainStatus::Finished => return Ok(out),
+                DrainStatus::NeedsMoreInput if fed == file.len() => {
+                    dec.wait_for_worker();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(feature = "enc")]
+    fn sample(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i / 7) as u8).wrapping_mul(31) ^ (i % 13) as u8)
+            .collect()
+    }
+
+    #[cfg(feature = "enc")]
+    fn archive(data: &[u8], block: u64) -> Vec<u8> {
+        let props = crate::LzmaEncProps::new()
+            .with_level(1)
+            .with_dict_size(4096);
+        crate::encode_xz(data, &props, CheckType::Crc64, block).unwrap()
+    }
+
+    #[test]
+    fn a_first_block_over_the_limit_is_never_a_workers() {
+        // A tiny block that declares a gigabyte of output: before, the first
+        // block was sent whatever it cost, and the worker reserved and
+        // zeroed all of it.
+        let mut dec = XzAdaptiveDecoder::new(
+            XzOptions::default()
+                .with_threads(4)
+                .with_memory_limit(1 << 20),
+        );
+        dec.buf = alloc::vec![0; 12];
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 1 << 30).unwrap(),
+            Dispatch::No
+        ));
+        assert_eq!(dec.cursor, 0);
+        assert_eq!(dec.spawned_threads(), 0);
+        // Nor once other blocks are held: it is chased when they are out.
+        dec.ready.insert(1, completed(1));
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 1 << 30).unwrap(),
+            Dispatch::No
+        ));
+        // A block that fits alone still goes to a worker, or waits for one.
+        assert!(matches!(
+            dec.try_dispatch(8, 4, 64).unwrap(),
+            Dispatch::Sent | Dispatch::Busy
+        ));
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn a_block_over_the_limit_is_chased_and_decodes_the_same() {
+        let data = sample(1 << 20);
+        let file = archive(&data, 1 << 20);
+        let mut dec = XzAdaptiveDecoder::new(
+            XzOptions::default()
+                .with_threads(4)
+                .with_memory_limit(256 << 10),
+        );
+        let got = decode_all(&mut dec, &file, 64 << 10).unwrap();
+        assert_eq!(got, data);
+        assert_eq!(dec.spawned_threads(), 0, "the block was chased");
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn blocks_that_fit_still_go_to_workers_and_decode_the_same() {
+        let data = sample(256 << 10);
+        let file = archive(&data, 32 << 10);
+        let mut dec = XzAdaptiveDecoder::new(
+            XzOptions::default()
+                .with_threads(4)
+                .with_memory_limit(1 << 20),
+        );
+        let got = decode_all(&mut dec, &file, file.len()).unwrap();
+        assert_eq!(got, data);
+        assert!(dec.spawned_threads() > 0);
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn an_index_fed_a_byte_at_a_time_is_read_once() {
+        const BLOCKS: usize = 3000;
+        let data = sample(BLOCKS * 16);
+        let file = archive(&data, 16);
+        let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(1));
+        let got = decode_all(&mut dec, &file, 1).unwrap();
+        assert_eq!(got, data);
+        // Every index byte but its stored CRC-32 is hashed exactly once, and
+        // every record is read once: the work is linear in the index, not
+        // quadratic in how many pieces it arrived in.
+        assert!(dec.index_size > 4 * BLOCKS as u64 / 2);
+        assert_eq!(dec.index_parse.hashed, dec.index_size - 4);
+        assert_eq!(dec.index_parse.records_parsed, BLOCKS as u64);
+        // Fed whole, the same.
+        let mut whole = XzAdaptiveDecoder::new(XzOptions::default().with_threads(1));
+        assert_eq!(decode_all(&mut whole, &file, file.len()).unwrap(), data);
+        assert_eq!(whole.index_size, dec.index_size);
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn a_bad_index_fails_the_same_however_it_is_split() {
+        let data = sample(64 * 16);
+        let file = archive(&data, 16);
+        let index_end = file.len() - STREAM_FOOTER_SIZE;
+        // A wrong stored CRC, a wrong record and a wrong count.
+        for at in [index_end - 1, index_end - 10, index_end - 8 - 2 * 64] {
+            let mut bad = file.clone();
+            bad[at] ^= 0x01;
+            let mut errors = Vec::new();
+            for step in [1, 3, 7, 64, bad.len()] {
+                let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(1));
+                errors.push(decode_all(&mut dec, &bad, step).unwrap_err());
+            }
+            assert!(errors.iter().all(|e| *e == errors[0]), "{at}: {errors:?}");
+        }
+    }
+
+    #[cfg(feature = "enc")]
+    #[test]
+    fn a_check_failure_is_returned_again_and_never_panics() {
+        let data = sample(64 << 10);
+        let file = archive(&data, 16 << 10);
+        let blocks =
+            crate::xz::index::block_table(&mut std::io::Cursor::new(&file), u64::MAX).unwrap();
+        let first = blocks[0];
+        let check_end = (first.file_offset + first.record.unpadded_size) as usize;
+        let mut bad = file.clone();
+        bad[check_end - 1] ^= 0xff;
+        for threads in [1, 4] {
+            let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(threads));
+            let error = decode_all(&mut dec, &bad, bad.len()).unwrap_err();
+            assert_eq!(error.kind, XzErrorKind::CheckMismatch, "{threads}");
+            for _ in 0..2 {
+                assert_eq!(
+                    dec.drain(|_, _| panic!("no output after an error")),
+                    Err(error)
+                );
+                assert_eq!(dec.drain_upto(1, |_, _| panic!("no output")), Err(error));
+                assert_eq!(dec.feed(&[0]), Err(error));
+                assert!(!dec.wait_for_worker());
+            }
+        }
+        // The same file, intact, decodes.
+        let mut dec = XzAdaptiveDecoder::new(XzOptions::default().with_threads(4));
+        assert_eq!(decode_all(&mut dec, &file, file.len()).unwrap(), data);
     }
 
     fn completed(index: u64) -> XzDone {
