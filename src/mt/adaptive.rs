@@ -33,7 +33,7 @@ use crate::buffer::DicBuf;
 use crate::error::{Error, FinishMode, Status};
 use crate::lzma2::Lzma2Decoder;
 
-use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner};
+use crate::lzma2::scan::{Lzma2Run, Lzma2RunScanner, MAX_RUNS_AHEAD, reserve_run};
 use crate::mt::Lzma2MtOptions;
 #[cfg(feature = "crc")]
 use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
@@ -1854,19 +1854,32 @@ impl Lzma2AdaptiveDecoder {
 
     /// Walks whatever headers have arrived since the last call.
     fn scan(&mut self) -> Result<(), Error> {
-        if self.scanner.finished() {
+        if self.scanner.finished() && self.scanner.pending_runs() == 0 {
             return Ok(());
         }
         // The scanner keeps its own position and its own state between
         // calls, so input that arrived in four pieces is walked as four
         // pieces: a header split across a boundary is resumed, not copied
         // together first.
-        while let Some(piece) = self.segs.piece_at(self.scanner.in_position()) {
-            self.scanner.feed(piece)?;
-            while let Some(r) = self.scanner.next_run() {
-                self.pending.push_back(r);
+        //
+        // At most [`MAX_RUNS_AHEAD`] runs wait in `pending`, and as many in the
+        // scanner, which stops at that many and keeps its place: a stream of
+        // tiny runs is walked as fast as the runs are taken, not as fast as
+        // it is fed. Each call goes on from where the last stopped.
+        loop {
+            while self.pending.len() < MAX_RUNS_AHEAD && self.scanner.pending_runs() != 0 {
+                reserve_run(&mut self.pending)?;
+                if let Some(r) = self.scanner.next_run() {
+                    self.pending.push_back(r);
+                }
             }
-            if self.scanner.finished() {
+            if self.scanner.finished() || self.pending.len() >= MAX_RUNS_AHEAD {
+                break;
+            }
+            let Some(piece) = self.segs.piece_at(self.scanner.in_position()) else {
+                break;
+            };
+            if self.scanner.feed(piece)? == 0 && self.scanner.pending_runs() == 0 {
                 break;
             }
         }
@@ -1913,7 +1926,15 @@ impl Lzma2AdaptiveDecoder {
             let excess = self.segs.spare_bytes().saturating_sub(room);
             self.segs.shed_spare_down(excess);
         }
-        self.segs.retain_from(self.cursor_in);
+        // The chase can decode past where the scanner stopped for a full
+        // backlog of runs; the input from there on is the scanner's to walk
+        // yet, and is kept until it has.
+        let walked = if self.scanner.finished() {
+            self.cursor_in
+        } else {
+            self.cursor_in.min(self.scanner.in_position())
+        };
+        self.segs.retain_from(walked);
     }
 
     /// Takes finished blocks off the pool, optionally waiting for one.
@@ -3145,6 +3166,73 @@ mod tests {
         hold(&mut d, last);
         d.scan().expect("scan");
         assert_eq!(d.pair_bound(), bound);
+    }
+
+    /// Decodes `stream` fed in one piece, checking after every drain that
+    /// no more than the cap of runs waits in the decoder or its scanner.
+    fn decode_counting_runs(stream: &[u8], threads: usize) -> (Vec<u8>, usize) {
+        let mut d = decoder(threads, u64::MAX);
+        let mut out = alloc::vec![0u8; 0];
+        let mut fed = 0;
+        let mut most = 0;
+        loop {
+            if fed < stream.len() {
+                fed += d.feed(&stream[fed..]).expect("feed");
+                if fed == stream.len() {
+                    d.end_of_input();
+                }
+            }
+            let status = d
+                .drain(|off, b| {
+                    let off = off as usize;
+                    if out.len() < off + b.len() {
+                        out.resize(off + b.len(), 0);
+                    }
+                    out[off..off + b.len()].copy_from_slice(b);
+                })
+                .expect("drain");
+            assert!(d.pending.len() <= MAX_RUNS_AHEAD);
+            assert!(d.scanner.pending_runs() <= MAX_RUNS_AHEAD);
+            most = most.max(d.pending.len());
+            if status == DrainStatus::Finished {
+                return (out, most);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_of_tiny_runs_is_scanned_as_its_runs_are_taken() {
+        // Four bytes of stream a run: a megabyte fed would be a quarter of a
+        // million runs queued at once without the cap.
+        let n = 3 * MAX_RUNS_AHEAD + 11;
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..n {
+            stream.extend_from_slice(&run(1, i as u8));
+            plain.push(i as u8);
+        }
+        stream.push(0);
+        for threads in [1, 4] {
+            let (out, most) = decode_counting_runs(&stream, threads);
+            assert_eq!(out, plain, "threads={threads}");
+            assert!(most <= MAX_RUNS_AHEAD, "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn a_stream_under_the_run_cap_decodes_the_same() {
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..5 {
+            let r = run(300_000, i);
+            stream.extend_from_slice(&r);
+            plain.extend((0..300_000).map(|j| i.wrapping_add(j as u8)));
+        }
+        stream.push(0);
+        for threads in [1, 4] {
+            let (out, _) = decode_counting_runs(&stream, threads);
+            assert_eq!(out, plain, "threads={threads}");
+        }
     }
 
     #[test]
