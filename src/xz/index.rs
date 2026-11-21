@@ -40,7 +40,7 @@ impl MetaBudget {
     /// Adds `bytes` to what is held, or refuses when that would pass the
     /// limit.
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), XzErrorKind> {
-        let needed = self.used.checked_add(bytes).unwrap_or(u64::MAX);
+        let needed = self.used.saturating_add(bytes);
         if needed > self.limit {
             return Err(XzErrorKind::MemoryLimit {
                 needed,
@@ -53,11 +53,7 @@ impl MetaBudget {
 
     /// As [`MetaBudget::charge`], for `n` values of `T`.
     pub(crate) fn charge_items<T>(&mut self, n: usize) -> Result<(), XzErrorKind> {
-        self.charge(
-            (n as u64)
-                .checked_mul(core::mem::size_of::<T>() as u64)
-                .unwrap_or(u64::MAX),
-        )
+        self.charge((n as u64).saturating_mul(core::mem::size_of::<T>() as u64))
     }
 
     /// Gives back what [`MetaBudget::charge`] took for something dropped.
