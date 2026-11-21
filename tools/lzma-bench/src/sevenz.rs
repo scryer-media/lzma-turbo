@@ -73,6 +73,59 @@ pub fn header_range(signature: &[u8; 32]) -> Option<(u64, u64)> {
     Some((32u64.checked_add(next_offset)?, next_size))
 }
 
+/// The largest header [`next_header`] will have read. The one shape this walk
+/// follows has a header of a few dozen bytes; 7-Zip's own archives of many
+/// files stay well under this.
+pub const MAX_NEXT_HEADER: u64 = 64 << 20;
+
+/// [`header_range`], checked against a file of `file_len` bytes before
+/// anything is allocated for it: the header must lie inside the file and be
+/// no longer than [`MAX_NEXT_HEADER`]. Returns the offset and the length as a
+/// `usize`, ready to read into a buffer that long.
+///
+/// # Errors
+///
+/// A message naming what is wrong, for a signature that is not a `.7z` one,
+/// an offset or size whose sum overflows, a header past the end of the file,
+/// or one over the cap.
+pub fn next_header(signature: &[u8; 32], file_len: u64) -> Result<(u64, usize), String> {
+    let (start, len) =
+        header_range(signature).ok_or("not a .7z file, or its header offset overflows")?;
+    if len > MAX_NEXT_HEADER {
+        return Err(format!(
+            "7z header of {len} bytes is over the {MAX_NEXT_HEADER}-byte cap"
+        ));
+    }
+    let end = start
+        .checked_add(len)
+        .ok_or("7z header offset and size overflow")?;
+    if end > file_len {
+        return Err(format!(
+            "7z header at {start}, {len} bytes, runs past the end of the {file_len}-byte file"
+        ));
+    }
+    let len = usize::try_from(len).map_err(|_| "7z header size does not fit in memory")?;
+    Ok((start, len))
+}
+
+/// The LZMA2 stream's bytes inside `data`, the whole `.7z` file, as `stream`
+/// locates them.
+///
+/// # Errors
+///
+/// A message, when the stream's offset and length overflow or run past the
+/// end of `data`.
+pub fn stream_bytes<'a>(data: &'a [u8], stream: &PackStream) -> Result<&'a [u8], String> {
+    let end = stream
+        .offset
+        .checked_add(stream.packed_len)
+        .ok_or("7z pack stream offset and length overflow")?;
+    let start = usize::try_from(stream.offset).map_err(|_| "7z pack stream offset overflows")?;
+    let end = usize::try_from(end).map_err(|_| "7z pack stream end overflows")?;
+    data.get(start..end)
+        .ok_or_else(|| "7z pack stream runs past the end of the file".into())
+}
+
 /// [`pack_stream`] given the header bytes alone, as [`header_range`] locates
 /// them.
 pub fn pack_stream_in_header(header: &[u8]) -> Option<PackStream> {
@@ -147,7 +200,9 @@ pub fn pack_stream_in_header(header: &[u8]) -> Option<PackStream> {
     let unpacked_len = r.number()?;
 
     Some(PackStream {
-        offset: 32 + pack_pos,
+        // The pack streams start right after the 32-byte signature header;
+        // a position that overflows past it is no archive.
+        offset: pack_pos.checked_add(32)?,
         packed_len,
         unpacked_len,
         dict_prop,

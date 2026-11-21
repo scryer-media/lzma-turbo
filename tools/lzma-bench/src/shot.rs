@@ -380,6 +380,9 @@ fn measure(shot: &Shot, path: &Path) -> Result<Line, String> {
 const ADAPTIVE_PIECE: usize = 4 << 20;
 /// The smallest read the adaptive shot makes under a tight limit.
 const ADAPTIVE_PIECE_MIN: usize = 64 << 10;
+/// Room left under the limit for what the decoder charges a piece besides
+/// its bytes: its queue slot and reference counts, about a hundred bytes.
+const PIECE_BOOKKEEPING: usize = 1 << 10;
 
 /// `Lzma2AdaptiveDecoder` the way a consumer pulling its own input drives it:
 /// read a piece, hand it over whole, drain, and when the decoder refuses the
@@ -404,11 +407,13 @@ fn adaptive(shot: &Shot, path: &Path, bytes_in: u64) -> Result<Line, String> {
     // read sized past the limit would never be taken. Under a tight limit the
     // reads come down to a quarter of it, and not below a small floor - but
     // never past the limit itself, which the floor would be under a limit
-    // smaller than it.
+    // smaller than it. The decoder also charges each piece a little
+    // bookkeeping on top of its bytes, so a read the size of the limit
+    // would never fit: a kibibyte is left for it.
     let limit = usize::try_from(shot.memory_limit).unwrap_or(usize::MAX);
     let piece_len = (limit / 4)
         .clamp(ADAPTIVE_PIECE_MIN, ADAPTIVE_PIECE)
-        .min(limit)
+        .min(limit.saturating_sub(PIECE_BOOKKEEPING))
         .max(1);
     let mut hand: Option<Vec<u8>> = None;
     let mut eof = false;
@@ -557,8 +562,13 @@ fn lzma2_stream_unbuffered(path: &Path) -> Result<(u8, std::io::Take<File>), Str
     let (prop, offset, len) = if ext == "7z" {
         let mut sig = [0u8; 32];
         file.read_exact(&mut sig).map_err(|e| e.to_string())?;
-        let (start, len) = crate::sevenz::header_range(&sig).ok_or("not a .7z file")?;
-        let mut header = vec![0u8; usize::try_from(len).map_err(|e| e.to_string())?];
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        let (start, len) = crate::sevenz::next_header(&sig, file_len)?;
+        let mut header = Vec::new();
+        header
+            .try_reserve_exact(len)
+            .map_err(|e| format!("7z header of {len} bytes: {e}"))?;
+        header.resize(len, 0);
         file.seek(SeekFrom::Start(start))
             .map_err(|e| e.to_string())?;
         file.read_exact(&mut header).map_err(|e| e.to_string())?;
