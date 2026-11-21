@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.12.1 - 2026-11-20
+
+Bounds on what hostile input can make a decoder hold or redo. Output bytes,
+checksums and reported positions are unchanged for every valid stream; no
+public item changed.
+
+- The adaptive `.xz` decoder never hands a block over the memory limit to a
+  worker, the first one included: such a block is decoded on the calling
+  thread, as later ones already were.
+- The `.xz` index of every stream in a file is charged against one memory
+  budget as it is read, its records counted before they are allocated, so a
+  file of many streams cannot hold more index than the limit allows.
+- The adaptive `.xz` decoder reads an index fed in small pieces once, not
+  once per piece, and returns the same error however the index is split.
+- After a check failure or any other error, `XzReader` and the adaptive `.xz`
+  decoder return that error again on every later call instead of decoding
+  on or panicking.
+- Every `.xz` block shares the caller's checksum split table rather than
+  copying it.
+- The memory limit is checked against the dictionary a block really
+  allocates, which LZMA2 rounds up, not the size the header states.
+- `bcj2::decode_to_vec` refuses an original size its streams cannot fill
+  before allocating it, and an allocation failure is an error.
+- The raw LZMA2 run scanner and the adaptive LZMA2 decoder queue at most
+  4,096 runs ahead of those taken; `Lzma2RunScanner::feed` stops before the
+  control byte that would close one more and goes on from there on the next
+  call, so its return value says how much was walked.
+- The threaded raw LZMA2 decoder hands a block whose input passes the
+  planner's allowance (a block and a sixteenth) to the single-threaded tail
+  instead of reading more input for it.
+- The adaptive LZMA2 decoder charges each input piece about a hundred bytes
+  of bookkeeping besides its bytes, so a stream fed a byte at a time is held
+  to the limit; a piece exactly the size of the memory limit no longer fits.
+
 ## 0.12.0 - 2026-11-09
 
 - The threaded raw LZMA2 decoders take a `WindowBacking` too, so a stream
