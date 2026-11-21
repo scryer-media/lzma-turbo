@@ -167,6 +167,10 @@ struct Plan {
     /// What one worker holds in RAM. A block buffer over a backing's in-RAM
     /// limit is lent, so with a backing only the limit's worth of it counts.
     per_thread: u64,
+    /// The packed bytes one worker's block is allowed, inside `per_thread`.
+    /// A block whose input runs past it is handed to the single-threaded
+    /// tail, so the input a worker holds stays what the plan counted.
+    in_block_max: u64,
     st_only: bool,
 }
 
@@ -183,6 +187,7 @@ fn plan(dict_prop: u8, options: &Lzma2MtOptions, window: Option<&WindowBacking>)
             threads: 1,
             out_block_max: OUT_BLOCK_MAX_DEFAULT,
             per_thread: 0,
+            in_block_max: 0,
             st_only: true,
         };
     }
@@ -214,6 +219,7 @@ fn plan(dict_prop: u8, options: &Lzma2MtOptions, window: Option<&WindowBacking>)
         threads: threads as usize,
         out_block_max: out_block_max as usize,
         per_thread,
+        in_block_max,
         st_only: threads <= 1,
     }
 }
@@ -439,8 +445,14 @@ impl Lzma2ParallelDecoder {
         let make = || Lzma2Coder::new(props.clone());
 
         let (replay, read_was_finished, mut written) = {
-            let mt: MtDec<'_, Lzma2Coder> =
-                MtDec::new(IN_BUF_SIZE_MT, self.plan.threads, input, out, &make);
+            let mt: MtDec<'_, Lzma2Coder> = MtDec::new(
+                IN_BUF_SIZE_MT,
+                self.plan.in_block_max,
+                self.plan.threads,
+                input,
+                out,
+                &make,
+            );
             let r = mt.run().map_err(io::Error::from)?;
             if let Some(e) = r.read_res {
                 return Err(e);
@@ -1006,5 +1018,112 @@ impl<R: Read + Send + 'static> Drop for Lzma2ParallelReader<R> {
         let rx = core::mem::replace(&mut self.rx, rx);
         drop(rx);
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the threaded pass alone over `stream`, as
+    /// [`Lzma2ParallelDecoder::decode`] does, with dictionary property 0 and
+    /// two workers: what was written, what the tail is left to replay, and
+    /// the longest input chain a worker held.
+    fn threaded_pass(stream: &[u8]) -> (Vec<u8>, usize, usize, Plan) {
+        let opts = Lzma2MtOptions {
+            threads: 2,
+            memory_limit: 8 << 20,
+        };
+        let plan = plan(0, &opts, None);
+        assert_eq!(plan.threads, 2);
+        let props = Lzma2CoderProps {
+            prop: 0,
+            out_block_max: plan.out_block_max,
+            out_size: None,
+            finish_mode: false,
+            finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "crc")]
+            plan: ChecksumPlan::none(),
+            #[cfg(feature = "crc")]
+            checks: None,
+            window: None,
+        };
+        let make = || Lzma2Coder::new(props.clone());
+        let mut input = stream;
+        let mut out = Vec::new();
+        let mt: MtDec<'_, Lzma2Coder> = MtDec::new(
+            IN_BUF_SIZE_MT,
+            plan.in_block_max,
+            plan.threads,
+            &mut input,
+            &mut out,
+            &make,
+        );
+        let r = mt.run().expect("threaded pass");
+        let replay = r.replay.iter().map(|b| b.len).sum();
+        let links = mt.peak_links.load(std::sync::atomic::Ordering::Relaxed);
+        drop(mt);
+        (out, replay, links, plan)
+    }
+
+    #[test]
+    fn a_block_whose_input_passes_the_plan_goes_to_the_tail() {
+        // One byte of output per 64 KiB chunk of input: 64 chunks are four
+        // mebibytes of input in a block of 64 bytes. The plan allows a worker
+        // a block's worth of input and a sixteenth.
+        let mut stream = Vec::new();
+        for i in 0..64 {
+            if i == 0 {
+                stream.extend_from_slice(&[0xE0, 0x00, 0x00, 0xFF, 0xFF, 0x00]);
+            } else {
+                stream.extend_from_slice(&[0x80, 0x00, 0x00, 0xFF, 0xFF]);
+            }
+            stream.extend(core::iter::repeat_n(0u8, 1 << 16));
+        }
+        stream.push(0);
+        let (out, replay, links, plan) = threaded_pass(&stream);
+        assert!(out.is_empty(), "no block was decoded by a worker");
+        let held = plan.in_block_max + IN_BUF_SIZE_MT as u64;
+        assert!(replay > 0, "the block is the tail's");
+        assert!(replay as u64 <= held, "replay {replay} over {held}");
+        let most = usize::try_from(held.div_ceil(IN_BUF_SIZE_MT as u64)).expect("small");
+        assert!(links <= most, "{links} links, plan allows {most}");
+
+        // And the whole decode ends as the single-threaded decoder ends it.
+        let mt = Lzma2ParallelDecoder::new(
+            0,
+            &Lzma2MtOptions {
+                threads: 2,
+                memory_limit: 8 << 20,
+            },
+        )
+        .expect("props");
+        let mut st = Lzma2Decoder::new(0).expect("props");
+        let mut buf = alloc::vec![0u8; 1 << 10];
+        let st_res = st.decode(&stream, &mut buf, FinishMode::End).map(|_| ());
+        let mt_res = mt.decode(&stream[..], Vec::new());
+        assert_eq!(mt_res.is_ok(), st_res.is_ok(), "{mt_res:?} {st_res:?}");
+    }
+
+    #[test]
+    fn valid_blocks_stay_with_the_workers() {
+        // Three 1 MiB runs of stored chunks: each a block of the planned
+        // size, a few bytes a chunk over it in input.
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for r in 0..3u8 {
+            for c in 0..16u32 {
+                stream.push(if c == 0 { 0x01 } else { 0x02 });
+                stream.extend_from_slice(&0xFFFFu16.to_be_bytes());
+                let bytes = (0..1u32 << 16).map(|i| r.wrapping_add((i ^ c) as u8));
+                let start = plain.len();
+                plain.extend(bytes);
+                stream.extend_from_slice(&plain[start..]);
+            }
+        }
+        stream.push(0);
+        let (out, replay, _, _) = threaded_pass(&stream);
+        assert_eq!(replay, 0, "no block went to the tail");
+        assert_eq!(out, plain);
     }
 }

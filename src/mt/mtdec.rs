@@ -220,12 +220,18 @@ pub(crate) struct RunResult {
 pub(crate) struct MtDec<'e, C> {
     /// C: `p->inBufSize`.
     in_buf_size: usize,
+    /// The packed bytes of one block a thread may read before it takes
+    /// another input link. C: nothing; see [`MtDec::new`].
+    in_block_max: u64,
     make_coder: &'e (dyn Fn() -> Result<C, Error> + Sync),
     slots: Vec<Slot>,
     read: Mutex<ReadState<'e>>,
     write: Mutex<WriteState<'e>>,
     prog: Mutex<ProgState>,
     exit_thread: AtomicBool,
+    /// The longest input chain any thread held, in links.
+    #[cfg(test)]
+    pub(crate) peak_links: std::sync::atomic::AtomicUsize,
 }
 
 /// C: `SeqInStream_ReadMax`: read until the buffer is full or the stream ends.
@@ -255,8 +261,23 @@ pub(crate) fn alloc_buf(size: usize) -> Result<Box<[u8]>, Error> {
 impl<'e, C: Coder> MtDec<'e, C> {
     /// C: `MtDec_Construct` plus the assignments `Lzma2DecMt_Decode` makes
     /// into `p->mtc` before calling `MtDec_Code`.
+    ///
+    /// # Deviation from the C
+    ///
+    /// `in_block_max` is the planner's packed-input allowance for one block,
+    /// which the thread count was chosen against. C's `MtDec_ThreadFunc2`
+    /// takes another input link for as long as the parse asks for more, so
+    /// chunk headers that claim little output for a great deal of input have
+    /// one worker hold any amount of it. Here a thread that has read
+    /// `in_block_max` bytes of a block and still has no end to it takes no
+    /// further link: the block goes the way of one that overflows the output
+    /// buffers, to the single-threaded tail, which reads it a buffer at a
+    /// time. A valid block is never that long: its packed size is within a
+    /// few bytes a chunk of its output, and its output is at most
+    /// `out_block_max`, against which the allowance has a sixteenth spare.
     pub(crate) fn new(
         in_buf_size: usize,
+        in_block_max: u64,
         num_threads_max: usize,
         stream: &'e mut (dyn Read + Send),
         out: &'e mut (dyn Write + Send),
@@ -272,6 +293,7 @@ impl<'e, C: Coder> MtDec<'e, C> {
         }
         MtDec {
             in_buf_size,
+            in_block_max,
             make_coder,
             slots,
             read: Mutex::new(ReadState {
@@ -303,6 +325,8 @@ impl<'e, C: Coder> MtDec<'e, C> {
                 interrupt_index: u64::MAX,
             }),
             exit_thread: AtomicBool::new(false),
+            #[cfg(test)]
+            peak_links: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -459,9 +483,23 @@ impl<'e, C: Coder> MtDec<'e, C> {
                 let mut cross_size = rd.cross_end - rd.cross_start;
 
                 loop {
+                    if have_prev && in_data_size >= self.in_block_max {
+                        // Past the planned allowance with the block still
+                        // open: hand it to the single-threaded tail, as an
+                        // overflow, rather than take another link. Every link
+                        // so far was parsed whole and the cross block is
+                        // already spent, so nothing is left to carry over.
+                        finish = true;
+                        overflow = true;
+                        break;
+                    }
                     if link == bufs.len() {
                         match alloc_buf(self.in_buf_size) {
-                            Ok(b) => bufs.push(b),
+                            Ok(b) => {
+                                bufs.push(b);
+                                #[cfg(test)]
+                                self.peak_links.fetch_max(bufs.len(), Ordering::Relaxed);
+                            }
                             Err(_) => {
                                 finish = true;
                                 is_alloc_error = true;
