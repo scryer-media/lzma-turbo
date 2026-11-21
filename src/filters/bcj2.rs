@@ -552,7 +552,8 @@ impl Bcj2Dec {
 /// # Errors
 ///
 /// Whatever [`Bcj2Dec::decode`] returns, and [`Bcj2Error::Data`] if the four
-/// streams do not in fact produce `orig_size` bytes.
+/// streams do not in fact produce `orig_size` bytes, if `orig_size` is more
+/// than they can produce, or if the output cannot be allocated.
 pub fn decode_to_vec(
     main: &[u8],
     call: &[u8],
@@ -560,7 +561,21 @@ pub fn decode_to_vec(
     rc: &[u8],
     orig_size: usize,
 ) -> Result<Vec<u8>, Bcj2Error> {
-    let mut out = vec![0u8; orig_size];
+    // Every output byte is a main-stream byte copied across or one of the
+    // four bytes a CALL or JUMP target is turned back into, so the three
+    // plain streams bound the output. A larger `orig_size` cannot be honest,
+    // and is refused before anything is allocated for it.
+    let most = main
+        .len()
+        .checked_add(call.len())
+        .and_then(|n| n.checked_add(jump.len()));
+    if most.is_none_or(|most| orig_size > most) {
+        return Err(Bcj2Error::Data);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(orig_size)
+        .map_err(|_| Bcj2Error::Data)?;
+    out.resize(orig_size, 0u8);
     let mut dec = Bcj2Dec::new();
     let mut s = Bcj2DecStreams::new(main, call, jump, rc, &mut out);
     dec.decode(&mut s)?;
@@ -1220,6 +1235,29 @@ mod tests {
         );
         let back = decode_to_vec(&s.main, &s.call, &s.jump, &s.rc, src.len()).expect("decode");
         assert_eq!(back, src, "{} bytes", src.len());
+    }
+
+    #[test]
+    fn an_original_size_the_streams_cannot_fill_is_refused_before_allocation() {
+        let src = code_like(0x1234_5678, 4096);
+        let s = encode_to_streams(&src);
+        let most = s.main.len() + s.call.len() + s.jump.len();
+        for orig_size in [most + 1, 1 << 40, usize::MAX] {
+            assert_eq!(
+                decode_to_vec(&s.main, &s.call, &s.jump, &s.rc, orig_size),
+                Err(Bcj2Error::Data),
+                "{orig_size}"
+            );
+        }
+        // Tiny streams declaring a huge output: refused, not allocated.
+        assert_eq!(
+            decode_to_vec(&[], &[], &[], &[0, 0, 0, 0, 0], usize::MAX),
+            Err(Bcj2Error::Data)
+        );
+        // The bound itself is the honest size, and still decodes.
+        assert_eq!(most, src.len());
+        let back = decode_to_vec(&s.main, &s.call, &s.jump, &s.rc, most).unwrap();
+        assert_eq!(back, src);
     }
 
     #[test]
