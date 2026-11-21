@@ -157,6 +157,7 @@ impl ChecksumPlan {
     /// computed over them. A decoder that checks each block with the
     /// stream's own check takes the caller's plan this way, so nothing is
     /// collected, sorted or allocated per block.
+    #[cfg(feature = "xz")]
     #[must_use]
     pub(crate) fn with_kind(&self, kind: Checksum) -> Self {
         ChecksumPlan {

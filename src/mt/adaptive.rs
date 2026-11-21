@@ -1866,12 +1866,20 @@ impl Lzma2AdaptiveDecoder {
         // scanner, which stops at that many and keeps its place: a stream of
         // tiny runs is walked as fast as the runs are taken, not as fast as
         // it is fed. Each call goes on from where the last stopped.
+        //
+        // The chase reads the input itself and can be past the scanner, which
+        // stopped for a full queue. A run it has already decoded is dropped
+        // here, as it arrives: left in `pending` such runs would fill it and
+        // stop the scan, and with no input at the cursor no decode step would
+        // come to retire them.
         loop {
+            self.drop_passed_runs();
             while self.pending.len() < MAX_RUNS_AHEAD && self.scanner.pending_runs() != 0 {
                 reserve_run(&mut self.pending)?;
                 if let Some(r) = self.scanner.next_run() {
                     self.pending.push_back(r);
                 }
+                self.drop_passed_runs();
             }
             if self.scanner.finished() || self.pending.len() >= MAX_RUNS_AHEAD {
                 break;
@@ -2555,9 +2563,9 @@ impl Lzma2AdaptiveDecoder {
         Ok(true)
     }
 
-    /// Drops runs the single-threaded path has decoded past, and works out
-    /// whether the cursor is at a boundary.
-    fn retire_runs(&mut self) {
+    /// Drops the runs at the front of `pending` that end at or before the
+    /// cursor: the single-threaded path has decoded them.
+    fn drop_passed_runs(&mut self) {
         while let Some(front) = self.pending.front().copied() {
             if front.in_offset + front.packed_len <= self.cursor_in {
                 self.st_retired_end = front.in_offset + front.packed_len;
@@ -2568,6 +2576,12 @@ impl Lzma2AdaptiveDecoder {
                 break;
             }
         }
+    }
+
+    /// Drops runs the single-threaded path has decoded past, and works out
+    /// whether the cursor is at a boundary.
+    fn retire_runs(&mut self) {
+        self.drop_passed_runs();
         self.st_in_run = match self.pending.front() {
             Some(front) => self.cursor_in > front.in_offset,
             // Past every complete run: inside the run still arriving, at its
@@ -3217,6 +3231,58 @@ mod tests {
             assert_eq!(out, plain, "threads={threads}");
             assert!(most <= MAX_RUNS_AHEAD, "threads={threads}");
         }
+    }
+
+    #[test]
+    fn a_chase_past_the_capped_scanner_drops_the_runs_it_decoded() {
+        // One thread, so the chase decodes every run, a whole fed piece at a
+        // step, and passes the scanner, which stops at the cap. The runs the
+        // scanner then hands over are ones the chase has already decoded:
+        // they must be dropped as they arrive, or they fill the queue, the
+        // scan stops, and with no input left at the cursor nothing retires
+        // them.
+        let n = 100_000;
+        let mut stream = Vec::new();
+        let mut plain = Vec::new();
+        for i in 0..n {
+            stream.extend_from_slice(&run(1, i as u8));
+            plain.push(i as u8);
+        }
+        stream.push(0);
+
+        let mut d = decoder(1, 8 << 20);
+        let mut out = alloc::vec![0u8; 0];
+        let mut fed = 0;
+        loop {
+            let mut took = 0;
+            if fed < stream.len() {
+                let end = stream.len().min(fed + (64 << 10));
+                took = d.feed(&stream[fed..end]).expect("feed");
+                fed += took;
+                if fed == stream.len() {
+                    d.end_of_input();
+                }
+            }
+            let status = d
+                .drain(|off, b| {
+                    let off = off as usize;
+                    if out.len() < off + b.len() {
+                        out.resize(off + b.len(), 0);
+                    }
+                    out[off..off + b.len()].copy_from_slice(b);
+                })
+                .expect("drain");
+            assert!(d.pending.len() <= MAX_RUNS_AHEAD);
+            if status == DrainStatus::Finished {
+                break;
+            }
+            assert!(
+                took != 0 || status == DrainStatus::Progress,
+                "stalled after {} bytes out, {fed} fed",
+                out.len()
+            );
+        }
+        assert_eq!(out, plain);
     }
 
     #[test]

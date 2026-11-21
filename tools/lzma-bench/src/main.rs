@@ -247,14 +247,27 @@ fn run_index(path: &Path) {
         return;
     };
     let mut scanner = lzma_turbo::Lzma2RunScanner::new();
-    if let Err(e) = scanner.feed(payload) {
-        eprintln!("lzma-bench: {}: {e}", path.display());
-        return;
-    }
     println!();
     println!("{}: runs", path.display());
     let (mut n, mut min, mut max) = (0u64, u64::MAX, 0u64);
-    while let Some(r) = scanner.next_run() {
+    // The scanner queues a bounded number of runs and stops: feed it what it
+    // left, taking the runs out between calls, until it takes nothing more.
+    let mut rest = payload;
+    loop {
+        let took = match scanner.feed(rest) {
+            Ok(took) => took,
+            Err(e) => {
+                eprintln!("lzma-bench: {}: {e}", path.display());
+                return;
+            }
+        };
+        rest = &rest[took..];
+        let Some(r) = scanner.next_run() else {
+            if took == 0 {
+                break;
+            }
+            continue;
+        };
         if n < 8 {
             println!(
                 "  #{n:<3} in {:>12} +{:<11} out {:>12} +{:<11} dict reset {} chunks lzma {} copy {}",
