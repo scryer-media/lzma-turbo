@@ -38,7 +38,7 @@ use crate::mt::Lzma2MtOptions;
 #[cfg(feature = "crc")]
 use crate::mt::checksum::{BlockChecks, ChecksumPlan, Segmenter};
 use crate::mt::pool::{Done, Job, Pool, locate};
-use crate::mt::segq::SegQueue;
+use crate::mt::segq::{PIECE_OVERHEAD, SegQueue};
 
 /// How much of the single-threaded decoder's dictionary is filled before it is
 /// handed to the caller. C: `props.outStep_ST`.
@@ -966,6 +966,25 @@ impl Lzma2AdaptiveDecoder {
     /// piece, so a caller reading in 256 KiB pieces, as 7-Zip reads, is
     /// allowed the 256 KiB of overrun 7-Zip keeps and not a mebibyte.
     fn pair_bound(&self) -> u64 {
+        let bytes = self.pair_bytes();
+        if bytes == u64::MAX {
+            return bytes;
+        }
+        // The bound is written in bytes of runs. What holding a piece costs
+        // besides its bytes is real memory, counted against the caller's
+        // limit, but no part of a pair: it is allowed here for as many
+        // pieces as those bytes fill, and one more for a piece cut short, so
+        // that a pair per thread is not refused for the bookkeeping of the
+        // pieces it is held in. It follows the bound and not the pieces held,
+        // so the bound stays what the runs make it.
+        let piece = self.segs.piece_size().max(MIN_PIECE);
+        let pieces = bytes.div_ceil(piece).saturating_add(1);
+        bytes.saturating_add(pieces.saturating_mul(PIECE_OVERHEAD))
+    }
+
+    /// [`Self::pair_bound`] in bytes of runs alone, before the bookkeeping
+    /// of the pieces they are held in.
+    fn pair_bytes(&self) -> u64 {
         let (run_in, run_out) = self.run_pair();
         if run_in == 0 && run_out == 0 {
             return u64::MAX;
@@ -1224,7 +1243,8 @@ impl Lzma2AdaptiveDecoder {
     /// that the path that accepts never copies.
     ///
     /// The piece costs [`held_bytes`](Lzma2AdaptiveDecoder::held_bytes) its
-    /// allocation's capacity, not its length, and is admitted by that: a short
+    /// allocation's capacity, not its length, plus a fixed amount for the
+    /// decoder's bookkeeping of a piece, and is admitted by that: a short
     /// piece in a large buffer is refused where its bytes alone would fit. A
     /// caller cutting a read short should copy a small piece into a buffer its
     /// size, or lend it with
@@ -1350,7 +1370,10 @@ impl Lzma2AdaptiveDecoder {
         // goes straight into one, so counting it twice - once where it sits
         // and again in the room the piece needs - would refuse input for
         // memory that is about to be the input.
-        let held = self.segs.held_bytes() - self.segs.spare_bytes();
+        //
+        // The piece offered costs its bookkeeping as well as its bytes, so
+        // that is counted as held before its bytes are weighed.
+        let held = self.segs.held_bytes() - self.segs.spare_bytes() + PIECE_OVERHEAD;
         let mut ceiling = self.buf_budget();
         if !self.has_work_in_hand() {
             ceiling = ceiling.max(self.buf_budget_for(1));
@@ -2902,13 +2925,13 @@ mod tests {
         hold(&mut d, &[1]);
         d.scan().unwrap();
         assert_eq!(d.pending.len(), 2);
-        let base = d.pair_bound();
+        let base = d.pair_bytes();
         let pair = d.run_pair();
         d.set_read_ahead(2);
-        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+        assert_eq!(d.pair_bytes() - base, d.pending[1].packed_len);
         assert_eq!(d.run_pair(), pair, "active output reservation is unchanged");
         d.pending[1].unpacked_len *= 10;
-        assert_eq!(d.pair_bound() - base, d.pending[1].packed_len);
+        assert_eq!(d.pair_bytes() - base, d.pending[1].packed_len);
     }
 
     #[test]
@@ -3151,7 +3174,11 @@ mod tests {
         assert!(d.collect(true));
         let mut left = usize::MAX;
         d.emit(&mut |_, _: &[u8]| {}, &mut left);
-        assert_eq!(d.segs.held_bytes() - d.segs.spare_bytes(), 10 * MIB as u64);
+        // Ten pieces: their bytes and the bookkeeping each one costs.
+        assert_eq!(
+            d.segs.held_bytes() - d.segs.spare_bytes(),
+            10 * (MIB as u64 + PIECE_OVERHEAD)
+        );
 
         // Each thread takes one of the 4 MiB runs. That is a pair per thread,
         // which is what the bound is for, and it must not be refused for the
@@ -3173,18 +3200,24 @@ mod tests {
         }
         d.segs.retain_from(d.segs.end());
         assert_eq!(d.segs.spare_bytes(), (20 * PIECE) as u64);
+        // A parked piece is held at its bytes, its bookkeeping gone with the
+        // run it carried, while the working bound allows for bookkeeping; so
+        // what is kept is the whole pieces that fit under each line.
+        let unit = PIECE as u64;
         let working_bound = d.limit();
         d.fit_parked_input();
-        assert_eq!(d.holding(), working_bound + PIECE as u64);
+        let kept = (working_bound + PIECE as u64) / unit * unit;
+        assert_eq!(d.holding(), kept);
         let reused = d.reclaim_piece().expect("the next read has storage");
         assert_eq!(reused.capacity(), PIECE);
-        assert_eq!(d.holding(), working_bound);
+        assert_eq!(d.holding(), kept - unit);
+        assert!(d.holding() <= working_bound);
 
         // An explicit ceiling never receives the handoff allowance.
         d.set_memory_limit(working_bound - PIECE as u64);
         d.fit_parked_input();
-        assert_eq!(d.holding(), working_bound - PIECE as u64);
-        assert_eq!(d.holding(), d.memory_limit());
+        assert_eq!(d.holding(), (working_bound - PIECE as u64) / unit * unit);
+        assert!(d.holding() <= d.memory_limit());
     }
 
     #[test]
@@ -3282,7 +3315,7 @@ mod tests {
             l
         };
         let l = sums(&d);
-        assert_eq!(l.input_bytes, stream.len() as u64);
+        assert_eq!(l.input_bytes, stream.len() as u64 + PIECE_OVERHEAD);
         assert_eq!((l.runs_out, l.runs_waiting), (0, 0));
 
         assert_eq!(d.dispatch().expect("dispatch"), Dispatch::Sent);
@@ -3575,7 +3608,7 @@ mod tests {
 
         let next = run(MIB, 1);
         let piece = exact(&next[MIB / 2..]);
-        let limit = d.holding() - parked + piece.capacity() as u64;
+        let limit = d.holding() - parked + piece.capacity() as u64 + PIECE_OVERHEAD;
         d.set_memory_limit(limit);
         assert!(
             d.feed_owned(piece).expect("feed").is_none(),
@@ -3613,7 +3646,7 @@ mod tests {
         assert!(parked > 0, "a piece is parked: {:?}", d.ledger());
 
         let piece = exact(&third[1..third.len() / 2]);
-        let limit = d.holding() - parked + piece.capacity() as u64;
+        let limit = d.holding() - parked + piece.capacity() as u64 + PIECE_OVERHEAD;
         d.set_memory_limit(limit);
         assert_eq!(d.memory_limit(), limit, "the pair bound is not the limit");
         assert!(
