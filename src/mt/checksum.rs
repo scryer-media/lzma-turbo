@@ -153,6 +153,18 @@ impl ChecksumPlan {
         self
     }
 
+    /// The same split points, shared rather than copied, with `kind`
+    /// computed over them. A decoder that checks each block with the
+    /// stream's own check takes the caller's plan this way, so nothing is
+    /// collected, sorted or allocated per block.
+    #[must_use]
+    pub(crate) fn with_kind(&self, kind: Checksum) -> Self {
+        ChecksumPlan {
+            kind,
+            splits: self.splits.clone(),
+        }
+    }
+
     /// What is to be computed.
     #[must_use]
     pub fn kind(&self) -> Checksum {
@@ -299,6 +311,13 @@ impl Segmenter {
                 self.seg_start = self.pos;
             }
         }
+    }
+
+    /// The split points this segmenter cuts at, for tests that check they
+    /// are shared with the plan rather than copied.
+    #[cfg(test)]
+    pub(crate) fn split_points(&self) -> &[u64] {
+        self.splits.as_deref().unwrap_or(&[])
     }
 
     /// Absolute offset of the next byte this segmenter expects.
