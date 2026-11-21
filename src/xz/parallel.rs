@@ -596,16 +596,16 @@ fn serial_cost<R: Read + Seek>(
         let size = header_size_from_first_byte(header[0])?;
         src.read_exact(&mut header[1..size]).ok()?;
         let parsed = BlockHeader::parse(&header[..size]).ok()?;
+        // The dictionary as `XzReader` allocates it, rounded up, which is
+        // also what it checks against the memory limit.
         let block_dict =
-            super::blockdec::dict_bytes(parsed.chain.dict_prop, parsed.uncompressed_size);
-        if let Some(w) = window {
-            let clamp = u32::try_from(block_dict).unwrap_or(u32::MAX);
-            let prop = crate::Lzma2Decoder::capped_props(parsed.chain.dict_prop, clamp).ok()?;
-            if w.covers(prop.dic_buf_size()) {
-                continue;
-            }
+            super::blockdec::dict_props(parsed.chain.dict_prop, parsed.uncompressed_size)
+                .ok()?
+                .dic_buf_size();
+        if window.is_some_and(|w| w.covers(block_dict)) {
+            continue;
         }
-        dict = dict.max(block_dict);
+        dict = dict.max(block_dict as u64);
         if dict.saturating_add(fixed) > cap {
             return None;
         }

@@ -68,6 +68,18 @@ pub(crate) fn dict_bytes(dict_prop: u8, uncompressed_size: Option<u64>) -> u64 {
     }
 }
 
+/// The properties a block's dictionary is allocated with, after the clamp
+/// [`dict_bytes`] applies. Their `dic_buf_size()` is the dictionary rounded
+/// up as the SDK rounds it: the bytes actually allocated, and so the number
+/// every memory limit is checked against.
+pub(crate) fn dict_props(
+    dict_prop: u8,
+    uncompressed_size: Option<u64>,
+) -> Result<crate::lzma::LzmaProps, crate::Error> {
+    let dict = dict_bytes(dict_prop, uncompressed_size);
+    Lzma2Decoder::capped_props(dict_prop, u32::try_from(dict).unwrap_or(u32::MAX))
+}
+
 impl BlockDecoder {
     /// Builds a decoder for one block.
     ///
@@ -96,22 +108,18 @@ impl BlockDecoder {
                 limit: limits.max_block_size,
             });
         }
-        let dict = dict_bytes(chain.dict_prop, limits.uncompressed_size);
-        let cap = u32::try_from(dict).unwrap_or(u32::MAX);
+        // The dictionary as it is allocated: rounded up as the SDK rounds
+        // it. This one number is what the limits are checked against and
+        // what is allocated, in RAM or on the window.
+        let prop = dict_props(chain.dict_prop, limits.uncompressed_size)?;
+        let size = prop.dic_buf_size();
         // A dictionary over the window's in-RAM limit goes on the window's
         // memory, and then costs nothing against the memory limit, which
         // bounds what the decoder allocates itself.
-        let caller = match window {
-            Some(w) => {
-                let prop = Lzma2Decoder::capped_props(chain.dict_prop, cap)?;
-                let size = prop.dic_buf_size();
-                w.covers(size).then_some((w, prop, size))
-            }
-            None => None,
-        };
+        let caller = window.filter(|w| w.covers(size));
         // A dictionary over the window's ceiling is refused here, before the
         // allocator is asked.
-        if let Some((w, _, size)) = caller
+        if let Some(w) = caller
             && !w.admits(size)
         {
             return Err(XzErrorKind::MemoryLimit {
@@ -119,14 +127,14 @@ impl BlockDecoder {
                 limit: w.max_len(),
             });
         }
-        if caller.is_none() && dict > limits.memory_limit {
+        if caller.is_none() && size as u64 > limits.memory_limit {
             return Err(XzErrorKind::MemoryLimit {
-                needed: dict,
+                needed: size as u64,
                 limit: limits.memory_limit,
             });
         }
         let lzma2 = match caller {
-            Some((w, prop, size)) => {
+            Some(w) => {
                 let mem = w.allocate(size).map_err(|e| {
                     let kind = e.kind();
                     *window_err = crate::WindowAllocError::from_io(e).ok();
@@ -137,7 +145,7 @@ impl BlockDecoder {
                 })?;
                 Lzma2Decoder::with_caller_dic(prop, mem)?
             }
-            None => Lzma2Decoder::new_capped(chain.dict_prop, cap)?,
+            None => Lzma2Decoder::with_props(prop)?,
         };
         Ok(BlockDecoder {
             lzma2,
@@ -455,6 +463,62 @@ mod tests {
             &mut None,
         )
         .unwrap()
+    }
+
+    fn limited(
+        chain: &FilterChain,
+        size: u64,
+        memory_limit: u64,
+        packed: usize,
+    ) -> Result<BlockDecoder, XzErrorKind> {
+        BlockDecoder::new(
+            chain,
+            CheckType::Crc32,
+            0,
+            &ChecksumPlan::none(),
+            true,
+            BlockLimits {
+                memory_limit,
+                uncompressed_size: Some(size),
+                compressed_size: Some(packed as u64),
+                max_block_size: size,
+            },
+            None,
+            &mut None,
+        )
+    }
+
+    #[test]
+    fn the_rounded_dictionary_is_what_the_limit_is_checked_against() {
+        // A 16 MiB dictionary clamped to a 5000-byte block is 5000 bytes,
+        // which the decoder rounds up to 8 KiB and allocates.
+        let chain =
+            FilterChain::validate(&[FilterFlags::new(FILTER_LZMA2, &[0x10]).unwrap()]).unwrap();
+        let original: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 253) as u8).collect();
+        let packed = packed(&chain, &original);
+        let rounded = dict_props(0x10, Some(5000)).unwrap().dic_buf_size();
+        assert_eq!(dict_bytes(0x10, Some(5000)), 5000);
+        assert_eq!(rounded, 8192);
+        for limit in [5000, 6000, 8191] {
+            assert!(matches!(
+                limited(&chain, 5000, limit, packed.len()),
+                Err(XzErrorKind::MemoryLimit { needed: 8192, limit: l }) if l == limit
+            ));
+        }
+        // At the rounded size it fits, and decodes as before.
+        let mut dec = limited(&chain, 5000, 8192, packed.len()).unwrap();
+        let mut out = alloc::vec![0u8; 8192];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while !dec.finished() {
+            let (read, wrote) = dec.decode(&packed[pos..], &mut out).unwrap();
+            pos += read;
+            got.extend_from_slice(&out[..wrote]);
+        }
+        assert_eq!(got, original);
+        let mut crc = crate::crc::Crc32::new();
+        crc.update(&original);
+        dec.finish(&crc.finalize().to_le_bytes()).unwrap();
     }
 
     #[test]

@@ -91,7 +91,13 @@ impl Lzma2Decoder {
     ///
     /// As [`Lzma2Decoder::new`].
     pub fn new_capped(dict_prop: u8, cap: u32) -> Result<Self, Error> {
-        let prop = Self::capped_props(dict_prop, cap)?;
+        Self::with_props(Self::capped_props(dict_prop, cap)?)
+    }
+
+    /// As [`Lzma2Decoder::new_capped`] for `prop` from
+    /// [`Lzma2Decoder::capped_props`], so that a caller that has checked
+    /// `prop.dic_buf_size()` against a limit allocates exactly that.
+    pub(crate) fn with_props(prop: LzmaProps) -> Result<Self, Error> {
         let mut p = Lzma2Decoder {
             frame: Lzma2Frame::new(),
             decoder: LzmaDec::new(prop)?,
